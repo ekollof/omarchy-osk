@@ -61,6 +61,7 @@
 #include <hyprland/src/event/EventBus.hpp>
 
 #include <cmath>
+#include <fstream>
 
 #include <atomic>
 #include <cstring>
@@ -572,6 +573,14 @@ static bool     press_pending = false;          /* single-finger button-down def
                                                  * a landing second finger cancels it, so two-finger
                                                  * scroll never drag-selects text */
 static bool     press_due = false;              /* deferred-press timer fired (main thread) */
+static std::unordered_map<int32_t, Vector2D> g_slotPos; /* live contact positions (touchID → pos) */
+static bool     gesture_decided = false;        /* scroll-vs-pinch latch for the current gesture */
+static bool     pinch_mode = false;             /* latched pinch (mutually exclusive with scroll) */
+static double   pinch_delta = 0;                /* signed contact-distance change since gesture start */
+static double   pinch_prev_d = 0;               /* previous frame's contact distance */
+static bool     pinch_prev_valid = false;
+static double   zoom_accum = 0;                 /* unconsumed pinch distance (px) */
+static int      pinch_ctrl_held = 0;            /* ctrl held on the synthetic keyboard for zoom */
 
 /* OSK panel exemption: touches inside this rect (normalized 0..1 on the
  * touch device's frame) pass through to the panel's own Qt touch handling;
@@ -623,6 +632,49 @@ static SP<Monitor::CMonitor> resolveTouchMonitor()
     return mon;
 }
 
+/* center + distance of the two live contacts (scroll/pinch geometry).
+ * Some digitizers (NVTK0603) never vary touchID, so slots can collapse to
+ * one entry — in that case pair the stored position against lastPos. */
+static bool contactGeometry(Vector2D &center, double &dist)
+{
+    if (g_slotPos.size() >= 2) {
+        auto     it = g_slotPos.begin();
+        Vector2D a  = it->second;
+        ++it;
+        Vector2D b = it->second;
+        center      = Vector2D{(a.x + b.x) / 2.0, (a.y + b.y) / 2.0};
+        dist        = std::hypot(a.x - b.x, a.y - b.y);
+        return true;
+    }
+    if (g_slotPos.size() == 1) {
+        Vector2D a = g_slotPos.begin()->second;
+        if (std::abs(a.x - lastPos.x) > 0.001 || std::abs(a.y - lastPos.y) > 0.001) {
+            center = Vector2D{(a.x + lastPos.x) / 2.0, (a.y + lastPos.y) / 2.0};
+            dist   = std::hypot(a.x - lastPos.x, a.y - lastPos.y);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void releasePinchCtrl()
+{
+    if (pinch_ctrl_held) {
+        execKey(KEY_LEFTCTRL, 0);
+        pinch_ctrl_held = 0;
+    }
+}
+
+/* DBG is a silent no-op from inside a plugin (header-inline logger singleton),
+ * so the gesture geometry traces go straight to a file */
+static void traceGeom(const std::string &line)
+{
+    if (!debug)
+        return;
+    std::ofstream f("/tmp/hypr-osk-geom.log", std::ios::app);
+    f << nowMs() << " " << line << "\n";
+}
+
 /* the single-finger button-down waits PRESS_DELAY_MS before firing: a second
  * finger landing inside that window converts the gesture to a two-finger
  * scroll without ever dragging the button (which drag-selects text) */
@@ -650,6 +702,7 @@ static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
 {
     fingers++;
     lastPos            = ev.pos;
+    g_slotPos[ev.touchID] = ev.pos;
     /* the touch device's bound output decides which monitor frame ev.pos is
      * normalized against — no hardcoded display anywhere */
     if (ev.device && !ev.device->m_boundOutput.empty())
@@ -671,6 +724,7 @@ static void touchUp(ITouch::SUpEvent ev, Event::SCallbackInfo &info)
 {
     if (fingers > 0)
         fingers--;
+    g_slotPos.erase(ev.touchID);
     up_flag = true;
     info.cancelled = true;
     scheduleApply();
@@ -679,6 +733,8 @@ static void touchUp(ITouch::SUpEvent ev, Event::SCallbackInfo &info)
 static void touchMotion(ITouch::SMotionEvent ev, Event::SCallbackInfo &info)
 {
     lastPos       = ev.pos;
+    g_slotPos[ev.touchID] = ev.pos; /* keep slot positions live — stale slots freeze the
+                                     * scroll/pinch geometry at the down points */
     motion_flag   = true;
     info.cancelled = true;
     scheduleApply();
@@ -691,6 +747,10 @@ static void applyTouches()
         up_flag = false;
         down_flag = false;
         press_pending = false;
+        releasePinchCtrl();
+        g_slotPos.clear();
+        pinch_mode      = false;
+        gesture_decided = false;
         if (fingers == 0)
             ignore_until_zero = false;
         return;
@@ -712,14 +772,17 @@ static void applyTouches()
         if (scroll_mode && fingers < 2) {
             /* finger lifted mid-scroll: gesture over */
             scroll_mode = false;
-            /* two-finger tap without scrolling = right click */
-            if (std::abs(scroll_travel_px) < 10 && nowMs() - dual_start_ms <= 250) {
+            /* two-finger tap without scrolling or pinching = right click */
+            if (std::abs(scroll_travel_px) < 10 && !pinch_mode && nowMs() - dual_start_ms <= 250) {
                 g_pSeatManager->sendPointerButton(nowMs(), BTN_RIGHT, WL_POINTER_BUTTON_STATE_PRESSED);
                 g_pSeatManager->sendPointerFrame();
                 g_pSeatManager->sendPointerButton(nowMs(), BTN_RIGHT, WL_POINTER_BUTTON_STATE_RELEASED);
                 g_pSeatManager->sendPointerFrame();
                 DBG("two-finger tap: right click");
             }
+            releasePinchCtrl();
+            pinch_mode      = false;
+            gesture_decided = false;
         }
         if (fingers == 0 && press_pending) {
             /* quick tap: the deferred press hadn't fired yet — click on lift */
@@ -745,8 +808,10 @@ static void applyTouches()
             pressed           = false;
             ignore_until_zero = true;
         }
-        if (fingers == 0)
+        if (fingers == 0) {
             contact_is_panel_native = false;
+            g_slotPos.clear();
+        }
     }
 
     if (down_flag) {
@@ -782,6 +847,9 @@ static void applyTouches()
             }
             scroll_mode = false;
             press_pending = false;
+            releasePinchCtrl();
+            pinch_mode      = false;
+            gesture_decided = false;
         } else if (fingers == 2) {
             /* two fingers: end any drag, enter two-finger scroll — the
              * deferred single-finger press (if it hadn't fired) dies here,
@@ -793,11 +861,26 @@ static void applyTouches()
                 pressed = false;
             }
             if (!scroll_mode) {
-                scroll_mode     = true;
-                scroll_anchor_y = lastPos.y;
-                scroll_travel_px = 0;
-                dual_start_ms   = nowMs();
+                scroll_mode       = true;
+                scroll_travel_px  = 0;
+                dual_start_ms     = nowMs();
                 scroll_wheel_shape = false;
+                gesture_decided   = false;
+                pinch_mode        = false;
+                pinch_delta       = 0;
+                zoom_accum        = 0;
+                Vector2D c;
+                double   d;
+                if (contactGeometry(c, d)) {
+                    scroll_anchor_y  = c.y; /* scroll (if it wins) follows the contact center */
+                    pinch_prev_d     = d;
+                    pinch_prev_valid = true;
+                    traceGeom("entry slots=" + std::to_string(g_slotPos.size()) + " d=" + std::to_string(d));
+                } else {
+                    scroll_anchor_y  = lastPos.y;
+                    pinch_prev_valid = false;
+                    traceGeom("entry slots=" + std::to_string(g_slotPos.size()) + " no geometry");
+                }
                 if (auto w = Desktop::focusState()->window()) {
                     std::string cls = w->m_class;
                     for (char &c : cls)
@@ -848,30 +931,93 @@ static void applyTouches()
         Pointer::pointerController()->warpTo(global, true);
         g_pInputManager->simulateMouseMovement();
     } else if (scroll_mode && fingers == 2) {
-        /* touchpad-style scroll: pixel deltas 1:1 with the finger, so content
-         * tracks the hand exactly. Wheel-source events (the old 0.025-units-
-         * per-notch scheme) get client-side acceleration/smoothing and
-         * outrun the fingers. */
-        auto mon = resolveTouchMonitor();
-        double px = (lastPos.y - scroll_anchor_y) * mon->m_size.y; /* logical px */
-        scroll_anchor_y = lastPos.y; /* consume the full delta: no drift */
-        if (px != 0.0) {
-            scroll_travel_px += std::abs(px);
-            /* natural scrolling: content follows the fingers */
-            if (scroll_wheel_shape) {
-                /* Chromium: v120 rides as exact pixels (its v8 handler wins
-                 * over the x12 legacy rescale within the frame) */
-                g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0,
-                                                (int32_t)std::lround(-px), WL_POINTER_AXIS_SOURCE_WHEEL,
-                                                WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
-            } else {
-                /* kitty & co: plain axis is the continuous pixel bucket */
-                g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0, 0,
-                                                WL_POINTER_AXIS_SOURCE_FINGER,
-                                                WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+        /* two-finger gesture: the contact-center delta scrolls, the contact-
+         * distance delta zooms; whichever dominates by the decision threshold
+         * latches the gesture (pixel scroll / ctrl+wheel zoom) */
+        auto mon  = resolveTouchMonitor();
+        if (!mon)
+            return;
+        Vector2D center = lastPos;
+        double   d      = pinch_prev_d;
+        contactGeometry(center, d);
+        if (!gesture_decided) {
+            if (pinch_prev_valid)
+                pinch_delta += d - pinch_prev_d;
+            double centerPx = std::abs(center.y - scroll_anchor_y) * mon->m_size.y;
+            double pinchPx  = std::abs(pinch_delta) * mon->m_size.y;
+            static unsigned geom_dbg = 0;
+            if (++geom_dbg % 5 == 0)
+                traceGeom("undecided slots=" + std::to_string(g_slotPos.size()) + " d=" + std::to_string(d) +
+                          " pinchPx=" + std::to_string(pinchPx) + " centerPx=" + std::to_string(centerPx));
+            if (centerPx + pinchPx > 14) {
+                gesture_decided = true;
+                pinch_mode      = pinchPx > 1.4 * centerPx;
+                scroll_anchor_y = center.y; /* consume the dead-zone drift */
+                traceGeom("decided pinch=" + std::string(pinch_mode ? "yes" : "no") +
+                          " pinchPx=" + std::to_string(pinchPx) + " centerPx=" + std::to_string(centerPx));
             }
-            g_pSeatManager->sendPointerFrame();
         }
+        if (gesture_decided && pinch_mode) {
+            /* pinch: ctrl+wheel — the universal app-level zoom binding.
+             * Native wl_touch pinch is unreachable (the plugin consumes all
+             * touch input), so the smoothness is recreated per client:
+             * Chromium gets every frame's delta as continuous v120 (its ctrl
+             * +high-res path zooms smoothly and snaps to presets on gesture
+             * end); other clients get quantized 10% notches. */
+            double dd = pinch_prev_valid ? (d - pinch_prev_d) * mon->m_size.y : 0.0; /* px */
+            if (scroll_wheel_shape) {
+                if (dd != 0.0) {
+                    if (!pinch_ctrl_held) {
+                        execKey(KEY_LEFTCTRL, 1);
+                        pinch_ctrl_held = 1;
+                    }
+                    /* legacy value keeps the /10 x 120 convention in parity */
+                    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                                    -dd / 12.0, 0, (int32_t)std::lround(-dd),
+                                                    WL_POINTER_AXIS_SOURCE_WHEEL,
+                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+                    g_pSeatManager->sendPointerFrame();
+                }
+            } else {
+                zoom_accum += dd;
+                int notches = (int)(zoom_accum / 30.0); /* ~30 px of spread = one 10% zoom step */
+                if (notches != 0) {
+                    zoom_accum -= notches * 30.0;
+                    if (!pinch_ctrl_held) {
+                        execKey(KEY_LEFTCTRL, 1);
+                        pinch_ctrl_held = 1;
+                    }
+                    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                                    -notches * 10.0, -notches, -notches * 120,
+                                                    WL_POINTER_AXIS_SOURCE_WHEEL,
+                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+                    g_pSeatManager->sendPointerFrame();
+                }
+            }
+        } else if (gesture_decided) {
+            /* touchpad-style scroll: pixel deltas 1:1 with the finger */
+            double px = (center.y - scroll_anchor_y) * mon->m_size.y; /* logical px */
+            scroll_anchor_y = center.y; /* consume the full delta: no drift */
+            if (px != 0.0) {
+                scroll_travel_px += std::abs(px);
+                /* natural scrolling: content follows the fingers */
+                if (scroll_wheel_shape) {
+                    /* Chromium: v120 rides as exact pixels (its v8 handler wins
+                     * over the x12 legacy rescale within the frame) */
+                    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0,
+                                                    (int32_t)std::lround(-px), WL_POINTER_AXIS_SOURCE_WHEEL,
+                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+                } else {
+                    /* kitty & co: plain axis is the continuous pixel bucket */
+                    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0, 0,
+                                                    WL_POINTER_AXIS_SOURCE_FINGER,
+                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+                }
+                g_pSeatManager->sendPointerFrame();
+            }
+        }
+        pinch_prev_d     = d;
+        pinch_prev_valid = true;
     }
 }
 

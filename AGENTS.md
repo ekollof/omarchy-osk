@@ -183,6 +183,13 @@ outright.
   button-down is deferred ~130 ms (`PRESS_DELAY_MS`) so a landing second
   finger cancels it — two-finger scroll never drag-selects text; quick taps
   click on lift, held single-finger drags get the button after the delay.
+  Pinch-vs-scroll latches per gesture: contact-center delta scrolls,
+  contact-distance delta pinches (~1.4x dominance to latch). Pinch emits
+  ctrl+wheel on the synthetic keyboard — continuous per-frame v120 for
+  chrom*-class windows (Chromium's ctrl+high-res path zooms smoothly and
+  snaps to presets on gesture end; native wl_touch pinch is unreachable
+  because the plugin consumes all touch input), quantized 10% steps
+  elsewhere.
 - **Bar widget popup**: use the shell's `qs.Ui` `Panel` base + `BarIconButton`
   + `KeyboardPanel` (see `shell/ekollof.osk-applet/Panel.qml` and
   `~/src/omarchy/shell/plugins/panels/power/Panel.qml` as the canonical
