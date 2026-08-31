@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build and deploy the omarchy-osk bundle:
 #   hypr-osk           (compositor plugin, C++)  -> ~/.local/share/hyprland/plugins/
+#   hyprgrass          (vendored edge gestures)  -> ~/.local/share/hyprland/plugins/
 #   ekollof.osk        (Quickshell overlay)      -> ~/.config/omarchy/plugins/
 #   ekollof.osk-applet (bar widget)              -> ~/.config/omarchy/plugins/
 #   hypr/osk.lua       (plugin load, gesture, keybind)
@@ -25,14 +26,27 @@ else
   install -m 644 "$DIR/hypr-osk/build/libhypr-osk.so" "$HOME/.local/share/hyprland/plugins/"
 fi
 
-# 3. Deploy the shell plugins
+# 3. Build the vendored hyprgrass (edge-swipe gesture) the same way: upstream
+# horriblename/hyprgrass pinned to hl-0.56.1 (known-good for Hyprland 0.56.x,
+# wf-touch included) — see AGENTS.md for re-vendoring. Skip when hyprpm
+# manages it instead.
+if hyprpm list 2>/dev/null | grep -q hyprgrass; then
+  echo "hyprgrass is hyprpm-managed: skipping the vendored build (rebuild with: hyprpm update)."
+else
+  pacman -Q glm >/dev/null 2>&1 || omarchy pkg add glm || echo "warning: glm missing, the hyprgrass build below will fail"
+  [[ -d "$DIR/vendor/hyprgrass/build" ]] || meson setup "$DIR/vendor/hyprgrass/build" "$DIR/vendor/hyprgrass" >/dev/null
+  meson compile -C "$DIR/vendor/hyprgrass/build"
+  install -m 644 "$DIR/vendor/hyprgrass/build/src/libhyprgrass.so" "$HOME/.local/share/hyprland/plugins/hyprgrass.so"
+fi
+
+# 4. Deploy the shell plugins
 mkdir -p "$HOME/.config/omarchy/plugins"
 for p in ekollof.osk ekollof.osk-applet; do
   rm -rf "$HOME/.config/omarchy/plugins/$p"
   cp -r "$DIR/shell/$p" "$HOME/.config/omarchy/plugins/"
 done
 
-# 4. Deploy the Hyprland integration
+# 5. Deploy the Hyprland integration
 mkdir -p "$HOME/.config/hypr/scripts"
 install -m 755 "$DIR/hypr/osk-toggle.sh" "$HOME/.config/hypr/scripts/osk-toggle.sh"
 install -m 644 "$DIR/hypr/osk.lua" "$HOME/.config/hypr/osk.lua"
@@ -41,7 +55,7 @@ if ! grep -q 'require("hypr.osk")' "$HYPRLAND"; then
   sed -i 's|^require("hypr.gestures")|require("hypr.gestures")\nrequire("hypr.osk")|' "$HYPRLAND"
 fi
 
-# 5. Register with the shell and reload Hyprland
+# 6. Register with the shell and reload Hyprland
 omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 omarchy-shell shell putBarWidget ekollof.osk-applet '{}' >/dev/null 2>&1 || true
 omarchy-shell shell setPluginEnabled ekollof.osk true >/dev/null 2>&1 || true
@@ -50,31 +64,5 @@ hyprctl reload >/dev/null 2>&1 || true
 echo "omarchy-osk installed."
 hyprctl plugin list | grep -q hypr-osk && echo "compositor plugin: loaded" \
   || echo "compositor plugin: NOT loaded yet (log out/in, or: hyprctl plugin load $HOME/.local/share/hyprland/plugins/libhypr-osk.so)"
-
-# hyprgrass (edge-swipe gesture) is not in the Arch repos. Omarchy-specific,
-# so drive hyprpm (Hyprland's plugin manager) directly as the user: it builds
-# hyprgrass against the RUNNING compositor and enables it. Needs gcc, meson,
-# ninja, glm, git, network — and a terminal for hyprpm's sudo prompts.
-if ! hyprctl plugin list | grep -q hyprgrass; then
-  missing=()
-  for dep in git gcc meson ninja glm; do
-    pacman -Q "$dep" >/dev/null 2>&1 || missing+=("$dep")
-  done
-  if ((${#missing[@]})) && ! omarchy pkg add "${missing[@]}"; then
-    echo "warning: could not install hyprgrass build deps: ${missing[*]}"
-  fi
-  if hyprpm list 2>/dev/null | grep -q hyprgrass; then
-    hyprpm update hyprgrass || true
-  else
-    hyprpm add https://github.com/horriblename/hyprgrass || true
-  fi
-  if hyprpm enable hyprgrass && hyprctl plugin list | grep -q hyprgrass; then
-    echo "hyprgrass installed via hyprpm: edge-swipe gesture active."
-    echo "  After Hyprland updates, rebuild it with:  hyprpm update"
-  else
-    echo "hyprgrass install via hyprpm failed: the edge-swipe gesture is missing."
-    echo "  Run in a terminal:  hyprpm add https://github.com/horriblename/hyprgrass"
-    echo "                      hyprpm enable hyprgrass"
-    echo "  The keyboard still toggles via SUPER+SHIFT+K and the bar applet."
-  fi
-fi
+hyprctl plugin list | grep -q hyprgrass && echo "hyprgrass: loaded" \
+  || echo "hyprgrass: built and deployed; loads at next session (or: hyprctl plugin load $HOME/.local/share/hyprland/plugins/hyprgrass.so)"

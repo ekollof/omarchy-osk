@@ -1,0 +1,787 @@
+#include "GestureManager.hpp"
+#include "HyprLogger.hpp"
+#include "config/lua/ConfigManager.hpp"
+#include "config/shared/actions/ConfigActions.hpp"
+#include "config/shared/complex/ComplexDataTypes.hpp"
+#include "config/supplementary/propRefresher/PropRefresher.hpp"
+
+#define private public
+#include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/config/ConfigManager.hpp>
+#include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/config/legacy/ConfigManager.hpp>
+#include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/output/Monitor.hpp>
+#include <hyprland/src/pointer/PointerController.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/managers/SeatManager.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
+#include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/managers/input/UnifiedWorkspaceSwipeGesture.hpp>
+#include <hyprland/src/plugins/PluginSystem.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>
+#undef private
+
+#include <algorithm>
+#include <ranges>
+#include <vector>
+
+// constexpr double SWIPE_THRESHOLD = 30.;
+constexpr int RESIZE_BORDER_GAP_INCREMENT = 10;
+
+static std::string trim(const std::string& str) {
+    size_t first = str.find_first_not_of(' ');
+    if (std::string::npos == first) {
+        return str;
+    }
+    size_t last = str.find_last_not_of(' ');
+    return str.substr(first, (last - first + 1));
+}
+
+static std::vector<std::string> splitString(const std::string& s, char delimiter, int numSubstrings) {
+    std::vector<std::string> substrings;
+    auto split_view = std::ranges::views::split(s, delimiter);
+    auto iter       = split_view.begin();
+
+    for (int i = 0; i < numSubstrings - 1 && iter != split_view.end(); ++i, ++iter) {
+        std::string substring;
+        for (char c : *iter) {
+            substring.push_back(c);
+        }
+        substrings.push_back(substring);
+    }
+
+    if (iter != split_view.end()) {
+        std::string rest;
+        for (char c : *iter) {
+            rest.push_back(c);
+        }
+        substrings.push_back(rest);
+    }
+
+    return substrings;
+}
+
+static int handleLongPressTimer(void* data) {
+    const auto gesture_manager = (GestureManager*)data;
+    gesture_manager->onLongPressTimeout(gesture_manager->long_press_next_trigger_time);
+
+    return 0;
+}
+
+static std::string commaSeparatedCssGaps(const Config::CCssGapData& data) {
+    return std::to_string(data.m_top) + "," + std::to_string(data.m_right) + "," + std::to_string(data.m_bottom) + "," +
+           std::to_string(data.m_left);
+}
+
+static void updateGapsIn(const Config::CCssGapData& newGapsIn) {
+    static auto PGAPSINDATA = CConfigValue<Config::IComplexConfigValue>("general:gaps_in");
+
+    if (Config::mgr()->type() == Config::CONFIG_LEGACY) {
+        Config::Legacy::mgr()->parseKeyword("general:gaps_in", commaSeparatedCssGaps(newGapsIn));
+    } else {
+        auto luaMgr = dynamicPointerCast<Config::Lua::CConfigManager>(WP<Config::IConfigManager>(Config::mgr()));
+
+        const auto it = luaMgr->m_configValues.find("general.gaps_in");
+        if (it == luaMgr->m_configValues.end()) {
+            Log::logger->log(Log::ERR, "[hyprgrass] lua config 'general.gaps_in' not found");
+            return;
+        }
+
+        auto* gapsInPtr = dynamic_cast<Config::CCssGapData*>(PGAPSINDATA.ptr());
+        // idk why `*gapsInPtr = newGapsIn` doesn't work
+        gapsInPtr->m_bottom = newGapsIn.m_bottom;
+        gapsInPtr->m_top    = newGapsIn.m_top;
+        gapsInPtr->m_left   = newGapsIn.m_left;
+        gapsInPtr->m_right  = newGapsIn.m_right;
+        Config::Supplementary::refresher()->scheduleRefresh(it->second->refreshBits());
+    }
+}
+
+GestureManager::GestureManager() : IGestureManager(std::make_unique<HyprLogger>()) {
+    static auto const PSENSITIVITY     = g_config->sensitivity;
+    static auto const LONG_PRESS_DELAY = g_config->longPressDelay;
+    static auto const EDGE_MARGIN      = g_config->edgeMargin;
+    const auto sensitivity             = PSENSITIVITY->m_val.ptr();
+    const auto longPressDelay          = LONG_PRESS_DELAY->m_val.ptr();
+    const auto margin                  = EDGE_MARGIN->m_val.ptr();
+
+    this->addEdgeSwipeGesture(SWIPE_THRESHOLD, SWIPE_INCORRECT_DRAG_TOLERANCE, sensitivity, longPressDelay, margin);
+    // TODO: should I use SWIPE_INCORRECT_DRAG_TOLERANCE instead?
+    this->addLongPress(SWIPE_THRESHOLD, sensitivity, longPressDelay);
+    this->addMultiFingerGesture(SWIPE_THRESHOLD, SWIPE_INCORRECT_DRAG_TOLERANCE, sensitivity, longPressDelay);
+    this->addMultiFingerTap(SWIPE_INCORRECT_DRAG_TOLERANCE, sensitivity, longPressDelay);
+    this->addPinchGesture(PINCH_THRESHOLD, sensitivity, longPressDelay);
+
+    this->long_press_timer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, handleLongPressTimer, this);
+}
+
+GestureManager::~GestureManager() {
+    wl_event_source_remove(this->long_press_timer);
+}
+
+bool GestureManager::findCompletedGesture(const CompletedGestureEvent& gev) const {
+    return this->findGestureBind(gev.to_string(), GestureEventType::COMPLETED);
+}
+bool GestureManager::handleCompletedGesture(const CompletedGestureEvent& gev) {
+    return this->handleGestureBind(gev.to_string(), GestureEventType::COMPLETED);
+}
+
+bool GestureManager::handleDragGesture(const DragGestureEvent& gev) {
+    static auto const WORKSPACE_SWIPE_FINGERS = g_config->workspaceSwipeFingers;
+    static auto const WORKSPACE_SWIPE_EDGE    = g_config->workspaceSwipeEdge;
+    static auto const RESIZE_LONG_PRESS       = g_config->resizeOnBorder;
+
+    static auto PBORDERSIZE       = CConfigValue<Config::INTEGER>("general:border_size");
+    static auto PBORDERGRABEXTEND = CConfigValue<Config::INTEGER>("general:extend_border_grab_area");
+    static auto PGAPSINDATA       = CConfigValue<Config::IComplexConfigValue>("general:gaps_in");
+
+    Log::logger->log(Log::DEBUG, "[hyprgrass] Drag gesture begin: {}", gev.to_string());
+
+    auto const workspace_swipe_edge_str = WORKSPACE_SWIPE_EDGE->value();
+
+    switch (gev.type) {
+        case GestureType::SWIPE: {
+            if (this->trackpadGestureBegin(gev))
+                return true;
+
+            if (WORKSPACE_SWIPE_FINGERS->value() != gev.finger_count) {
+                return false;
+            }
+
+            if (this->handleWorkspaceSwipe(gev.direction))
+                return true;
+
+            return false;
+        }
+
+        case GestureType::EDGE_SWIPE: {
+            if (workspace_swipe_edge_str == "l" && gev.edge_origin == GESTURE_DIRECTION_LEFT) {
+                return this->handleWorkspaceSwipe(gev.direction);
+            }
+            if (workspace_swipe_edge_str == "r" && gev.edge_origin == GESTURE_DIRECTION_RIGHT) {
+                return this->handleWorkspaceSwipe(gev.direction);
+            }
+            if (workspace_swipe_edge_str == "u" && gev.edge_origin == GESTURE_DIRECTION_UP) {
+                return this->handleWorkspaceSwipe(gev.direction);
+            }
+            if (workspace_swipe_edge_str == "d" && gev.edge_origin == GESTURE_DIRECTION_DOWN) {
+                return this->handleWorkspaceSwipe(gev.direction);
+            }
+
+            if (this->trackpadGestureBegin(gev))
+                return true;
+
+            return false;
+        }
+
+        case GestureType::LONG_PRESS:
+            if (g_pSessionLockManager->isSessionLocked()) {
+                return this->handleGestureBind(gev.to_string(), GestureEventType::DRAG_BEGIN);
+            }
+
+            if (RESIZE_LONG_PRESS->value() && gev.finger_count == 1) {
+                const auto BORDER_GRAB_AREA = *PBORDERSIZE + *PBORDERGRABEXTEND;
+
+                // kind of a hack: this is the window detected from previous touch events
+                const auto w = g_pInputManager->m_foundWindowToFocus.lock();
+                const Vector2D touchPos =
+                    pixelPositionToPercentagePosition(this->m_sGestureState.get_center().current) *
+                    this->m_lastTouchedMonitor->m_size;
+                if (w && !Fullscreen::controller()->isFullscreen(w)) {
+                    const Vector2D realPos  = w->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+                    const Vector2D realSize = w->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+                    const CBox real = {realPos.x, realPos.y, realSize.x, realSize.y};
+                    const CBox grab = {
+                        real.x - BORDER_GRAB_AREA, real.y - BORDER_GRAB_AREA, real.width + 2 * BORDER_GRAB_AREA,
+                        real.height + 2 * BORDER_GRAB_AREA
+                    };
+
+                    bool notInRealWindow = !real.containsPoint(touchPos) || w->isInCurvedCorner(touchPos.x, touchPos.y);
+                    bool onTiledGap      = !w->m_isFloating && !Fullscreen::controller()->isFullscreen(w) && notInRealWindow;
+                    bool inGrabArea      = notInRealWindow && grab.containsPoint(touchPos);
+
+                    if ((onTiledGap || inGrabArea) && !w->hasPopupAt(touchPos)) {
+                        IPointer::SButtonEvent e = {
+                            .timeMs = 0, // HACK: they don't use this :p
+                            .button = 0,
+                            .state  = WL_POINTER_BUTTON_STATE_PRESSED,
+                        };
+                        g_pKeybindManager->resizeWithBorder(e);
+
+                        auto oldGapsIn           = *static_cast<Config::CCssGapData*>(PGAPSINDATA.ptr());
+                        this->resizeOnBorderInfo = {
+                            .active      = true,
+                            .old_gaps_in = oldGapsIn,
+                        };
+
+                        Config::CCssGapData newGapsIn = oldGapsIn;
+                        newGapsIn.m_top += RESIZE_BORDER_GAP_INCREMENT;
+                        newGapsIn.m_right += RESIZE_BORDER_GAP_INCREMENT;
+                        newGapsIn.m_bottom += RESIZE_BORDER_GAP_INCREMENT;
+                        newGapsIn.m_left += RESIZE_BORDER_GAP_INCREMENT;
+                        updateGapsIn(newGapsIn);
+                        return true;
+                    }
+                }
+            }
+
+            if (this->trackpadGestureBegin(gev))
+                return true;
+
+            return this->handleGestureBind(gev.to_string(), GestureEventType::DRAG_BEGIN);
+
+        case GestureType::PINCH:
+            if (this->trackpadGestureBegin(gev))
+                return true;
+
+            return this->handleGestureBind(gev.to_string(), GestureEventType::DRAG_BEGIN);
+            break;
+        case GestureType::TAP:
+            // tap does not trigger drag
+            break;
+    }
+
+    return false;
+}
+
+bool GestureManager::findGestureBind(std::string bind, GestureEventType type) const {
+    Log::logger->log(Log::DEBUG, "[hyprgrass] Looking for binds matching: {}", bind);
+
+    auto allBinds   = std::ranges::views::join(std::array{g_pKeybindManager->m_keybinds, this->internalBinds});
+    const auto MODS = g_pInputManager->getModsFromAllKBs();
+
+    for (const auto& k : allBinds) {
+        if (k->key != bind)
+            continue;
+
+        if (k->handler == "pass")
+            continue;
+
+        if (k->locked != g_pSessionLockManager->isSessionLocked())
+            continue;
+
+        if (k->modmask != MODS)
+            continue;
+
+        return true;
+    }
+    return false;
+}
+
+// bind is the name of the gesture event.
+// pressed only matters for mouse binds: only start of drag gestures should set it to true
+bool GestureManager::handleGestureBind(std::string bind, GestureEventType type) {
+    bool found = false;
+    Log::logger->log(Log::DEBUG, "[hyprgrass] Looking for binds matching: {}", bind);
+
+    auto allBinds   = std::ranges::views::join(std::array{g_pKeybindManager->m_keybinds, this->internalBinds});
+    const auto MODS = g_pInputManager->getModsFromAllKBs();
+
+    for (const auto& k : allBinds) {
+        if (k->key != bind)
+            continue;
+
+        if (k->handler == "pass")
+            continue;
+
+        if (k->locked != g_pSessionLockManager->isSessionLocked())
+            continue;
+
+        if (k->modmask != MODS)
+            continue;
+
+        // only legacy config uses "mouse" dispatcher
+        bool useMouseDispatcher = k->mouse && Config::mgr()->type() == Config::CONFIG_LEGACY;
+        const auto DISPATCHER   = g_pKeybindManager->m_dispatchers.find(useMouseDispatcher ? "mouse" : k->handler);
+
+        // Should never happen, as we check in the ConfigManager, but oh well
+        if (DISPATCHER == g_pKeybindManager->m_dispatchers.end()) {
+            Log::logger->log(Log::ERR, "Invalid handler in a keybind! (handler {} does not exist)", k->handler);
+            continue;
+        }
+
+        switch (type) {
+            case GestureEventType::COMPLETED:
+                // mouse dispatchers only trigger on drag begin/end
+                if (!k->mouse) {
+                    Log::logger->log(Log::DEBUG, "[hyprgrass] calling dispatcher ({})", bind);
+                    DISPATCHER->second(k->arg);
+                    found = found || !k->nonConsuming;
+                }
+                break;
+
+            default:
+                if (!k->mouse) {
+                    // only mouse actions are considered on drag begin/end
+                    continue;
+                }
+
+                if (useMouseDispatcher) {
+                    Log::logger->log(Log::DEBUG, "[hyprgrass] calling mouse dispatcher ({})", bind);
+                    char pressed = type == GestureEventType::DRAG_BEGIN ? '1' : '0';
+                    DISPATCHER->second(pressed + k->arg);
+                    found = found || !k->nonConsuming;
+                } else {
+                    bool pressed          = type == GestureEventType::DRAG_BEGIN;
+                    this->mouseBindActive = pressed;
+                    // yes this is how the lua dispatcher detects key press state
+                    Config::Actions::state()->m_passPressed = static_cast<int>(pressed);
+
+                    DISPATCHER->second(k->arg);
+
+                    Config::Actions::state()->m_passPressed = -1;
+
+                    found = found || !k->nonConsuming;
+                }
+        }
+    }
+
+    return found;
+}
+
+void GestureManager::handleCancelledGesture() {}
+
+void GestureManager::dragGestureUpdate(const wf::touch::gesture_event_t& ev) {
+    if (!this->getActiveDragGesture().has_value()) {
+        return;
+    }
+
+    if (this->activeTrackpadGesture) {
+        this->trackpadGestureUpdate(ev.time);
+        return;
+    }
+
+    switch (this->getActiveDragGesture()->type) {
+        case GestureType::SWIPE:
+            if (this->workspaceSwipeActive) {
+                this->updateWorkspaceSwipe();
+            }
+            return;
+
+        case GestureType::LONG_PRESS: {
+            const auto pos = this->m_sGestureState.get_center().current;
+            Pointer::pointerController()->warpTo(Vector2D(pos.x, pos.y));
+            g_pInputManager->simulateMouseMovement();
+            return;
+        }
+        case GestureType::EDGE_SWIPE:
+            this->updateWorkspaceSwipe();
+            break;
+
+        case GestureType::PINCH:
+            break;
+        case GestureType::TAP:
+            // tap does not trigger drag
+            break;
+    }
+}
+
+void GestureManager::handleDragGestureEnd(const DragGestureEvent& gev) {
+    if (g_pSessionLockManager->isSessionLocked()) {
+        this->handleGestureBind(gev.to_string(), GestureEventType::DRAG_END);
+        return;
+    }
+
+    if (this->activeTrackpadGesture) {
+        this->trackpadGestureEnd(gev.time);
+        return;
+    }
+
+    Log::logger->log(Log::DEBUG, "[hyprgrass] Drag gesture ended: {}", gev.to_string());
+    switch (gev.type) {
+        case GestureType::SWIPE:
+            if (this->workspaceSwipeActive) {
+                g_pUnifiedWorkspaceSwipe->end();
+                this->workspaceSwipeActive = false;
+            }
+            return;
+        case GestureType::LONG_PRESS:
+            if (this->resizeOnBorderInfo.active) {
+                g_pKeybindManager->changeMouseBindMode(eMouseBindMode::MBIND_INVALID);
+                updateGapsIn(this->resizeOnBorderInfo.old_gaps_in);
+                this->resizeOnBorderInfo = {};
+                return;
+            }
+
+            // longpress already triggered CompletedGesture on timeout
+            if (this->mouseBindActive) {
+                this->handleGestureBind(gev.to_string(), GestureEventType::DRAG_END);
+            }
+
+            return;
+        case GestureType::EDGE_SWIPE:
+            if (this->workspaceSwipeActive) {
+                g_pUnifiedWorkspaceSwipe->end();
+            }
+            break;
+        case GestureType::PINCH:
+            this->handleGestureBind(gev.to_string(), GestureEventType::DRAG_END);
+            return;
+        case GestureType::TAP:
+            // tap does not trigger drag
+            break;
+    }
+}
+
+bool GestureManager::handleWorkspaceSwipe(const GestureDirection direction) {
+    const bool VERTANIMS =
+        Desktop::focusState()->monitor()->m_activeWorkspace->m_renderOffset->getConfig()->pValues->internalStyle ==
+            "slidevert" ||
+        Desktop::focusState()
+            ->monitor()
+            ->m_activeWorkspace->m_renderOffset->getConfig()
+            ->pValues->internalStyle.starts_with("slidevert");
+
+    const auto horizontal           = GESTURE_DIRECTION_LEFT | GESTURE_DIRECTION_RIGHT;
+    const auto vertical             = GESTURE_DIRECTION_UP | GESTURE_DIRECTION_DOWN;
+    const auto workspace_directions = VERTANIMS ? vertical : horizontal;
+    const auto anti_directions      = VERTANIMS ? horizontal : vertical;
+
+    if (direction & workspace_directions && !(direction & anti_directions)) {
+        this->workspaceSwipeActive = true;
+        g_pUnifiedWorkspaceSwipe->begin();
+        return true;
+    }
+
+    return false;
+}
+
+void GestureManager::updateWorkspaceSwipe() {
+    const auto ANIMSTYLE   = g_pUnifiedWorkspaceSwipe->m_workspaceBegin->m_renderOffset->getStyle();
+    const bool VERTANIMS   = ANIMSTYLE == "slidevert" || ANIMSTYLE.starts_with("slidefadevert");
+    const auto swipe_delta = this->pixelToTrackpadDistance(this->m_sGestureState.get_center().delta());
+
+    g_pUnifiedWorkspaceSwipe->update(VERTANIMS ? -swipe_delta.y : -swipe_delta.x);
+    return;
+}
+
+bool GestureManager::trackpadGestureBegin(const DragGestureEvent& gev) {
+    Vector2D delta = this->pixelToTrackpadDistance(this->m_sGestureState.get_center().delta());
+
+    // longpress events do not trigger a handler->m_activeGesture at the beginning,
+    // we look it up ourselves beforehand
+    bool foundLongPress = false;
+    // hyprland has an arbitrary threshold of 5 pixels
+    if (gev.type == GestureType::LONG_PRESS && std::abs(delta.x) < 5 && std::abs(delta.y) < 5) {
+        const auto MODS = g_pInputManager->getModsFromAllKBs();
+        for (const auto& g : g_pShimTrackpadGestures->longPress()->m_gestures) {
+            if (g->fingerCount == gev.finger_count && g->modMask == MODS) {
+                foundLongPress = true;
+                break;
+            }
+        }
+    }
+    uint32_t fingers = gev.type == GestureType::EDGE_SWIPE ? gev.edge_origin : gev.finger_count;
+
+    CTrackpadGestures* handler = g_pShimTrackpadGestures->get(gev.type);
+    if (gev.type == GestureType::PINCH) {
+        IPointer::SPinchBeginEvent pinchBegin = {
+            .timeMs  = gev.time,
+            .fingers = fingers,
+        };
+        IPointer::SPinchUpdateEvent pinch = {
+            .timeMs   = gev.time,
+            .fingers  = fingers,
+            .delta    = delta,
+            .scale    = this->m_sGestureState.get_pinch_scale(),
+            .rotation = this->m_sGestureState.get_rotation_angle(),
+        };
+
+        handler->gestureBegin(pinchBegin);
+        handler->gestureUpdate(pinch);
+    } else {
+        IPointer::SSwipeBeginEvent swipeBegin = {
+            .timeMs  = gev.time,
+            .fingers = fingers,
+        };
+        IPointer::SSwipeUpdateEvent swipe = {
+            .timeMs  = gev.time,
+            .fingers = fingers,
+            .delta   = delta,
+        };
+
+        CTrackpadGestures* handler = g_pShimTrackpadGestures->get(gev.type);
+        handler->gestureBegin(swipeBegin);
+        handler->gestureUpdate(swipe);
+    }
+    this->emulatedSwipePoint = this->m_sGestureState.get_center().current;
+
+    this->activeTrackpadGesture = foundLongPress || handler->m_activeGesture ? handler : nullptr;
+    return this->activeTrackpadGesture;
+}
+
+void GestureManager::trackpadGestureUpdate(uint32_t time) {
+    if (!this->activeTrackpadGesture)
+        return;
+
+    const auto currentPoint = this->m_sGestureState.get_center().current;
+    const auto deltaPx      = currentPoint - this->emulatedSwipePoint;
+    const Vector2D delta    = pixelToTrackpadDistance(deltaPx);
+
+    DragGestureEvent activeDrag = this->getActiveDragGesture().value();
+    uint32_t fingers = activeDrag.type == GestureType::EDGE_SWIPE ? activeDrag.edge_origin : activeDrag.finger_count;
+
+    this->emulatedSwipePoint = currentPoint;
+
+    if (activeDrag.type == GestureType::PINCH) {
+        IPointer::SPinchUpdateEvent pinch = {
+            .timeMs  = time,
+            .fingers = fingers,
+            .delta   = delta,
+            .scale   = this->m_sGestureState.get_pinch_scale(),
+            // FIXME: rotation should be relative to previous update event, not the initial one
+            .rotation = this->m_sGestureState.get_rotation_angle(),
+        };
+
+        this->activeTrackpadGesture->gestureUpdate(pinch);
+    } else {
+        IPointer::SSwipeUpdateEvent swipe = {
+            .timeMs  = time,
+            .fingers = fingers,
+            .delta   = delta,
+        };
+
+        this->activeTrackpadGesture->gestureUpdate(swipe);
+    }
+}
+
+void GestureManager::trackpadGestureEnd(uint32_t time) {
+    DragGestureEvent activeDrag = this->getActiveDragGesture().value();
+    if (activeDrag.type == GestureType::PINCH) {
+        IPointer::SPinchEndEvent swipe = {
+            .timeMs    = time,
+            .cancelled = false,
+        };
+        this->activeTrackpadGesture->gestureEnd(swipe);
+    } else {
+        IPointer::SSwipeEndEvent swipe = {
+            .timeMs    = time,
+            .cancelled = false,
+        };
+        this->activeTrackpadGesture->gestureEnd(swipe);
+    }
+    this->activeTrackpadGesture = nullptr;
+}
+
+void GestureManager::updateLongPressTimer(uint32_t current_time, uint32_t delay) {
+    this->long_press_next_trigger_time = current_time + delay + 1;
+    wl_event_source_timer_update(this->long_press_timer, delay);
+}
+
+void GestureManager::stopLongPressTimer() {
+    wl_event_source_timer_update(this->long_press_timer, 0);
+}
+
+void GestureManager::sendCancelEventsToWindows() {
+    static auto const SEND_CANCEL = g_config->sendCancel;
+
+    if (!SEND_CANCEL->value()) {
+        return;
+    }
+
+    for (const auto& touch : this->touchedResources.all()) {
+        const auto t = touch.lock();
+        if (t.get()) {
+            t->sendCancel();
+        }
+    }
+}
+
+// @return whether or not to inhibit further actions
+bool GestureManager::onTouchDown(ITouch::SDownEvent ev) {
+    static auto const SEND_CANCEL = g_config->sendCancel;
+
+    auto monitor = State::monitorState()->query().name(!ev.device->m_boundOutput.empty() ? ev.device->m_boundOutput : "").run();
+    monitor      = monitor ? monitor : Desktop::focusState()->monitor();
+
+    if (!monitor) {
+        Log::logger->log(Log::ERR, "[hyprgrass] onTouchDown: could not find a monitor???");
+        return false;
+    }
+
+    this->m_lastTouchedMonitor = monitor;
+
+    const auto& monitorPos  = this->m_lastTouchedMonitor->m_position;
+    const auto& monitorSize = this->m_lastTouchedMonitor->m_size;
+    this->m_monitorArea     = SMonitorArea{monitorPos.x, monitorPos.y, monitorSize.x, monitorSize.y};
+
+    Pointer::pointerController()->warpTo(
+        Vector2D{
+            monitorPos.x + ev.pos.x * monitorSize.x,
+            monitorPos.y + ev.pos.y * monitorSize.y,
+        }
+    );
+
+    g_pInputManager->refocus();
+
+    if (this->m_sGestureState.fingers.size() == 0) {
+        this->touchedResources.clear();
+        this->activeTrackpadGesture = nullptr;
+    }
+
+    if (!eventForwardingInhibited() && SEND_CANCEL->value() && g_pInputManager->m_touchData.touchFocusSurface) {
+        // remember which surfaces were touched, to later send cancel events
+        const auto surface = g_pInputManager->m_touchData.touchFocusSurface;
+
+        wl_client* client = surface.get()->client();
+        if (client) {
+            SP<CWLSeatResource> seat = g_pSeatManager->seatResourceForClient(client);
+
+            if (seat) {
+                auto touches = seat.get()->m_touches;
+                for (const auto& touch : touches) {
+                    this->touchedResources.insert(touch);
+                }
+            }
+        }
+    }
+
+    // NOTE @wlr_touch_down_event.x and y uses a number between 0 and 1 to
+    // represent "how many percent of screen" whereas
+    // @wf::touch::gesture_event_t uses PIXELS as unit
+    auto pos = wlrTouchEventPositionAsPixels(ev.pos.x, ev.pos.y);
+
+    const wf::touch::gesture_event_t gesture_event = {
+        .type   = wf::touch::EVENT_TYPE_TOUCH_DOWN,
+        .time   = ev.timeMs,
+        .finger = ev.touchID,
+        .pos    = pos,
+    };
+
+    return IGestureManager::onTouchDown(gesture_event);
+}
+
+bool GestureManager::onTouchUp(ITouch::SUpEvent ev) {
+    static auto const SEND_CANCEL = g_config->sendCancel;
+
+    wf::touch::point_t lift_off_pos;
+    try {
+        lift_off_pos = this->m_sGestureState.fingers.at(ev.touchID).current;
+    } catch (const std::out_of_range&) {
+        return false;
+    }
+
+    const wf::touch::gesture_event_t gesture_event = {
+        .type   = wf::touch::EVENT_TYPE_TOUCH_UP,
+        .time   = ev.timeMs,
+        .finger = ev.touchID,
+        .pos    = {lift_off_pos.x, lift_off_pos.y},
+    };
+
+    const auto BLOCK = IGestureManager::onTouchUp(gesture_event);
+    if (SEND_CANCEL->value()) {
+        const auto surface = g_pInputManager->m_touchData.touchFocusSurface;
+
+        if (!surface.valid()) {
+            return true;
+        }
+
+        wl_client* client = surface.get()->client();
+        if (!client) {
+            return true;
+        }
+
+        SP<CWLSeatResource> seat = g_pSeatManager->seatResourceForClient(client);
+        if (!seat.get()) {
+            return true;
+        }
+
+        auto touches = seat.get()->m_touches;
+        for (const auto& touch : touches) {
+            this->touchedResources.remove(touch);
+        }
+
+        return BLOCK;
+    } else {
+        // send_cancel is turned off; we need to rely on touchup events
+        return false;
+    }
+}
+
+bool GestureManager::onTouchMove(ITouch::SMotionEvent ev) {
+    if (!this->m_lastTouchedMonitor) {
+        Log::logger->log(Log::ERR, "[hyprgrass] onTouchMove: where the fuck is my monitor");
+        return false;
+    }
+
+    auto pos = wlrTouchEventPositionAsPixels(ev.pos.x, ev.pos.y);
+
+    const wf::touch::gesture_event_t gesture_event = {
+        .type   = wf::touch::EVENT_TYPE_MOTION,
+        .time   = ev.timeMs,
+        .finger = ev.touchID,
+        .pos    = pos,
+    };
+
+    return IGestureManager::onTouchMove(gesture_event);
+}
+
+SMonitorArea GestureManager::getMonitorArea() const {
+    return this->m_monitorArea;
+}
+
+void GestureManager::onLongPressTimeout(uint32_t time_msec) {
+    if (this->m_sGestureState.fingers.empty()) {
+        return;
+    }
+
+    const auto finger = this->m_sGestureState.fingers.begin();
+
+    const wf::touch::gesture_event_t touch_event = {
+        .type   = wf::touch::EVENT_TYPE_MOTION,
+        .time   = time_msec,
+        .finger = finger->first,
+        .pos    = finger->second.current,
+    };
+
+    IGestureManager::onTouchMove(touch_event);
+}
+
+wf::touch::point_t GestureManager::wlrTouchEventPositionAsPixels(double x, double y) const {
+    auto area = this->getMonitorArea();
+    return wf::touch::point_t{x * area.w + area.x, y * area.h + area.y};
+}
+
+Vector2D GestureManager::pixelPositionToPercentagePosition(wf::touch::point_t point) const {
+    auto monitorArea = this->getMonitorArea();
+    return Vector2D((point.x - monitorArea.x) / monitorArea.w, (point.y - monitorArea.y) / monitorArea.h);
+}
+
+Vector2D GestureManager::pixelToTrackpadDistance(wf::touch::point_t distancePx) const {
+    static auto const PSWIPEDIST = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_distance");
+    const auto SWIPEDISTANCE     = std::clamp(*PSWIPEDIST, (int64_t)1LL, (int64_t)UINT32_MAX);
+
+    const auto monArea       = this->getMonitorArea();
+    const auto delta_percent = distancePx / wf::touch::point_t(monArea.w, monArea.h);
+
+    return Vector2D(delta_percent.x * SWIPEDISTANCE, delta_percent.y * SWIPEDISTANCE);
+}
+
+void GestureManager::touchBindDispatcher(std::string args) {
+    auto argsSplit = splitString(args, ',', 4);
+    if (argsSplit.size() < 4) {
+        Log::logger->log(Log::ERR, "touchBind called with not enough args: {}", args);
+        return;
+    }
+    const auto _modifier      = trim(argsSplit[0]);
+    const auto key            = trim(argsSplit[1]);
+    const auto dispatcher     = trim(argsSplit[2]);
+    const auto dispatcherArgs = trim(argsSplit[3]);
+
+    this->internalBinds.emplace_back(
+        makeShared<SKeybind>(SKeybind{
+            .key     = key,
+            .handler = dispatcher,
+            .arg     = dispatcherArgs,
+        })
+    );
+}
+
+void GestureManager::debugLog(const std::string& msg) {
+    Log::logger->log(Log::DEBUG, "[hyprgrass] " + msg);
+}
+
+void hyprgrass_debug(const std::string& s) {
+    Log::logger->log(Log::DEBUG, "[hyprgrass] [debug] {}", s);
+}

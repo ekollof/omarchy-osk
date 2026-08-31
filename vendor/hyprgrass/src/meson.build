@@ -1,0 +1,25 @@
+version_header = configure_file(
+  input: 'version.hpp.in',
+  output: 'version.hpp',
+  configuration: {
+    'HYPRGRASS_VERSION': meson.project_version()
+  }
+)
+
+if get_option('hyprgrass')
+  subdir('gestures')
+
+  shared_module('hyprgrass',
+    'main.cpp',
+    'GestureManager.cpp',
+    'ShimTrackpadGestures.cpp',
+    'VecSet.cpp',
+    cpp_args: ['-DWLR_USE_UNSTABLE'],
+    link_with: [gestures],
+    dependencies: [
+      wftouch,
+      hyprland_deps,
+      hyprland_headers
+    ],
+    install: true)
+endif
