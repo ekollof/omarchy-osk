@@ -164,7 +164,14 @@ outright.
   enters two-finger scroll. An earlier version flagged only the first
   finger's down, so scroll/right-click could never engage while taps and
   drags (first finger only) kept working. Batched landings (both fingers
-  before the apply timer) must resolve in a single pass.
+  before the apply timer) must resolve in a single pass. Scroll is emitted
+  touchpad-style (raw logical px, 1:1 with the hand) and shaped per gesture
+  by focused window class: Hyprland 0.56 only forwards v120 for wheel
+  source, and Chromium rescales plain axis values by 1/10 * 120 (wheel
+  ticks) — so chrom*-class windows get SOURCE_WHEEL + value120 (exact
+  pixels via Chromium's v8 handler, which replaces the legacy delta in the
+  same frame), while kitty & co read plain axis as continuous pixels (v120
+  would mean wheel notches to them) and get SOURCE_FINGER.
 - **Bar widget popup**: use the shell's `qs.Ui` `Panel` base + `BarIconButton`
   + `KeyboardPanel` (see `shell/ekollof.osk-applet/Panel.qml` and
   `~/src/omarchy/shell/plugins/panels/power/Panel.qml` as the canonical

@@ -55,9 +55,12 @@
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <set>
 #include <hyprland/src/event/EventBus.hpp>
+
+#include <cmath>
 
 #include <atomic>
 #include <cstring>
@@ -549,7 +552,13 @@ static int      fingers = 0;
 static bool     ignore_until_zero = false;      /* gesture ended; wait for all fingers up */
 static bool     scroll_mode = false;
 static double   scroll_anchor_y = 0;            /* normalized y anchor */
-static int      scroll_steps = 0;
+static double   scroll_travel_px = 0;           /* px moved this gesture (tap-vs-scroll heuristic) */
+static bool     scroll_wheel_shape = false;     /* per-gesture event shape, chosen by focused window class:
+                                                 * Chromium rescales legacy axis values by 1/10 * 120 (wheel
+                                                 * ticks) and only honors v120 when Hyprland sends it, which
+                                                 * 0.56 gates to wheel source — so chrom*-class windows get
+                                                 * wheel+v120; kitty & co read plain axis as continuous px
+                                                 * (their v120 would be wheel notches) and get FINGER px. */
 static uint32_t dual_start_ms = 0;
 static Vector2D lastPos;                        /* normalized (0..1) */
 static bool     pressed = false;                /* left button held */
@@ -656,7 +665,7 @@ static void applyTouches()
             /* finger lifted mid-scroll: gesture over */
             scroll_mode = false;
             /* two-finger tap without scrolling = right click */
-            if (scroll_steps == 0 && nowMs() - dual_start_ms <= 250) {
+            if (std::abs(scroll_travel_px) < 10 && nowMs() - dual_start_ms <= 250) {
                 g_pSeatManager->sendPointerButton(nowMs(), BTN_RIGHT, WL_POINTER_BUTTON_STATE_PRESSED);
                 g_pSeatManager->sendPointerFrame();
                 g_pSeatManager->sendPointerButton(nowMs(), BTN_RIGHT, WL_POINTER_BUTTON_STATE_RELEASED);
@@ -707,7 +716,7 @@ static void applyTouches()
                 DBG("panel contact: synthetic pointer press");
             }
             scroll_mode  = false;
-            scroll_steps = 0;
+            scroll_travel_px = 0;
         } else if (fingers >= 3) {
             /* 3+ fingers: hyprgrass territory */
             if (pressed) {
@@ -726,8 +735,16 @@ static void applyTouches()
             if (!scroll_mode) {
                 scroll_mode     = true;
                 scroll_anchor_y = lastPos.y;
-                scroll_steps    = 0;
+                scroll_travel_px = 0;
                 dual_start_ms   = nowMs();
+                scroll_wheel_shape = false;
+                if (auto w = Desktop::focusState()->window()) {
+                    std::string cls = w->m_class;
+                    for (char &c : cls)
+                        c = c >= 'A' && c <= 'Z' ? c + 32 : c;
+                    if (cls.contains("chrom"))
+                        scroll_wheel_shape = true;
+                }
                 DBG("two fingers: scroll mode");
             }
         } else if (!pressed) {
@@ -739,7 +756,7 @@ static void applyTouches()
             g_pSeatManager->sendPointerFrame();
             pressed      = true;
             scroll_mode  = false;
-            scroll_steps = 0;
+            scroll_travel_px = 0;
             DBG("contact: pointer under finger, pressed");
         }
     }
@@ -767,19 +784,34 @@ static void applyTouches()
         Pointer::pointerController()->warpTo(global, true);
         g_pInputManager->simulateMouseMovement();
     } else if (scroll_mode && fingers == 2) {
-        /* scroll from the vertical delta of the normalized position;
-         * 0.025 ≈ 20 logical px on an 800-tall screen */
-        double dy = lastPos.y - scroll_anchor_y;
-        int steps = (int)(dy / 0.025);
-        if (steps != 0) {
-            scroll_anchor_y += steps * 0.025;
-            scroll_steps += abs(steps);
+        /* touchpad-style scroll: pixel deltas 1:1 with the finger, so content
+         * tracks the hand exactly. Wheel-source events (the old 0.025-units-
+         * per-notch scheme) get client-side acceleration/smoothing and
+         * outrun the fingers. */
+        auto mon = State::monitorState()
+                       ->query()
+                       .name(!touchDeviceOutput.empty() ? touchDeviceOutput : "")
+                       .run();
+        if (!mon)
+            mon = Desktop::focusState()->monitor();
+        double px = (lastPos.y - scroll_anchor_y) * mon->m_size.y; /* logical px */
+        scroll_anchor_y = lastPos.y; /* consume the full delta: no drift */
+        if (px != 0.0) {
+            scroll_travel_px += std::abs(px);
             /* natural scrolling: content follows the fingers */
-            g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, steps * -10.0, -steps,
-                                            steps * -120, WL_POINTER_AXIS_SOURCE_WHEEL,
-                                            WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+            if (scroll_wheel_shape) {
+                /* Chromium: v120 rides as exact pixels (its v8 handler wins
+                 * over the x12 legacy rescale within the frame) */
+                g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0,
+                                                (int32_t)std::lround(-px), WL_POINTER_AXIS_SOURCE_WHEEL,
+                                                WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+            } else {
+                /* kitty & co: plain axis is the continuous pixel bucket */
+                g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0, 0,
+                                                WL_POINTER_AXIS_SOURCE_FINGER,
+                                                WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+            }
             g_pSeatManager->sendPointerFrame();
-            DBG("scroll " + std::to_string(steps) + " steps");
         }
     }
 }
