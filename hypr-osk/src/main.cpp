@@ -35,6 +35,9 @@
  *                                needs HYPR_OSK_ALLOW_ANY_PEER=1)
  *   FLING <tau_ms> <cap_px_s>    scroll momentum: decay time constant and
  *                                entry-velocity cap for the post-lift fling
+ *   SWALLOW <0|1>                consume touchscreen input (virtual pointer
+ *                                + gestures) or pass it to Hyprland's native
+ *                                touchscreen support
  *
  * Access control: the socket can type into the focused session, so peers are
  * validated on accept with SO_PEERCRED — the uid must match and (unless
@@ -93,7 +96,7 @@ static int    debug   = 1;
  * corrupt under event-loop reentrancy (the crash mechanism). TEXT is
  * bounded to 95 bytes. */
 struct SOskCommand {
-    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING } type;
+    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, SWALLOW } type;
     int  a = 0, b = 0;
     char text[TEXT_CAP] = {0};
 };
@@ -584,6 +587,8 @@ static SP<CEventLoopTimer> g_flingTimer;
 static double   fling_tau = 0.32;               /* momentum decay constant (s, FLING cmd) */
 static double   fling_cap = 5500.0;             /* fling entry velocity cap (px/s) */
 static double   fling_min = 200.0;              /* minimum lift velocity to fling (px/s) */
+static bool     touch_swallow = true;           /* consume all touch input (virtual pointer);
+                                                 * off = native touchscreen support */
 
 /* OSK panel exemption: touches inside this rect (normalized 0..1 on the
  * touch device's frame) pass through to the panel's own Qt touch handling;
@@ -747,6 +752,11 @@ static void armPressTimer()
  * input/monitor code from inside the touch callback deadlocks the pipeline) */
 static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
 {
+    if (!touch_swallow) {
+        /* native touchscreen mode: hand the contact to Hyprland untouched */
+        info.cancelled = false;
+        return;
+    }
     stopFling(); /* a new touch always kills momentum */
     fingers++;
     lastPos            = ev.pos;
@@ -770,6 +780,10 @@ static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
 
 static void touchUp(ITouch::SUpEvent ev, Event::SCallbackInfo &info)
 {
+    if (!touch_swallow) {
+        info.cancelled = false;
+        return;
+    }
     if (fingers > 0)
         fingers--;
     g_slotPos.erase(ev.touchID);
@@ -780,6 +794,10 @@ static void touchUp(ITouch::SUpEvent ev, Event::SCallbackInfo &info)
 
 static void touchMotion(ITouch::SMotionEvent ev, Event::SCallbackInfo &info)
 {
+    if (!touch_swallow) {
+        info.cancelled = false;
+        return;
+    }
     lastPos       = ev.pos;
     g_slotPos[ev.touchID] = ev.pos; /* keep slot positions live — stale slots freeze the
                                      * scroll/pinch geometry at the down points */
@@ -1451,6 +1469,16 @@ static void handle_line(int cfd, char *line)
             reply = "ok";
         } else
             reply = "err bad args";
+    } else if (!strncmp(line, "SWALLOW ", 8)) {
+        /* SWALLOW <0|1> — consume touchscreen input (virtual pointer) or
+         * hand it to Hyprland's native touchscreen support */
+        if (!strcmp(line + 8, "0") || !strcmp(line + 8, "1")) {
+            cmd.type = SOskCommand::EType::SWALLOW;
+            cmd.a    = line[8] - '0';
+            queueCommand(std::move(cmd));
+            reply = "ok";
+        } else
+            reply = "err bad args";
     } else if (!strncmp(line, "MON", 3)) {
         /* MON — reply with the touch monitor's logical frame (x y w h), the
          * exact frame touch ev.pos is normalized against (m_position/m_size) */
@@ -1468,12 +1496,12 @@ static void handle_line(int cfd, char *line)
         snprintf(buf, sizeof buf,
                  "state fingers=%d pressed=%d ignore=%d scroll=%d down=%d up=%d contact_osk=%d "
                  "panel_valid=%d inject=%d anypeer=%d panel_ny=%.3f panel_nh=%.3f last=%.3f,%.3f "
-                 "fires=%u ring=%zu indrain=%d layout=%s textmap=%zu fling=%.0fms/%.0fpx",
+                 "fires=%u ring=%zu indrain=%d layout=%s textmap=%zu fling=%.0fms/%.0fpx swallow=%d",
                  fingers, (int)pressed, (int)ignore_until_zero, (int)scroll_mode, (int)down_flag,
                  (int)up_flag, (int)contact_is_panel_native, (int)panel_rect_valid,
                  (int)panel_rect_valid, (int)g_allowAnyPeer, panel_ny,
                  panel_nh, lastPos.x, lastPos.y, g_drain_fires, g_ringCount, (int)g_inDrain,
-                 g_layoutSpec.c_str(), g_textMap.size(), fling_tau * 1000.0, fling_cap);
+                 g_layoutSpec.c_str(), g_textMap.size(), fling_tau * 1000.0, fling_cap, (int)touch_swallow);
         reply = buf;
     } else if (!strncmp(line, "CALIB ", 6)) {
         reply = "ok"; /* accepted for protocol compatibility; the frame comes from the compositor */
@@ -1668,6 +1696,30 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 fling_cap = std::max(500.0, std::min(20000.0, (double)c.b));
                 DBG("fling: tau=" + std::to_string(fling_tau) + " cap=" + std::to_string(fling_cap));
                 break;
+            case SOskCommand::EType::SWALLOW:
+                touch_swallow = c.a != 0;
+                traceGeom(std::string("swallow set: ") + (touch_swallow ? "on" : "off"));
+                if (!touch_swallow) {
+                    /* mid-gesture toggle: unwind everything cleanly */
+                    if (pressed || panel_pressed) {
+                        g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+                        g_pSeatManager->sendPointerFrame();
+                    }
+                    pressed = panel_pressed = false;
+                    stopFling();
+                    releasePinchCtrl();
+                    press_pending = false;
+                    press_due     = false;
+                    contact_is_panel_native = false;
+                    fingers          = 0;
+                    ignore_until_zero = false;
+                    scroll_mode      = false;
+                    pinch_mode       = false;
+                    gesture_decided  = false;
+                    g_slotPos.clear();
+                }
+                DBG(std::string("touch swallow: ") + (touch_swallow ? "on" : "off"));
+                break;
             }
             g_ringMutex.lock();
         }
@@ -1741,6 +1793,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                          "[hypr-osk] HYPR_OSK_ALLOW_ANY_PEER=1: peer exe check skipped, PMOVE/PBTN enabled");
 
     g_socketRunning = true;
+    traceGeom(std::string("plugin init, swallow=") + (touch_swallow ? "on" : "off"));
     g_socketThread = std::thread(socket_thread_fn, socketPath());
 
     Log::logger->log(Log::INFO, "[hypr-osk] plugin initialized, socket at " + socketPath());

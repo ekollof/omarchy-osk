@@ -99,13 +99,20 @@ right-click = toggle).
   locale: LC_ALL > LC_CTYPE > LANG territory → xkb layout (en_US → us,
   da_DK → dk, …), persisted on first run to `~/.config/omarchy/osk.json`.
 - **Config**: `~/.config/omarchy/osk.json` — `{layout, repeat, repeatDelay,
-  repeatInterval, flingDecay, flingCap}`. The OSK plugin owns the file; the
-  bar applet edits through its IPC target (`omarchy-shell ekollof.osk
-  setLayout dk`, `setRepeat d r`, `setRepeatEnabled on|off`, `setFling tau
-  cap`, `getState`) and watches the file for display. Fling values ride to
-  the compositor plugin as `FLING <tau> <cap>` on handshake and on change.
-  Applet enable/disable toggles the whole `ekollof.osk` plugin via
+  repeatInterval, flingDecay, flingCap, touchSwallow}`. The OSK plugin owns
+  the file; the bar applet edits through its IPC target (`omarchy-shell
+  ekollof.osk setLayout dk`, `setRepeat d r`, `setRepeatEnabled on|off`,
+  `setFling tau cap`, `setTouchSwallow on|off`, `getState`) and watches the
+  file for display. Fling values and the swallow flag ride to the compositor
+  plugin as `FLING`/`SWALLOW` on handshake and on change. Applet
+  enable/disable toggles the whole `ekollof.osk` plugin via
   `shell.pluginRegistry.setEnabled`.
+- **Touch swallowing off = native mode**: `SWALLOW 0` makes the plugin stop
+  consuming touchscreen input — apps receive native wl_touch (incl.
+  Hyprland's builtin pointer emulation and touch refocus); all plugin
+  gestures (scroll/pinch/tap emulation) are inert, and OSK key taps fall
+  back to Qt's own touch handling of the layer surface. Toggling mid-gesture
+  unwinds cleanly (button release, fling/ctrl reset, slot clear).
 
 ## Socket protocol (single client)
 
@@ -114,7 +121,8 @@ replies `ok` / `err <msg>` / `PONG`; the plugin pushes `grid <json>` lines
 unsolicited. Commands: `PING`, `KEY <evdev> <1|0>`, `MOD <shift|ctrl|alt|super>
 <on|off>`, `MODS off`, `TEXT <utf8>`, `LAYOUT <name>[(<variant>)]`, `ROWS`,
 `PANEL x y w h`, `PMOVE x y`, `PBTN <code> <1|0>`, `MON`, `CALIB` (no-op),
-`FLING <tau_ms> <cap_px_s>` (scroll momentum decay + speed cap), `STATS`.
+`FLING <tau_ms> <cap_px_s>` (scroll momentum decay + speed cap),
+`SWALLOW <0|1>` (touch input swallowing on/off), `STATS`.
 Full docs: header of `hypr-osk/src/main.cpp`.
 
 **Access control**: the socket can type into the focused session, so peers

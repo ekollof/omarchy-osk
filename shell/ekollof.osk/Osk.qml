@@ -43,6 +43,7 @@ Item {
   property bool repeatEnabled: true   // hold-to-repeat on/off (bar applet toggle)
   property int flingDecay: 320        // fling momentum decay constant (ms)
   property int flingCap: 5500         // fling entry velocity cap (px/s)
+  property bool touchSwallow: true    // on: virtual pointer device; off: native touchscreen
   property var grid: null             // letter grid from the plugin (ROWS)
   property string touchMonitor: ""    // monitor with the touch surface (plugin MON reply)
 
@@ -142,11 +143,12 @@ Item {
     root.repeatEnabled = cfg.repeat !== undefined ? !!cfg.repeat : true // default on
     root.flingDecay = clampInt(cfg.flingDecay, 100, 800, 320)
     root.flingCap = clampInt(cfg.flingCap, 1000, 8000, 5500)
+    root.touchSwallow = cfg.touchSwallow !== undefined ? !!cfg.touchSwallow : true
     root.cfgLoaded = true
     // persist on first run so the applet sees the LANG-derived default too
     if (!raw || !cfg.layout || cfg.repeat === undefined || cfg.flingDecay === undefined ||
-        cfg.flingCap === undefined || cfg.repeatDelay !== root.repeatDelay ||
-        cfg.repeatInterval !== root.repeatInterval)
+        cfg.flingCap === undefined || cfg.touchSwallow === undefined ||
+        cfg.repeatDelay !== root.repeatDelay || cfg.repeatInterval !== root.repeatInterval)
       persistConfig()
     // pushes the (possibly changed) layout to the plugin and pulls the grid
     Qt.callLater(root.announce)
@@ -159,7 +161,8 @@ Item {
       repeatDelay: root.repeatDelay,
       repeatInterval: root.repeatInterval,
       flingDecay: root.flingDecay,
-      flingCap: root.flingCap
+      flingCap: root.flingCap,
+      touchSwallow: root.touchSwallow
     }) + "\n")
   }
 
@@ -173,6 +176,7 @@ Item {
       repeatInterval: root.repeatInterval,
       flingDecay: root.flingDecay,
       flingCap: root.flingCap,
+      touchSwallow: root.touchSwallow,
       gridLoaded: !!root.grid
     })
   }
@@ -220,6 +224,16 @@ Item {
     return "ok"
   }
 
+  function setTouchSwallow(arg) {
+    const v = String(arg || "").trim().toLowerCase()
+    if (v !== "on" && v !== "off" && v !== "true" && v !== "false" && v !== "1" && v !== "0")
+      return "err need on|off"
+    root.touchSwallow = (v === "on" || v === "true" || v === "1")
+    persistConfig()
+    send("SWALLOW " + (root.touchSwallow ? "1" : "0"))
+    return "ok"
+  }
+
   // ---- IPC: the bar applet (and scripts) drive settings through here -----
   // `omarchy-shell ekollof.osk <method> [args…]`. The shell target's generic
   // `call` verb is currently broken for panel plugins, so the applet routes
@@ -243,6 +257,10 @@ Item {
 
     function setFling(decay: string, cap: string): string {
       return root.setFling(decay + " " + cap)
+    }
+
+    function setTouchSwallow(on: string): string {
+      return root.setTouchSwallow(on)
     }
 
     function toggle(): string {
@@ -286,6 +304,7 @@ Item {
     send("ROWS")
     send("MON")
     send("FLING " + root.flingDecay + " " + root.flingCap)
+    send("SWALLOW " + (root.touchSwallow ? "1" : "0"))
     if (root.opened)
       Qt.callLater(root.syncPanel)
   }
@@ -592,6 +611,6 @@ Item {
 
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
-  Component.onCompleted: console.log("[ekollof.osk] loaded rev9 layout=" + root.layout +
+  Component.onCompleted: console.log("[ekollof.osk] loaded rev10 layout=" + root.layout +
                                      " cfg=" + root.cfgPath())
 }

@@ -25,6 +25,7 @@ Panel {
   property int repeatInterval: 60
   property int flingDecay: 320
   property int flingCap: 5500
+  property bool touchSwallow: true
   property var layouts: []
 
   implicitWidth: button.implicitWidth
@@ -79,6 +80,8 @@ Panel {
       root.flingDecay = parseInt(cfg.flingDecay, 10) || 320
     if (cfg.flingCap)
       root.flingCap = parseInt(cfg.flingCap, 10) || 5500
+    if (cfg.touchSwallow !== undefined)
+      root.touchSwallow = !!cfg.touchSwallow
   }
 
   function setLayouts(raw) {
@@ -168,6 +171,21 @@ Panel {
         foreground: root.bar ? root.bar.foreground : Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onClicked: root.setOskEnabled(!root.oskEnabled)
+      }
+
+      Toggle {
+        width: parent.width
+        label: "Virtual pointing device"
+        description: root.touchSwallow
+                     ? "On: touch input drives the virtual pointer (tap, drag, scroll, pinch)"
+                     : "Off: native touchscreen support — apps receive raw touch, gestures are off"
+        checked: root.touchSwallow
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        onClicked: {
+          root.touchSwallow = !root.touchSwallow
+          root.callOsk("setTouchSwallow", root.touchSwallow ? "on" : "off")
+        }
       }
 
       Button {
