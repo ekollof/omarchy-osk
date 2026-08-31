@@ -158,6 +158,13 @@ outright.
   apply timer; all compositor mutations happen in `applyTouches()` on the
   idle phase of the main thread. Same for socket commands: queued into a
   fixed ring buffer, drained by an event-loop timer on the main thread.
+- **The touch resolver must see every contact down.** `touchDown` sets
+  `down_flag` unconditionally and the `applyTouches()` down-branch is a mode
+  resolver driven by (fingers, pressed) — the second finger's down is what
+  enters two-finger scroll. An earlier version flagged only the first
+  finger's down, so scroll/right-click could never engage while taps and
+  drags (first finger only) kept working. Batched landings (both fingers
+  before the apply timer) must resolve in a single pass.
 - **Bar widget popup**: use the shell's `qs.Ui` `Panel` base + `BarIconButton`
   + `KeyboardPanel` (see `shell/ekollof.osk-applet/Panel.qml` and
   `~/src/omarchy/shell/plugins/panels/power/Panel.qml` as the canonical

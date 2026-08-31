@@ -604,9 +604,9 @@ static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
 {
     fingers++;
     lastPos            = ev.pos;
-    contact_is_panel_native = posInPanel(ev.pos.x, ev.pos.y);
     if (fingers == 1)
-        down_flag = true; /* panel contacts apply as synthetic pointer clicks */
+        contact_is_panel_native = posInPanel(ev.pos.x, ev.pos.y); /* primary contact decides the mode */
+    down_flag = true; /* EVERY down must apply: the resolver needs to see finger #2 to enter scroll */
     info.cancelled = true; /* consumed: Hyprland's touch refocus would steal keyboard focus */
     scheduleApply();
 }
@@ -681,6 +681,10 @@ static void applyTouches()
     }
 
     if (down_flag) {
+        /* mode resolver: settles the gesture state from (fingers, pressed).
+         * Runs for EVERY contact down — the second finger's down is what
+         * enters scroll mode; batched landings (both fingers before the
+         * apply timer) resolve here in one pass. */
         down_flag = false;
         auto mon = State::monitorState()
                        ->query()
@@ -690,45 +694,53 @@ static void applyTouches()
             mon = Desktop::focusState()->monitor();
 
         if (contact_is_panel_native) {
-            /* synthetic click on the keyboard panel: pointer focus delivers
-             * the tap to the layer; keyboard focus never moves (the layer is
-             * keyboard-focus-none) */
-            Vector2D global = mon->m_position + (lastPos * mon->m_size);
-            Pointer::pointerController()->warpTo(global, true);
-            g_pInputManager->simulateMouseMovement();
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
-            g_pSeatManager->sendPointerFrame();
-            panel_pressed = true;
-            scroll_mode   = false;
-            scroll_steps  = 0;
-            DBG("panel contact: synthetic pointer press");
-        } else if (fingers == 1 && !pressed) {
+            /* panel contact: synthetic click on the keyboard layer — pointer
+             * focus delivers the tap, keyboard focus never moves (the layer
+             * is keyboard-focus-none). Extra fingers on the panel: ignored. */
+            if (!panel_pressed && fingers == 1) {
+                Vector2D global = mon->m_position + (lastPos * mon->m_size);
+                Pointer::pointerController()->warpTo(global, true);
+                g_pInputManager->simulateMouseMovement();
+                g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
+                g_pSeatManager->sendPointerFrame();
+                panel_pressed = true;
+                DBG("panel contact: synthetic pointer press");
+            }
+            scroll_mode  = false;
+            scroll_steps = 0;
+        } else if (fingers >= 3) {
+            /* 3+ fingers: hyprgrass territory */
+            if (pressed) {
+                g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+                g_pSeatManager->sendPointerFrame();
+                pressed = false;
+            }
+            scroll_mode = false;
+        } else if (fingers == 2) {
+            /* two fingers: end any drag, enter two-finger scroll */
+            if (pressed) {
+                g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+                g_pSeatManager->sendPointerFrame();
+                pressed = false;
+            }
+            if (!scroll_mode) {
+                scroll_mode     = true;
+                scroll_anchor_y = lastPos.y;
+                scroll_steps    = 0;
+                dual_start_ms   = nowMs();
+                DBG("two fingers: scroll mode");
+            }
+        } else if (!pressed) {
             /* primary contact: cursor under the finger, button pressed */
             Vector2D global = mon->m_position + (lastPos * mon->m_size);
             Pointer::pointerController()->warpTo(global, true);
             g_pInputManager->simulateMouseMovement();
             g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
             g_pSeatManager->sendPointerFrame();
-            pressed     = true;
-            scroll_mode = false;
+            pressed      = true;
+            scroll_mode  = false;
             scroll_steps = 0;
             DBG("contact: pointer under finger, pressed");
-        } else if (fingers == 2 && pressed) {
-            /* second finger: end drag, enter two-finger scroll */
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
-            g_pSeatManager->sendPointerFrame();
-            pressed        = false;
-            scroll_mode    = true;
-            scroll_anchor_y = lastPos.y;
-            scroll_steps   = 0;
-            dual_start_ms  = nowMs();
-            DBG("two fingers: scroll mode");
-        } else if (fingers >= 3 && pressed) {
-            /* 3+ fingers: hyprgrass territory */
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
-            g_pSeatManager->sendPointerFrame();
-            pressed      = false;
-            scroll_mode  = false;
         }
     }
 
