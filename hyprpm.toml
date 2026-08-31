@@ -8,6 +8,7 @@
 # preferred when both exist; the loader guards against double-loads).
 # commit_pins: running-Hyprland-commit -> plugin-commit that built against it.
 [repository]
+repository = "https://github.com/ekollof/omarchy-osk"
 name = "hypr-osk"
 authors = ["ekollof"]
 commit_pins = [

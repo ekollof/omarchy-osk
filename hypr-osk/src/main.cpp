@@ -565,7 +565,8 @@ static bool     pressed = false;                /* left button held */
 static bool     panel_pressed = false;          /* synthetic click on the OSK panel */
 static unsigned g_drain_fires = 0;               /* drain timer fire count */
 static bool     down_flag = false, up_flag = false, motion_flag = false;
-static std::string touchDeviceOutput = "eDP-1";
+static std::string touchDeviceOutput = ""; /* resolved per gesture from the touch device's
+                                            * bound output (touchDown); empty → focus monitor */
 static bool     apply_pending = false;
 
 /* OSK panel exemption: touches inside this rect (normalized 0..1 on the
@@ -613,6 +614,10 @@ static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
 {
     fingers++;
     lastPos            = ev.pos;
+    /* the touch device's bound output decides which monitor frame ev.pos is
+     * normalized against — no hardcoded display anywhere */
+    if (ev.device && !ev.device->m_boundOutput.empty())
+        touchDeviceOutput = ev.device->m_boundOutput;
     if (fingers == 1)
         contact_is_panel_native = posInPanel(ev.pos.x, ev.pos.y); /* primary contact decides the mode */
     down_flag = true; /* EVERY down must apply: the resolver needs to see finger #2 to enter scroll */
@@ -1199,9 +1204,9 @@ static void handle_line(int cfd, char *line)
         if (!mon)
             mon = Desktop::focusState()->monitor();
         if (mon) {
-            char buf[128];
-            snprintf(buf, sizeof buf, "mon %d %d %d %d", (int)mon->m_position.x, (int)mon->m_position.y,
-                     (int)mon->m_size.x, (int)mon->m_size.y);
+            char buf[160];
+            snprintf(buf, sizeof buf, "mon %s %d %d %d %d", mon->m_name.c_str(), (int)mon->m_position.x,
+                     (int)mon->m_position.y, (int)mon->m_size.x, (int)mon->m_size.y);
             reply = buf;
         } else
             reply = "err no monitor";

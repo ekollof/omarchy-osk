@@ -42,6 +42,7 @@ Item {
   property int repeatInterval: 60     // ms between repeats
   property bool repeatEnabled: true   // hold-to-repeat on/off (bar applet toggle)
   property var grid: null             // letter grid from the plugin (ROWS)
+  property string touchMonitor: ""    // monitor with the touch surface (plugin MON reply)
 
   readonly property real unit: (panel.width - Style.space(8) * 2) / 15.0 // widest row (home row)
   readonly property int keyH: Style.space(46)
@@ -62,6 +63,7 @@ Item {
 
   function show() {
     root.opened = true
+    send("MON") // re-check which screen carries the touch surface
     syncPanel()
   }
 
@@ -84,8 +86,8 @@ Item {
 
   function syncPanel() {
     // Publish our rect to the plugin, normalized against the touch screen's
-    // logical frame (the same frame ev.pos is normalized to; MON is the
-    // plugin's own view of that frame — 1280x800 for the transformed panel).
+    // logical frame — the same frame ev.pos is normalized to. The plugin
+    // reports that frame (and the monitor's name) via MON.
     const s = panel.screen
     if (!root.opened || !s || s.height <= 0)
       return
@@ -258,6 +260,7 @@ Item {
     root.announced = true
     send("LAYOUT " + root.layout)
     send("ROWS")
+    send("MON")
     if (root.opened)
       Qt.callLater(root.syncPanel)
   }
@@ -268,6 +271,15 @@ Item {
         root.grid = JSON.parse(line.substring(5))
       } catch (e) {
         console.warn("[ekollof.osk] bad grid reply: " + e)
+      }
+    } else if (line.indexOf("mon ") === 0) {
+      // "mon <name> x y w h" — the monitor whose frame touch ev.pos is
+      // normalized against; dock the keyboard there
+      const name = line.split(/\s+/)[1] || ""
+      if (name && name !== root.touchMonitor) {
+        console.log("[ekollof.osk] touch monitor: " + name)
+        root.touchMonitor = name
+        Qt.callLater(root.syncPanel)
       }
     }
   }
@@ -447,7 +459,9 @@ Item {
   PanelWindow {
     id: panel
     visible: root.opened
-    screen: Quickshell.screens.find(s => s.name === "eDP-1") ?? null
+    screen: root.touchMonitor
+            ? (Quickshell.screens.find(s => s.name === root.touchMonitor) ?? null)
+            : null
     anchors {
       left: true
       bottom: true
@@ -553,6 +567,6 @@ Item {
 
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
-  Component.onCompleted: console.log("[ekollof.osk] loaded rev7 layout=" + root.layout +
+  Component.onCompleted: console.log("[ekollof.osk] loaded rev8 layout=" + root.layout +
                                      " cfg=" + root.cfgPath())
 }

@@ -76,7 +76,10 @@ right-click = toggle).
   QML publishes via `PANEL x y w h` (normalized 0..1 against the touch
   device's monitor frame) become synthetic clicks on the keyboard layer, so
   Qt `TapHandler`s work while keyboard focus never moves (the layer is
-  keyboard-focus none).
+  keyboard-focus none). Touch coords are normalized against the touch
+  device's bound output, resolved per gesture from the device itself (no
+  hardcoded display); `MON` answers `mon <name> x y w h` and the shell
+  docks the keyboard panel on that monitor.
 - **Key tap → typed char**: TapHandler → `activate()` → socket `TEXT <utf8>`
   or `KEY <evdev> 1/0` → compositor plugin maps the char against the ACTIVE
   xkb keymap of its synthetic keyboard device (`hypr-osk-vk`) and injects
