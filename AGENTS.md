@@ -179,7 +179,10 @@ outright.
   ticks) — so chrom*-class windows get SOURCE_WHEEL + value120 (exact
   pixels via Chromium's v8 handler, which replaces the legacy delta in the
   same frame), while kitty & co read plain axis as continuous pixels (v120
-  would mean wheel notches to them) and get SOURCE_FINGER.
+  would mean wheel notches to them) and get SOURCE_FINGER. Finger #1's
+  button-down is deferred ~130 ms (`PRESS_DELAY_MS`) so a landing second
+  finger cancels it — two-finger scroll never drag-selects text; quick taps
+  click on lift, held single-finger drags get the button after the delay.
 - **Bar widget popup**: use the shell's `qs.Ui` `Panel` base + `BarIconButton`
   + `KeyboardPanel` (see `shell/ekollof.osk-applet/Panel.qml` and
   `~/src/omarchy/shell/plugins/panels/power/Panel.qml` as the canonical

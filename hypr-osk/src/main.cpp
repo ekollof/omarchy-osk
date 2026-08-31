@@ -568,6 +568,10 @@ static bool     down_flag = false, up_flag = false, motion_flag = false;
 static std::string touchDeviceOutput = ""; /* resolved per gesture from the touch device's
                                             * bound output (touchDown); empty → focus monitor */
 static bool     apply_pending = false;
+static bool     press_pending = false;          /* single-finger button-down deferred ~130 ms:
+                                                 * a landing second finger cancels it, so two-finger
+                                                 * scroll never drag-selects text */
+static bool     press_due = false;              /* deferred-press timer fired (main thread) */
 
 /* OSK panel exemption: touches inside this rect (normalized 0..1 on the
  * touch device's frame) pass through to the panel's own Qt touch handling;
@@ -608,6 +612,38 @@ static void scheduleApply()
         g_applyTimer->updateTimeout(std::chrono::milliseconds(0));
 }
 
+static SP<Monitor::CMonitor> resolveTouchMonitor()
+{
+    auto mon = State::monitorState()
+                   ->query()
+                   .name(!touchDeviceOutput.empty() ? touchDeviceOutput : "")
+                   .run();
+    if (!mon)
+        mon = Desktop::focusState()->monitor();
+    return mon;
+}
+
+/* the single-finger button-down waits PRESS_DELAY_MS before firing: a second
+ * finger landing inside that window converts the gesture to a two-finger
+ * scroll without ever dragging the button (which drag-selects text) */
+#define PRESS_DELAY_MS 130
+static SP<CEventLoopTimer> g_pressTimer;
+
+static void armPressTimer()
+{
+    if (!g_pressTimer) {
+        g_pressTimer = makeShared<CEventLoopTimer>(
+            std::chrono::milliseconds(PRESS_DELAY_MS),
+            [](SP<CEventLoopTimer>, void*) {
+                press_due = true;
+                applyTouches();
+            },
+            nullptr);
+        g_pEventLoopManager->addTimer(g_pressTimer);
+    } else
+        g_pressTimer->updateTimeout(std::chrono::milliseconds(PRESS_DELAY_MS));
+}
+
 /* handlers: record state + schedule only — no compositor calls (calling
  * input/monitor code from inside the touch callback deadlocks the pipeline) */
 static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
@@ -621,6 +657,12 @@ static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
     if (fingers == 1)
         contact_is_panel_native = posInPanel(ev.pos.x, ev.pos.y); /* primary contact decides the mode */
     down_flag = true; /* EVERY down must apply: the resolver needs to see finger #2 to enter scroll */
+    if (fingers == 1 && !contact_is_panel_native) {
+        /* defer the button-down: a second finger landing inside the window
+         * converts this gesture to a scroll without ever dragging the button */
+        press_pending = true;
+        armPressTimer();
+    }
     info.cancelled = true; /* consumed: Hyprland's touch refocus would steal keyboard focus */
     scheduleApply();
 }
@@ -648,6 +690,7 @@ static void applyTouches()
     if (ignore_until_zero) {
         up_flag = false;
         down_flag = false;
+        press_pending = false;
         if (fingers == 0)
             ignore_until_zero = false;
         return;
@@ -678,7 +721,19 @@ static void applyTouches()
                 DBG("two-finger tap: right click");
             }
         }
-        if (fingers == 0 && pressed) {
+        if (fingers == 0 && press_pending) {
+            /* quick tap: the deferred press hadn't fired yet — click on lift */
+            press_pending = false;
+            auto mon = resolveTouchMonitor();
+            Vector2D global = mon->m_position + (lastPos * mon->m_size);
+            Pointer::pointerController()->warpTo(global, true);
+            g_pInputManager->simulateMouseMovement();
+            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
+            g_pSeatManager->sendPointerFrame();
+            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+            g_pSeatManager->sendPointerFrame();
+            DBG("tap: deferred press+release at lift");
+        } else if (fingers == 0 && pressed) {
             g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
             g_pSeatManager->sendPointerFrame();
             pressed = false;
@@ -700,12 +755,7 @@ static void applyTouches()
          * enters scroll mode; batched landings (both fingers before the
          * apply timer) resolve here in one pass. */
         down_flag = false;
-        auto mon = State::monitorState()
-                       ->query()
-                       .name(!touchDeviceOutput.empty() ? touchDeviceOutput : "")
-                       .run();
-        if (!mon)
-            mon = Desktop::focusState()->monitor();
+        auto mon = resolveTouchMonitor();
 
         if (contact_is_panel_native) {
             /* panel contact: synthetic click on the keyboard layer — pointer
@@ -722,6 +772,7 @@ static void applyTouches()
             }
             scroll_mode  = false;
             scroll_travel_px = 0;
+            press_pending = false; /* panel taps press immediately, nothing deferred */
         } else if (fingers >= 3) {
             /* 3+ fingers: hyprgrass territory */
             if (pressed) {
@@ -730,8 +781,12 @@ static void applyTouches()
                 pressed = false;
             }
             scroll_mode = false;
+            press_pending = false;
         } else if (fingers == 2) {
-            /* two fingers: end any drag, enter two-finger scroll */
+            /* two fingers: end any drag, enter two-finger scroll — the
+             * deferred single-finger press (if it hadn't fired) dies here,
+             * so scrolling never starts with a held button */
+            press_pending = false;
             if (pressed) {
                 g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
                 g_pSeatManager->sendPointerFrame();
@@ -752,39 +807,43 @@ static void applyTouches()
                 }
                 DBG("two fingers: scroll mode");
             }
-        } else if (!pressed) {
-            /* primary contact: cursor under the finger, button pressed */
+        } else if (press_pending) {
+            /* primary contact: button-down is deferred (PRESS_DELAY_MS) so a
+             * landing second finger can still turn this into a scroll; the
+             * cursor already tracks the finger (motion branch) and a quick
+             * lift clicks at the touch point (up branch) */
+            Vector2D global = mon->m_position + (lastPos * mon->m_size);
+            Pointer::pointerController()->warpTo(global, true);
+            g_pInputManager->simulateMouseMovement();
+        }
+    }
+
+    if (press_due) {
+        /* deferred single-finger press: fire only if the gesture is still a
+         * lone, unpressed, non-panel contact */
+        press_due = false;
+        if (press_pending && fingers == 1 && !pressed && !contact_is_panel_native) {
+            auto mon = resolveTouchMonitor();
             Vector2D global = mon->m_position + (lastPos * mon->m_size);
             Pointer::pointerController()->warpTo(global, true);
             g_pInputManager->simulateMouseMovement();
             g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
             g_pSeatManager->sendPointerFrame();
-            pressed      = true;
-            scroll_mode  = false;
-            scroll_travel_px = 0;
-            DBG("contact: pointer under finger, pressed");
+            pressed = true;
+            DBG("deferred press fired");
         }
+        press_pending = false;
     }
 
-    if (fingers == 1 && pressed) {
-        /* motion: cursor follows the finger exactly */
-        auto mon = State::monitorState()
-                       ->query()
-                       .name(!touchDeviceOutput.empty() ? touchDeviceOutput : "")
-                       .run();
-        if (!mon)
-            mon = Desktop::focusState()->monitor();
+    if (fingers == 1 && (pressed || press_pending)) {
+        /* motion: cursor follows the finger (button may still be deferred) */
+        auto mon = resolveTouchMonitor();
         Vector2D global = mon->m_position + (lastPos * mon->m_size);
         Pointer::pointerController()->warpTo(global, true);
         g_pInputManager->simulateMouseMovement();
     } else if (fingers == 1 && panel_pressed) {
         /* drag on the panel: cursor follows, pointer focus stays on the layer */
-        auto mon = State::monitorState()
-                       ->query()
-                       .name(!touchDeviceOutput.empty() ? touchDeviceOutput : "")
-                       .run();
-        if (!mon)
-            mon = Desktop::focusState()->monitor();
+        auto mon = resolveTouchMonitor();
         Vector2D global = mon->m_position + (lastPos * mon->m_size);
         Pointer::pointerController()->warpTo(global, true);
         g_pInputManager->simulateMouseMovement();
@@ -793,12 +852,7 @@ static void applyTouches()
          * tracks the hand exactly. Wheel-source events (the old 0.025-units-
          * per-notch scheme) get client-side acceleration/smoothing and
          * outrun the fingers. */
-        auto mon = State::monitorState()
-                       ->query()
-                       .name(!touchDeviceOutput.empty() ? touchDeviceOutput : "")
-                       .run();
-        if (!mon)
-            mon = Desktop::focusState()->monitor();
+        auto mon = resolveTouchMonitor();
         double px = (lastPos.y - scroll_anchor_y) * mon->m_size.y; /* logical px */
         scroll_anchor_y = lastPos.y; /* consume the full delta: no drift */
         if (px != 0.0) {
@@ -1197,12 +1251,7 @@ static void handle_line(int cfd, char *line)
     } else if (!strncmp(line, "MON", 3)) {
         /* MON — reply with the touch monitor's logical frame (x y w h), the
          * exact frame touch ev.pos is normalized against (m_position/m_size) */
-        auto mon = State::monitorState()
-                       ->query()
-                       .name(!touchDeviceOutput.empty() ? touchDeviceOutput : "")
-                       .run();
-        if (!mon)
-            mon = Desktop::focusState()->monitor();
+        auto mon = resolveTouchMonitor();
         if (mon) {
             char buf[160];
             snprintf(buf, sizeof buf, "mon %s %d %d %d %d", mon->m_name.c_str(), (int)mon->m_position.x,
@@ -1507,6 +1556,11 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_applyTimer->cancel();
         g_pEventLoopManager->removeTimer(g_applyTimer);
         g_applyTimer.reset();
+    }
+    if (g_pressTimer) {
+        g_pressTimer->cancel();
+        g_pEventLoopManager->removeTimer(g_pressTimer);
+        g_pressTimer.reset();
     }
     if (g_drainTimer) {
         g_drainTimer->cancel();
