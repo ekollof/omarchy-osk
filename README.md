@@ -7,6 +7,10 @@ compositor plugin consumes all touchscreen input and re-emits it as pointer
 input, while the on-screen keyboard injects text and key events into whatever
 window has focus — exactly like wvkbd, but native to the Omarchy shell.
 
+<p align="center">
+  <img src="screenshot.jpeg" width="420" alt="Omarchy tablet in portrait: the on-screen keyboard docked at the bottom, the bar applet settings panel open on top">
+</p>
+
 ## Components
 
 | Component | What it is |
