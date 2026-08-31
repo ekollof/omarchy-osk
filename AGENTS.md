@@ -98,11 +98,14 @@ right-click = toggle).
   renders its main layer from it. The default layout comes from the session
   locale: LC_ALL > LC_CTYPE > LANG territory → xkb layout (en_US → us,
   da_DK → dk, …), persisted on first run to `~/.config/omarchy/osk.json`.
-- **Config**: `~/.config/omarchy/osk.json` — `{layout, repeatDelay,
-  repeatInterval}`. The OSK plugin owns the file; the bar applet edits through
-  its IPC target (`omarchy-shell ekollof.osk setLayout dk`, `setRepeat d r`,
-  `getState`) and watches the file for display. Applet enable/disable toggles
-  the whole `ekollof.osk` plugin via `shell.pluginRegistry.setEnabled`.
+- **Config**: `~/.config/omarchy/osk.json` — `{layout, repeat, repeatDelay,
+  repeatInterval, flingDecay, flingCap}`. The OSK plugin owns the file; the
+  bar applet edits through its IPC target (`omarchy-shell ekollof.osk
+  setLayout dk`, `setRepeat d r`, `setRepeatEnabled on|off`, `setFling tau
+  cap`, `getState`) and watches the file for display. Fling values ride to
+  the compositor plugin as `FLING <tau> <cap>` on handshake and on change.
+  Applet enable/disable toggles the whole `ekollof.osk` plugin via
+  `shell.pluginRegistry.setEnabled`.
 
 ## Socket protocol (single client)
 
@@ -111,7 +114,8 @@ replies `ok` / `err <msg>` / `PONG`; the plugin pushes `grid <json>` lines
 unsolicited. Commands: `PING`, `KEY <evdev> <1|0>`, `MOD <shift|ctrl|alt|super>
 <on|off>`, `MODS off`, `TEXT <utf8>`, `LAYOUT <name>[(<variant>)]`, `ROWS`,
 `PANEL x y w h`, `PMOVE x y`, `PBTN <code> <1|0>`, `MON`, `CALIB` (no-op),
-`STATS`. Full docs: header of `hypr-osk/src/main.cpp`.
+`FLING <tau_ms> <cap_px_s>` (scroll momentum decay + speed cap), `STATS`.
+Full docs: header of `hypr-osk/src/main.cpp`.
 
 **Access control**: the socket can type into the focused session, so peers
 are validated on accept — `SO_PEERCRED` requires the same uid (always), and
@@ -131,6 +135,12 @@ outright.
 
 ## Hard-won gotchas (do not re-learn these)
 
+- **Plugin DBG output goes nowhere.** `Log::logger` is a header-inline
+  singleton, so a plugin .so gets its own never-printed instance — every
+  `DBG()` line in main.cpp is a silent no-op. When you need eyes on
+  compositor-side gesture state, use `traceGeom()` (appends to
+  `/tmp/hypr-osk-geom.log`), or `hyprctl rollinglog`-adjacent sources —
+  never the log.
 - **xkb keycodes are evdev + 8.** `xkb_keymap_*` iteration yields xkb codes;
   `IKeyboard::SKeyEvent.keycode` and the wire protocol are EVDEV codes. The
   textmap stores `key - 8` and the grid lookup adds `+ 8` — mixing them up
@@ -172,24 +182,27 @@ outright.
   enters two-finger scroll. An earlier version flagged only the first
   finger's down, so scroll/right-click could never engage while taps and
   drags (first finger only) kept working. Batched landings (both fingers
-  before the apply timer) must resolve in a single pass. Scroll is emitted
-  touchpad-style (raw logical px, 1:1 with the hand) and shaped per gesture
-  by focused window class: Hyprland 0.56 only forwards v120 for wheel
-  source, and Chromium rescales plain axis values by 1/10 * 120 (wheel
-  ticks) — so chrom*-class windows get SOURCE_WHEEL + value120 (exact
-  pixels via Chromium's v8 handler, which replaces the legacy delta in the
-  same frame), while kitty & co read plain axis as continuous pixels (v120
-  would mean wheel notches to them) and get SOURCE_FINGER. Finger #1's
+  before the apply timer) must resolve in a single pass. Scroll is one
+  universal v120 stream (`SOURCE_WHEEL`, value120 = exact pixels): Hyprland
+  0.56 only forwards v120 for wheel source, Chromium's v8 handler replaces
+  the x12 legacy rescale with the exact v120 pixels, and kitty reads v120
+  as smooth pixel scroll at (5 lines x cellHeight)/120 (~0.83x px on
+  default fonts — tune kitty's `wheel_scroll_multiplier` if it matters).
+  No per-app shaping anywhere. The scroll-vs-pinch latch fires once
+  center/distance motion crosses 9 px: contact-center delta scrolls,
+  contact-distance delta pinches (~1.4x dominance); a scroll-latched
+  gesture hands off to pinch within the first 250 ms when spread dominates
+  the unaccelerated scroll travel 2:1. Pinch emits ctrl+wheel —
+  continuous per-frame v120 (smooth zoom + preset snap in Chromium).
+  Scrolling carries android-feel dynamics: velocity is tracked per frame
+  (smoothed), emission is accelerated up to 2x at 3000 px/s, and lifting
+  the fingers hands the velocity to a 16 ms fling timer that decays
+  exponentially (~28%/100 ms, `FLING`-configurable) until any new touch,
+  an aborted gesture, or plugin unload cancels it.
+  Finger #1's
   button-down is deferred ~130 ms (`PRESS_DELAY_MS`) so a landing second
   finger cancels it — two-finger scroll never drag-selects text; quick taps
   click on lift, held single-finger drags get the button after the delay.
-  Pinch-vs-scroll latches per gesture: contact-center delta scrolls,
-  contact-distance delta pinches (~1.4x dominance to latch). Pinch emits
-  ctrl+wheel on the synthetic keyboard — continuous per-frame v120 for
-  chrom*-class windows (Chromium's ctrl+high-res path zooms smoothly and
-  snaps to presets on gesture end; native wl_touch pinch is unreachable
-  because the plugin consumes all touch input), quantized 10% steps
-  elsewhere.
 - **Bar widget popup**: use the shell's `qs.Ui` `Panel` base + `BarIconButton`
   + `KeyboardPanel` (see `shell/ekollof.osk-applet/Panel.qml` and
   `~/src/omarchy/shell/plugins/panels/power/Panel.qml` as the canonical

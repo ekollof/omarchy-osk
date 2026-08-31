@@ -33,6 +33,8 @@
  *                                debug only, needs HYPR_OSK_ALLOW_ANY_PEER=1)
  *   PBTN <code> <1|0>            pointer button (0x110 = left; debug only,
  *                                needs HYPR_OSK_ALLOW_ANY_PEER=1)
+ *   FLING <tau_ms> <cap_px_s>    scroll momentum: decay time constant and
+ *                                entry-velocity cap for the post-lift fling
  *
  * Access control: the socket can type into the focused session, so peers are
  * validated on accept with SO_PEERCRED — the uid must match and (unless
@@ -55,7 +57,6 @@
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <set>
 #include <hyprland/src/event/EventBus.hpp>
@@ -92,7 +93,7 @@ static int    debug   = 1;
  * corrupt under event-loop reentrancy (the crash mechanism). TEXT is
  * bounded to 95 bytes. */
 struct SOskCommand {
-    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN } type;
+    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING } type;
     int  a = 0, b = 0;
     char text[TEXT_CAP] = {0};
 };
@@ -554,12 +555,7 @@ static bool     ignore_until_zero = false;      /* gesture ended; wait for all f
 static bool     scroll_mode = false;
 static double   scroll_anchor_y = 0;            /* normalized y anchor */
 static double   scroll_travel_px = 0;           /* px moved this gesture (tap-vs-scroll heuristic) */
-static bool     scroll_wheel_shape = false;     /* per-gesture event shape, chosen by focused window class:
-                                                 * Chromium rescales legacy axis values by 1/10 * 120 (wheel
-                                                 * ticks) and only honors v120 when Hyprland sends it, which
-                                                 * 0.56 gates to wheel source — so chrom*-class windows get
-                                                 * wheel+v120; kitty & co read plain axis as continuous px
-                                                 * (their v120 would be wheel notches) and get FINGER px. */
+static double   scroll_raw_px = 0;              /* unaccelerated travel (scroll->pinch handoff math) */
 static uint32_t dual_start_ms = 0;
 static Vector2D lastPos;                        /* normalized (0..1) */
 static bool     pressed = false;                /* left button held */
@@ -579,8 +575,15 @@ static bool     pinch_mode = false;             /* latched pinch (mutually exclu
 static double   pinch_delta = 0;                /* signed contact-distance change since gesture start */
 static double   pinch_prev_d = 0;               /* previous frame's contact distance */
 static bool     pinch_prev_valid = false;
-static double   zoom_accum = 0;                 /* unconsumed pinch distance (px) */
 static int      pinch_ctrl_held = 0;            /* ctrl held on the synthetic keyboard for zoom */
+static double   scroll_vel = 0;                 /* smoothed finger velocity, px/s (signed) */
+static uint32_t scroll_last_ms = 0;             /* last scroll-frame timestamp */
+static bool     fling_active = false;           /* momentum scrolling after lift */
+static uint32_t fling_last_ms = 0;
+static SP<CEventLoopTimer> g_flingTimer;
+static double   fling_tau = 0.32;               /* momentum decay constant (s, FLING cmd) */
+static double   fling_cap = 5500.0;             /* fling entry velocity cap (px/s) */
+static double   fling_min = 200.0;              /* minimum lift velocity to fling (px/s) */
 
 /* OSK panel exemption: touches inside this rect (normalized 0..1 on the
  * touch device's frame) pass through to the panel's own Qt touch handling;
@@ -675,6 +678,50 @@ static void traceGeom(const std::string &line)
     f << nowMs() << " " << line << "\n";
 }
 
+/* emit one finger-equivalent scroll delta through the universal v120 stream:
+ * Hyprland 0.56 forwards v120 only for wheel source, and every relevant
+ * client is wl_pointer v8+ — Chromium's v8 handler replaces the x12 legacy
+ * rescale with the exact v120 pixels, kitty reads v120 as smooth pixel
+ * scroll at (5 lines x cellHeight)/120 (~0.83x px on default fonts) */
+static void emitScroll(double px)
+{
+    if (px == 0.0)
+        return;
+    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0,
+                                    (int32_t)std::lround(-px), WL_POINTER_AXIS_SOURCE_WHEEL,
+                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+    g_pSeatManager->sendPointerFrame();
+    scroll_travel_px += std::abs(px);
+}
+
+/* ---------------- fling momentum (android-style) ---------------- */
+static void stopFling()
+{
+    fling_active = false;
+    scroll_vel   = 0;
+}
+
+static void flingTick()
+{
+    if (!fling_active)
+        return;
+    uint32_t now = nowMs();
+    double dt = (now - fling_last_ms) / 1000.0;
+    fling_last_ms = now;
+    if (dt <= 0.0 || dt > 0.25) {
+        stopFling();
+        return;
+    }
+    scroll_vel *= std::exp(-dt / fling_tau); /* friction: ~28% velocity loss per 100 ms at 0.32 s */
+    if (std::abs(scroll_vel) < 130.0) {
+        stopFling();
+        return;
+    }
+    emitScroll(scroll_vel * dt);
+    if (g_flingTimer)
+        g_flingTimer->updateTimeout(std::chrono::milliseconds(16));
+}
+
 /* the single-finger button-down waits PRESS_DELAY_MS before firing: a second
  * finger landing inside that window converts the gesture to a two-finger
  * scroll without ever dragging the button (which drag-selects text) */
@@ -700,6 +747,7 @@ static void armPressTimer()
  * input/monitor code from inside the touch callback deadlocks the pipeline) */
 static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
 {
+    stopFling(); /* a new touch always kills momentum */
     fingers++;
     lastPos            = ev.pos;
     g_slotPos[ev.touchID] = ev.pos;
@@ -747,6 +795,7 @@ static void applyTouches()
         up_flag = false;
         down_flag = false;
         press_pending = false;
+        stopFling();
         releasePinchCtrl();
         g_slotPos.clear();
         pinch_mode      = false;
@@ -783,6 +832,21 @@ static void applyTouches()
             releasePinchCtrl();
             pinch_mode      = false;
             gesture_decided = false;
+            /* android-style fling: keep going with the lift velocity, decay */
+            if (std::abs(scroll_vel) > fling_min) {
+                fling_active  = true;
+                fling_last_ms = nowMs();
+                scroll_vel    = std::max(-fling_cap, std::min(fling_cap, scroll_vel));
+                if (!g_flingTimer) {
+                    g_flingTimer = makeShared<CEventLoopTimer>(
+                        std::chrono::milliseconds(16),
+                        [](SP<CEventLoopTimer>, void*) { flingTick(); },
+                        nullptr);
+                    g_pEventLoopManager->addTimer(g_flingTimer);
+                } else
+                    g_flingTimer->updateTimeout(std::chrono::milliseconds(16));
+            } else
+                scroll_vel = 0;
         }
         if (fingers == 0 && press_pending) {
             /* quick tap: the deferred press hadn't fired yet — click on lift */
@@ -863,12 +927,13 @@ static void applyTouches()
             if (!scroll_mode) {
                 scroll_mode       = true;
                 scroll_travel_px  = 0;
+                scroll_raw_px     = 0;
                 dual_start_ms     = nowMs();
-                scroll_wheel_shape = false;
+                scroll_vel        = 0;
+                scroll_last_ms    = 0;
                 gesture_decided   = false;
                 pinch_mode        = false;
                 pinch_delta       = 0;
-                zoom_accum        = 0;
                 Vector2D c;
                 double   d;
                 if (contactGeometry(c, d)) {
@@ -880,13 +945,6 @@ static void applyTouches()
                     scroll_anchor_y  = lastPos.y;
                     pinch_prev_valid = false;
                     traceGeom("entry slots=" + std::to_string(g_slotPos.size()) + " no geometry");
-                }
-                if (auto w = Desktop::focusState()->window()) {
-                    std::string cls = w->m_class;
-                    for (char &c : cls)
-                        c = c >= 'A' && c <= 'Z' ? c + 32 : c;
-                    if (cls.contains("chrom"))
-                        scroll_wheel_shape = true;
                 }
                 DBG("two fingers: scroll mode");
             }
@@ -949,7 +1007,7 @@ static void applyTouches()
             if (++geom_dbg % 5 == 0)
                 traceGeom("undecided slots=" + std::to_string(g_slotPos.size()) + " d=" + std::to_string(d) +
                           " pinchPx=" + std::to_string(pinchPx) + " centerPx=" + std::to_string(centerPx));
-            if (centerPx + pinchPx > 14) {
+            if (centerPx + pinchPx > 9) {
                 gesture_decided = true;
                 pinch_mode      = pinchPx > 1.4 * centerPx;
                 scroll_anchor_y = center.y; /* consume the dead-zone drift */
@@ -958,62 +1016,49 @@ static void applyTouches()
             }
         }
         if (gesture_decided && pinch_mode) {
-            /* pinch: ctrl+wheel — the universal app-level zoom binding.
-             * Native wl_touch pinch is unreachable (the plugin consumes all
-             * touch input), so the smoothness is recreated per client:
-             * Chromium gets every frame's delta as continuous v120 (its ctrl
+            /* pinch: ctrl+wheel — universal continuous v120. Native wl_touch
+             * pinch is unreachable (the plugin consumes all touch input), so
+             * smoothness is recreated with per-frame deltas: Chromium's ctrl
              * +high-res path zooms smoothly and snaps to presets on gesture
-             * end); other clients get quantized 10% notches. */
+             * end; other v8 clients get proportional ctrl-scroll. */
             double dd = pinch_prev_valid ? (d - pinch_prev_d) * mon->m_size.y : 0.0; /* px */
-            if (scroll_wheel_shape) {
-                if (dd != 0.0) {
-                    if (!pinch_ctrl_held) {
-                        execKey(KEY_LEFTCTRL, 1);
-                        pinch_ctrl_held = 1;
-                    }
-                    /* legacy value keeps the /10 x 120 convention in parity */
-                    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                                    -dd / 12.0, 0, (int32_t)std::lround(-dd),
-                                                    WL_POINTER_AXIS_SOURCE_WHEEL,
-                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
-                    g_pSeatManager->sendPointerFrame();
+            if (dd != 0.0) {
+                if (!pinch_ctrl_held) {
+                    execKey(KEY_LEFTCTRL, 1);
+                    pinch_ctrl_held = 1;
                 }
-            } else {
-                zoom_accum += dd;
-                int notches = (int)(zoom_accum / 30.0); /* ~30 px of spread = one 10% zoom step */
-                if (notches != 0) {
-                    zoom_accum -= notches * 30.0;
-                    if (!pinch_ctrl_held) {
-                        execKey(KEY_LEFTCTRL, 1);
-                        pinch_ctrl_held = 1;
-                    }
-                    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                                    -notches * 10.0, -notches, -notches * 120,
-                                                    WL_POINTER_AXIS_SOURCE_WHEEL,
-                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
-                    g_pSeatManager->sendPointerFrame();
-                }
+                /* legacy value keeps the /10 x 120 convention in parity */
+                g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                                -dd / 12.0, 0, (int32_t)std::lround(-dd),
+                                                WL_POINTER_AXIS_SOURCE_WHEEL,
+                                                WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+                g_pSeatManager->sendPointerFrame();
             }
         } else if (gesture_decided) {
-            /* touchpad-style scroll: pixel deltas 1:1 with the finger */
-            double px = (center.y - scroll_anchor_y) * mon->m_size.y; /* logical px */
-            scroll_anchor_y = center.y; /* consume the full delta: no drift */
-            if (px != 0.0) {
-                scroll_travel_px += std::abs(px);
-                /* natural scrolling: content follows the fingers */
-                if (scroll_wheel_shape) {
-                    /* Chromium: v120 rides as exact pixels (its v8 handler wins
-                     * over the x12 legacy rescale within the frame) */
-                    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0,
-                                                    (int32_t)std::lround(-px), WL_POINTER_AXIS_SOURCE_WHEEL,
-                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
-                } else {
-                    /* kitty & co: plain axis is the continuous pixel bucket */
-                    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0, 0,
-                                                    WL_POINTER_AXIS_SOURCE_FINGER,
-                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+            /* scroll: hand off to pinch while little scroll has committed and
+             * spread starts to dominate (a pinch intent mislatched as scroll) */
+            if (nowMs() - dual_start_ms <= 250 &&
+                std::abs(pinch_delta) * mon->m_size.y > 2.0 * scroll_raw_px + 9.0) {
+                pinch_mode = true;
+                traceGeom("handoff scroll->pinch");
+            } else {
+                /* touchpad-style scroll: pixel deltas following the finger, with
+                 * a velocity-scaled acceleration and a fling on lift */
+                double px = (center.y - scroll_anchor_y) * mon->m_size.y; /* logical px */
+                uint32_t now = nowMs();
+                double dt = scroll_last_ms ? (now - scroll_last_ms) / 1000.0 : 0.0;
+                scroll_last_ms = now;
+                scroll_anchor_y = center.y; /* consume the full delta: no drift */
+                scroll_raw_px += std::abs(px);
+                if (px != 0.0) {
+                    if (dt > 0.001 && dt < 0.2) {
+                        double v = px / dt; /* instantaneous px/s, signed */
+                        scroll_vel = 0.5 * scroll_vel + 0.5 * v;
+                    }
+                    /* acceleration: linear ramp up to 2x at 3000 px/s */
+                    double acc = 1.0 + std::min(std::abs(scroll_vel), 3000.0) / 3000.0;
+                    emitScroll(px * acc);
                 }
-                g_pSeatManager->sendPointerFrame();
             }
         }
         pinch_prev_d     = d;
@@ -1394,6 +1439,18 @@ static void handle_line(int cfd, char *line)
             } else
                 reply = "err bad args";
         }
+    } else if (!strncmp(line, "FLING ", 6)) {
+        /* FLING <tau_ms> <cap_px_s> — momentum decay + speed cap */
+        int tau, cap;
+        if (sscanf(line + 6, "%d %d", &tau, &cap) == 2 && tau >= 50 && tau <= 2000 && cap >= 500 &&
+            cap <= 20000) {
+            cmd.type = SOskCommand::EType::FLING;
+            cmd.a    = tau;
+            cmd.b    = cap;
+            queueCommand(std::move(cmd));
+            reply = "ok";
+        } else
+            reply = "err bad args";
     } else if (!strncmp(line, "MON", 3)) {
         /* MON — reply with the touch monitor's logical frame (x y w h), the
          * exact frame touch ev.pos is normalized against (m_position/m_size) */
@@ -1411,12 +1468,12 @@ static void handle_line(int cfd, char *line)
         snprintf(buf, sizeof buf,
                  "state fingers=%d pressed=%d ignore=%d scroll=%d down=%d up=%d contact_osk=%d "
                  "panel_valid=%d inject=%d anypeer=%d panel_ny=%.3f panel_nh=%.3f last=%.3f,%.3f "
-                 "fires=%u ring=%zu indrain=%d layout=%s textmap=%zu",
+                 "fires=%u ring=%zu indrain=%d layout=%s textmap=%zu fling=%.0fms/%.0fpx",
                  fingers, (int)pressed, (int)ignore_until_zero, (int)scroll_mode, (int)down_flag,
                  (int)up_flag, (int)contact_is_panel_native, (int)panel_rect_valid,
                  (int)panel_rect_valid, (int)g_allowAnyPeer, panel_ny,
                  panel_nh, lastPos.x, lastPos.y, g_drain_fires, g_ringCount, (int)g_inDrain,
-                 g_layoutSpec.c_str(), g_textMap.size());
+                 g_layoutSpec.c_str(), g_textMap.size(), fling_tau * 1000.0, fling_cap);
         reply = buf;
     } else if (!strncmp(line, "CALIB ", 6)) {
         reply = "ok"; /* accepted for protocol compatibility; the frame comes from the compositor */
@@ -1606,6 +1663,11 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
             case SOskCommand::EType::LAYOUT: execLayout(c.text); break;
             case SOskCommand::EType::PMOVE: execPmove(c.a, c.b); break;
             case SOskCommand::EType::PBTN: execPbtn((unsigned)c.a, c.b); break;
+            case SOskCommand::EType::FLING:
+                fling_tau = std::max(0.05, std::min(2.0, c.a / 1000.0));
+                fling_cap = std::max(500.0, std::min(20000.0, (double)c.b));
+                DBG("fling: tau=" + std::to_string(fling_tau) + " cap=" + std::to_string(fling_cap));
+                break;
             }
             g_ringMutex.lock();
         }
@@ -1708,6 +1770,12 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_pEventLoopManager->removeTimer(g_pressTimer);
         g_pressTimer.reset();
     }
+    if (g_flingTimer) {
+        g_flingTimer->cancel();
+        g_pEventLoopManager->removeTimer(g_flingTimer);
+        g_flingTimer.reset();
+    }
+    fling_active = false;
     if (g_drainTimer) {
         g_drainTimer->cancel();
         g_pEventLoopManager->removeTimer(g_drainTimer);
