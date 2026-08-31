@@ -101,6 +101,19 @@ session, so:
 - `PMOVE`/`PBTN` (remote pointer, debugging) require
   `HYPR_OSK_ALLOW_ANY_PEER=1` in Hyprland's environment
 
+## Removal
+
+- **Compositor plugins**: `hyprctl plugin unload ~/.local/share/hyprland/plugins/libhypr-osk.so`
+  (same for `hyprgrass.so`, full path required), then delete the `.so` files
+  to make it permanent. If hyprpm manages one: `hyprpm remove hypr-osk`.
+- **Shell plugins**: delete `~/.config/omarchy/plugins/ekollof.osk` and
+  `~/.config/omarchy/plugins/ekollof.osk-applet` (or
+  `omarchy plugin remove ekollof.osk` for a plugin-add copy), then
+  `omarchy-shell shell rescanPlugins`.
+- **Hyprland glue**: remove `~/.config/hypr/osk.lua`, the
+  `require("hypr.osk")` line in `~/.config/hypr/hyprland.lua`, and
+  `~/.config/hypr/scripts/osk-toggle.sh`.
+
 ## Development
 
 Edit this tree, run `./install.sh`. QML changes hot-reload (restart the
