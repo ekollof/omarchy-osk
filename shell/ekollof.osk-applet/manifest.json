@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "ekollof.osk-applet",
+  "name": "On-screen keyboard applet",
+  "version": "0.1.0",
+  "author": "ekollof",
+  "description": "Bar applet for the on-screen keyboard: enable/disable, show/hide, layout (xkb) and key-repeat settings",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "On-screen keyboard",
+    "description": "Toggle and configure the on-screen keyboard",
+    "category": "Input",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

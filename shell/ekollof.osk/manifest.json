@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "ekollof.osk",
+  "name": "On-screen keyboard",
+  "version": "0.1.0",
+  "author": "ekollof",
+  "description": "Quickshell on-screen keyboard in the wvkbd terminal layout, wired to the hypr-osk compositor plugin (PANEL passthrough + TEXT/KEY/MOD injection)",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Osk.qml"
+  }
+}
