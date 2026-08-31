@@ -20,6 +20,7 @@ Panel {
 
   property bool oskEnabled: false
   property string layout: "us"
+  property bool repeatEnabled: true
   property int repeatDelay: 400
   property int repeatInterval: 60
   property var layouts: []
@@ -66,6 +67,8 @@ Panel {
     try { cfg = JSON.parse(raw || "{}") || {} } catch (e) { cfg = {} }
     if (cfg.layout)
       root.layout = String(cfg.layout)
+    if (cfg.repeat !== undefined)
+      root.repeatEnabled = !!cfg.repeat
     if (cfg.repeatDelay)
       root.repeatDelay = parseInt(cfg.repeatDelay, 10) || 400
     if (cfg.repeatInterval)
@@ -213,9 +216,22 @@ Panel {
       // ---------- key repeat ----------
       PanelSectionHeader {
         width: parent.width
-        text: "Key repeat (hold backspace or arrows)"
+        text: "Key repeat (hold any key)"
         foreground: root.bar ? root.bar.foreground : Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+      }
+
+      Toggle {
+        width: parent.width
+        label: "Enable repeat"
+        description: "Holding a key repeats it (first after the delay, then at the interval)"
+        checked: root.repeatEnabled
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        onClicked: {
+          root.repeatEnabled = !root.repeatEnabled
+          root.callOsk("setRepeatEnabled", root.repeatEnabled ? "on" : "off")
+        }
       }
 
       Column {

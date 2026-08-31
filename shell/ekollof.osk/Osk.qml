@@ -40,6 +40,7 @@ Item {
   property string layout: ""          // "us", "dk", "us(intl)"…
   property int repeatDelay: 400       // ms before hold-repeat starts
   property int repeatInterval: 60     // ms between repeats
+  property bool repeatEnabled: true   // hold-to-repeat on/off (bar applet toggle)
   property var grid: null             // letter grid from the plugin (ROWS)
 
   readonly property real unit: (panel.width - Style.space(8) * 2) / 15.0 // widest row (home row)
@@ -134,9 +135,11 @@ Item {
     root.layout = layout
     root.repeatDelay = clampInt(cfg.repeatDelay, 100, 2000, 400)
     root.repeatInterval = clampInt(cfg.repeatInterval, 15, 500, 60)
+    root.repeatEnabled = cfg.repeat !== undefined ? !!cfg.repeat : true // default on
     root.cfgLoaded = true
     // persist on first run so the applet sees the LANG-derived default too
-    if (!raw || !cfg.layout || cfg.repeatDelay !== root.repeatDelay || cfg.repeatInterval !== root.repeatInterval)
+    if (!raw || !cfg.layout || cfg.repeat === undefined ||
+        cfg.repeatDelay !== root.repeatDelay || cfg.repeatInterval !== root.repeatInterval)
       persistConfig()
     // pushes the (possibly changed) layout to the plugin and pulls the grid
     Qt.callLater(root.announce)
@@ -145,6 +148,7 @@ Item {
   function persistConfig() {
     cfgFile.setText(JSON.stringify({
       layout: root.layout,
+      repeat: root.repeatEnabled,
       repeatDelay: root.repeatDelay,
       repeatInterval: root.repeatInterval
     }) + "\n")
@@ -155,6 +159,7 @@ Item {
   function getState() {
     return JSON.stringify({
       layout: root.layout,
+      repeat: root.repeatEnabled,
       repeatDelay: root.repeatDelay,
       repeatInterval: root.repeatInterval,
       gridLoaded: !!root.grid
@@ -184,6 +189,15 @@ Item {
     return "ok"
   }
 
+  function setRepeatEnabled(arg) {
+    const v = String(arg || "").trim().toLowerCase()
+    if (v !== "on" && v !== "off" && v !== "true" && v !== "false" && v !== "1" && v !== "0")
+      return "err need on|off"
+    root.repeatEnabled = (v === "on" || v === "true" || v === "1")
+    persistConfig()
+    return "ok"
+  }
+
   // ---- IPC: the bar applet (and scripts) drive settings through here -----
   // `omarchy-shell ekollof.osk <method> [args…]`. The shell target's generic
   // `call` verb is currently broken for panel plugins, so the applet routes
@@ -199,6 +213,10 @@ Item {
 
     function setRepeat(delay: string, interval: string): string {
       return root.setRepeat(delay + " " + interval)
+    }
+
+    function setRepeatEnabled(on: string): string {
+      return root.setRepeatEnabled(on)
     }
 
     function toggle(): string {
@@ -315,11 +333,14 @@ Item {
     onFileChanged: reload()
   }
 
-  // press-and-hold auto-repeat (backspace, arrows) — one key held at a time
+  // press-and-hold auto-repeat (all char/code keys) — one key held at a time
   // on touch, so a single root timer works for every key
-  function startRepeat(code, key) {
-    repeatTimer.code = code
+  function startRepeat(k, key) {
+    if (!root.repeatEnabled)
+      return
     repeatTimer.key = key
+    repeatTimer.code = k.t === "code" ? (k.c || 0) : 0
+    repeatTimer.text = k.t === "char" ? (resolveChar(k) || "") : ""
     repeatTimer.fired = false
     repeatTimer.interval = Math.max(100, root.repeatDelay)
     repeatTimer.restart()
@@ -329,21 +350,40 @@ Item {
     repeatTimer.stop()
   }
 
+  // caps lock shifts letters only; caps+shift gives lowercase (real caps)
+  function resolveChar(k) {
+    const isLetter = /^[a-z]$/.test(k.l || "")
+    const wantUpper = k.s && (root.shift ? (root.capsLock ? false : true) : (root.capsLock && isLetter))
+    if (wantUpper)
+      return k.s
+    if (root.shift && root.capsLock && isLetter && k.s)
+      return k.l
+    return k.l
+  }
+
   Timer {
     id: repeatTimer
     interval: 400
+    repeat: true // one-shot would fire a single repeat then stop: hold = no autorepeat
     property int code: 0
+    property string text: "" // char keys repeat as TEXT, resolved at press time
     property bool fired: false
     property QtObject key: null
     onTriggered: {
       if (!fired) {
         fired = true
         interval = Math.max(15, root.repeatInterval)
+        if (text !== "")
+          clearOneShot() // phone-style: one-shot mods apply to exactly one char
       }
       if (key)
         key.repeatFired = true
-      send("KEY " + code + " 1")
-      send("KEY " + code + " 0")
+      if (code > 0) {
+        send("KEY " + code + " 1")
+        send("KEY " + code + " 0")
+      } else if (text !== "") {
+        send("TEXT " + text)
+      }
     }
   }
 
@@ -371,19 +411,10 @@ Item {
     console.log("[ekollof.osk] key t=" + k.t + " k=" + (k.l || "") + " c=" + (k.c || 0) +
                 " m=" + (k.m || "") + " sock=" + connected())
     switch (k.t) {
-    case "char": {
-      // caps lock shifts letters only; caps+shift gives lowercase (real caps)
-      const isLetter = /^[a-z]$/.test(k.l || "")
-      let ch = k.l
-      const wantUpper = k.s && (root.shift ? (root.capsLock ? false : true) : (root.capsLock && isLetter))
-      if (wantUpper)
-        ch = k.s
-      else if (root.shift && root.capsLock && isLetter && k.s)
-        ch = k.l
-      send("TEXT " + ch)
+    case "char":
+      send("TEXT " + resolveChar(k))
       clearOneShot()
       break
-    }
     case "code":
       send("KEY " + k.c + " 1")
       send("KEY " + k.c + " 0")
@@ -500,8 +531,9 @@ Item {
                     key.keyDown = pressed
                     if (pressed) {
                       key.repeatFired = false
-                      if (key.modelData.r)
-                        root.startRepeat(key.modelData.c, key)
+                      const t = key.modelData.t
+                      if (t === "char" || t === "code")
+                        root.startRepeat(key.modelData, key)
                     } else {
                       root.stopRepeat()
                     }
@@ -521,6 +553,6 @@ Item {
 
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
-  Component.onCompleted: console.log("[ekollof.osk] loaded rev4 layout=" + root.layout +
+  Component.onCompleted: console.log("[ekollof.osk] loaded rev7 layout=" + root.layout +
                                      " cfg=" + root.cfgPath())
 }

@@ -13,11 +13,14 @@
 //
 // Key types in the returned rows:
 //   char  — sent as TEXT (the plugin resolves keycode+mods via the active keymap)
-//   code  — raw evdev keycode, sent as KEY <c> 1 / KEY <c> 0 (r: hold-repeat)
+//   code  — raw evdev keycode, sent as KEY <c> 1 / KEY <c> 0
 //   mod   — sticky modifier held by the plugin (MOD <m> on/off)
 //   shift — QML-side one-shot shift
 //   caps  — QML-side shift lock
 //   layer — switch layer / back
+//
+// char and code keys auto-repeat on hold (mod/shift/caps/layer keys don't);
+// the old r: hold-repeat marker is no longer consulted.
 
 var functionalRow = [
   { l: "⌨͕", w: 1, t: "layer", to: "special", scheme: 1 },
