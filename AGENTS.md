@@ -11,6 +11,8 @@ hypr-osk/            Hyprland compositor plugin (C++23, meson)
 hypr-osk/src/main.cpp   — all of it: touch emulation, synthetic keyboard,
                           unix-socket IPC. Protocol documented in the header
                           comment of main.cpp.
+hyprpm.toml          hyprpm manifest (repo root): the plugin is buildable
+                     via `hyprpm add` as an alternative to install.sh
 shell/ekollof.osk/   Quickshell overlay plugin (the visible keyboard)
   manifest.json      — kinds: ["overlay"], keepLoaded: true
   Osk.qml            — UI, socket client, config, IPC target
@@ -30,6 +32,7 @@ install.sh           Build + deploy everything, idempotent
 | Bundle                     | Deployed to                                        |
 |----------------------------|----------------------------------------------------|
 | `hypr-osk/build/libhypr-osk.so` | `~/.local/share/hyprland/plugins/libhypr-osk.so` |
+| `hyprpm add` route         | `/var/cache/hyprpm/<user>/hypr-osk/hypr-osk.so`    |
 | `shell/ekollof.osk/`       | `~/.config/omarchy/plugins/ekollof.osk/`           |
 | `shell/ekollof.osk-applet/`| `~/.config/omarchy/plugins/ekollof.osk-applet/`    |
 | `hypr/osk.lua`             | `~/.config/hypr/osk.lua` (required from `hyprland.lua`) |
@@ -198,10 +201,32 @@ pixman, libinput, wayland-server, xkbcommon (≥ 1.0 for
 `xkb_keymap_key_get_mods_for_level`), libdrm; quickshell ≥ 0.3 (omarchy-shell),
 localectl (layout list). All ship with Omarchy.
 
-**hyprgrass** (edge gesture) is not in the Arch repos but ships via the AUR
-as `hyprgrass-meta` (meta package: pulls deps and builds hyprgrass) — install
-with `omarchy pkg aur add hyprgrass-meta`. On this machine it was built from
-source instead (`~/.local/src/hyprgrass` → `~/.local/share/hyprland/plugins/
-hyprgrass.so`). Without it only the edge-swipe gesture is lost; the keyboard
-still toggles via SUPER+SHIFT+K and the bar applet. install.sh warns when it
-is missing.
+**hyprgrass** (edge gesture) is not in the Arch repos and there is no stable
+AUR package (`hyprgrass-meta` drives hyprpm via a root pacman hook,
+`hyprgrass-git` would drag in `hyprland-git`). install.sh therefore drives
+**hyprpm** directly as the user: installs missing build deps via
+`omarchy pkg add` (git, gcc, meson, ninja, glm), then
+`hyprpm add https://github.com/horriblename/hyprgrass` + `hyprpm enable
+hyprgrass` — built against the RUNNING Hyprland, stored in hyprpm's cache
+(`/var/cache/hyprpm/<user>/hyprgrass/` on current Hyprland; older layouts
+live under `~/.local/share/hyprland/plugins/`). hyprpm does not auto-load
+its plugins into a fresh session, so osk.lua exec_on_start-loads whichever
+hyprgrass.so exists (flat manual build, legacy or current hyprpm store).
+After Hyprland updates the plugin must be rebuilt manually: `hyprpm update`.
+On this machine it was built from source instead (`~/.local/src/hyprgrass` →
+flat `~/.local/share/hyprland/plugins/hyprgrass.so`). Without it only the
+edge-swipe gesture is lost; the keyboard still toggles via SUPER+SHIFT+K and
+the bar applet.
+
+**hyprpm route for hypr-osk itself**: `hyprpm.toml` (repo root) makes the
+compositor plugin hyprpm-buildable: `hyprpm update` once (headers build;
+needs interactive sudo plus cmake, cpio, hyprwayland-scanner, gcc, g++,
+pkg-config, git), then `hyprpm add <repo-url-or-path>` + `hyprpm enable
+hypr-osk`. hyprpm prepends its headers to `PKG_CONFIG_PATH`, so the same
+meson.build serves both routes. The .so lands at
+`/var/cache/hyprpm/<user>/hypr-osk/hypr-osk.so`; osk.lua loads whichever
+copy exists at session start (flat install.sh deploy preferred; both
+loaders guard against double-loads by plugin name). install.sh skips its
+own build when `hyprpm list` reports hypr-osk. The manifest was validated
+against hyprpm's CManifest source; a live add reaches the headers check
+("Headers outdated") until `hyprpm update` runs — untested past that here.

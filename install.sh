@@ -13,15 +13,20 @@
 set -euo pipefail
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-# 1. Build the compositor plugin
-[[ -d "$DIR/hypr-osk/build" ]] || meson setup "$DIR/hypr-osk/build" "$DIR/hypr-osk" >/dev/null
-meson compile -C "$DIR/hypr-osk/build"
-
-# 2. Install it where Hyprland plugins live (autostart loads from here)
-mkdir -p "$HOME/.local/share/hyprland/plugins"
-install -m 644 "$DIR/hypr-osk/build/libhypr-osk.so" "$HOME/.local/share/hyprland/plugins/"
+# 1+2. Build the compositor plugin and install it where Hyprland plugins
+# live — unless hyprpm manages it (see hyprpm.toml): then its copy wins and
+# a flat copy here would fight it (rebuild with: hyprpm update).
+if hyprpm list 2>/dev/null | grep -q hypr-osk; then
+  echo "hypr-osk is hyprpm-managed: skipping the local build (rebuild with: hyprpm update)."
+else
+  [[ -d "$DIR/hypr-osk/build" ]] || meson setup "$DIR/hypr-osk/build" "$DIR/hypr-osk" >/dev/null
+  meson compile -C "$DIR/hypr-osk/build"
+  mkdir -p "$HOME/.local/share/hyprland/plugins"
+  install -m 644 "$DIR/hypr-osk/build/libhypr-osk.so" "$HOME/.local/share/hyprland/plugins/"
+fi
 
 # 3. Deploy the shell plugins
+mkdir -p "$HOME/.config/omarchy/plugins"
 for p in ekollof.osk ekollof.osk-applet; do
   rm -rf "$HOME/.config/omarchy/plugins/$p"
   cp -r "$DIR/shell/$p" "$HOME/.config/omarchy/plugins/"
@@ -45,8 +50,31 @@ hyprctl reload >/dev/null 2>&1 || true
 echo "omarchy-osk installed."
 hyprctl plugin list | grep -q hypr-osk && echo "compositor plugin: loaded" \
   || echo "compositor plugin: NOT loaded yet (log out/in, or: hyprctl plugin load $HOME/.local/share/hyprland/plugins/libhypr-osk.so)"
+
+# hyprgrass (edge-swipe gesture) is not in the Arch repos. Omarchy-specific,
+# so drive hyprpm (Hyprland's plugin manager) directly as the user: it builds
+# hyprgrass against the RUNNING compositor and enables it. Needs gcc, meson,
+# ninja, glm, git, network — and a terminal for hyprpm's sudo prompts.
 if ! hyprctl plugin list | grep -q hyprgrass; then
-  echo "hyprgrass not loaded: the edge-swipe gesture is unavailable."
-  echo "  Install it from the AUR:  omarchy pkg aur add hyprgrass-meta"
-  echo "  The keyboard still toggles via SUPER+SHIFT+K and the bar applet."
+  missing=()
+  for dep in git gcc meson ninja glm; do
+    pacman -Q "$dep" >/dev/null 2>&1 || missing+=("$dep")
+  done
+  if ((${#missing[@]})) && ! omarchy pkg add "${missing[@]}"; then
+    echo "warning: could not install hyprgrass build deps: ${missing[*]}"
+  fi
+  if hyprpm list 2>/dev/null | grep -q hyprgrass; then
+    hyprpm update hyprgrass || true
+  else
+    hyprpm add https://github.com/horriblename/hyprgrass || true
+  fi
+  if hyprpm enable hyprgrass && hyprctl plugin list | grep -q hyprgrass; then
+    echo "hyprgrass installed via hyprpm: edge-swipe gesture active."
+    echo "  After Hyprland updates, rebuild it with:  hyprpm update"
+  else
+    echo "hyprgrass install via hyprpm failed: the edge-swipe gesture is missing."
+    echo "  Run in a terminal:  hyprpm add https://github.com/horriblename/hyprgrass"
+    echo "                      hyprpm enable hyprgrass"
+    echo "  The keyboard still toggles via SUPER+SHIFT+K and the bar applet."
+  fi
 fi

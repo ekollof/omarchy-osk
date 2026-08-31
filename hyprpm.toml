@@ -1,0 +1,23 @@
+# hyprpm manifest — makes the compositor plugin installable with:
+#   hyprpm update          (headers first; needs sudo + cmake, cpio,
+#                           hyprwayland-scanner, gcc, g++, pkg-config, git)
+#   hyprpm add <this-repo>
+#   hyprpm enable hypr-osk
+# The plugin .so then lives at /var/cache/hyprpm/<user>/hypr-osk/hypr-osk.so
+# and osk.lua picks it up at session start (install.sh's flat copy is
+# preferred when both exist; the loader guards against double-loads).
+# commit_pins: running-Hyprland-commit -> plugin-commit that built against it.
+[repository]
+name = "hypr-osk"
+authors = ["ekollof"]
+commit_pins = [
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "d64eeb9b32871ede4eb4f83c582c45929300a56e"],
+]
+
+[hypr-osk]
+description = "On-screen keyboard: touchscreen-to-pointer emulation + synthetic keyboard injection"
+output = "build/libhypr-osk.so"
+build = [
+    "rm -rf build && meson setup build hypr-osk",
+    "meson compile -C build",
+]
