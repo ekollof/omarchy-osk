@@ -89,6 +89,18 @@ omarchy-shell ekollof.osk setRepeatEnabled off
 omarchy-shell ekollof.osk toggle
 ```
 
+## 2-in-1 convertibles: use autorotation
+
+On a convertible or tablet, running an autorotation daemon is strongly
+recommended. The touch mapping follows the monitor orientation, so if you
+rotate the device without keeping the touch device's transform in sync with
+the monitor, taps and scrolling land rotated. This is often not set up out
+of the box: Omarchy does not install `iio-sensor-proxy` by default. Install
+it (`omarchy pkg add iio-sensor-proxy`) and run a small rotation daemon that
+moves the monitor and touch transforms together (see the
+[GPD Pocket 4 discussion](https://github.com/omacom/omarchy/discussions/9032)
+for a working example).
+
 ## Security
 
 The IPC socket (`$XDG_RUNTIME_DIR/hypr-osk.sock`) can type into the focused
