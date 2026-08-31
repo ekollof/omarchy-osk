@@ -13,6 +13,11 @@ hypr-osk/src/main.cpp   — all of it: touch emulation, synthetic keyboard,
                           comment of main.cpp.
 hyprpm.toml          hyprpm manifest (repo root): the plugin is buildable
                      via `hyprpm add` as an alternative to install.sh
+manifest.json        Omarchy shell plugin manifest (repo root): validates
+                     with `omarchy plugin validate` and makes the checkout
+                     `omarchy plugin add`-able (kinds: overlay + bar-widget,
+                     one id for both). install.sh keeps deploying the two
+                     separate plugin dirs — same ids, so don't mix paths.
 vendor/hyprgrass/    Vendored hyprgrass (upstream hl-0.56.1, wf-touch
                      included): edge-gesture plugin, built + deployed by
                      install.sh like hypr-osk

@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "ekollof.osk",
+  "name": "On-screen keyboard",
+  "version": "0.1.0",
+  "author": "ekollof",
+  "description": "On-screen keyboard + touchscreen pointer emulation for tablets: xkb-layout-driven OSK overlay, bar applet settings, hold-to-repeat and socket access control (compositor plugin via ./install.sh)",
+  "kinds": [
+    "overlay",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "overlay": "shell/ekollof.osk/Osk.qml",
+    "barWidget": "shell/ekollof.osk-applet/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "On-screen keyboard",
+    "description": "Toggle and configure the on-screen keyboard",
+    "category": "Input",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -58,6 +58,13 @@ meson/ninja/gcc, glm; `install.sh` installs missing packages via
 local install is the primary path and `install.sh` defers to hyprpm when it
 manages a plugin.
 
+The repository root also carries an Omarchy shell-plugin manifest, so the
+checkout validates with `omarchy plugin validate` and is discoverable for
+the plugin marketplace. Note `omarchy plugin add` installs the shell UI only
+— the compositor plugin (touch→pointer, key injection) still requires
+`./install.sh`, which deploys the same plugins in its own layout and
+supersedes a plugin-add copy.
+
 ## Usage
 
 Toggle the keyboard:
