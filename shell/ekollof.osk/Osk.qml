@@ -41,6 +41,8 @@ Item {
   property int repeatDelay: 400       // ms before hold-repeat starts
   property int repeatInterval: 60     // ms between repeats
   property bool repeatEnabled: true   // hold-to-repeat on/off (bar applet toggle)
+  property int flingDecay: 320        // fling momentum decay constant (ms)
+  property int flingCap: 5500         // fling entry velocity cap (px/s)
   property var grid: null             // letter grid from the plugin (ROWS)
   property string touchMonitor: ""    // monitor with the touch surface (plugin MON reply)
 
@@ -138,10 +140,13 @@ Item {
     root.repeatDelay = clampInt(cfg.repeatDelay, 100, 2000, 400)
     root.repeatInterval = clampInt(cfg.repeatInterval, 15, 500, 60)
     root.repeatEnabled = cfg.repeat !== undefined ? !!cfg.repeat : true // default on
+    root.flingDecay = clampInt(cfg.flingDecay, 100, 800, 320)
+    root.flingCap = clampInt(cfg.flingCap, 1000, 8000, 5500)
     root.cfgLoaded = true
     // persist on first run so the applet sees the LANG-derived default too
-    if (!raw || !cfg.layout || cfg.repeat === undefined ||
-        cfg.repeatDelay !== root.repeatDelay || cfg.repeatInterval !== root.repeatInterval)
+    if (!raw || !cfg.layout || cfg.repeat === undefined || cfg.flingDecay === undefined ||
+        cfg.flingCap === undefined || cfg.repeatDelay !== root.repeatDelay ||
+        cfg.repeatInterval !== root.repeatInterval)
       persistConfig()
     // pushes the (possibly changed) layout to the plugin and pulls the grid
     Qt.callLater(root.announce)
@@ -152,7 +157,9 @@ Item {
       layout: root.layout,
       repeat: root.repeatEnabled,
       repeatDelay: root.repeatDelay,
-      repeatInterval: root.repeatInterval
+      repeatInterval: root.repeatInterval,
+      flingDecay: root.flingDecay,
+      flingCap: root.flingCap
     }) + "\n")
   }
 
@@ -164,6 +171,8 @@ Item {
       repeat: root.repeatEnabled,
       repeatDelay: root.repeatDelay,
       repeatInterval: root.repeatInterval,
+      flingDecay: root.flingDecay,
+      flingCap: root.flingCap,
       gridLoaded: !!root.grid
     })
   }
@@ -200,6 +209,17 @@ Item {
     return "ok"
   }
 
+  function setFling(arg) {
+    const parts = String(arg || "").trim().split(/[\s,]+/)
+    if (parts.length !== 2)
+      return "err need 'decay cap'"
+    root.flingDecay = clampInt(parts[0], 100, 800, root.flingDecay)
+    root.flingCap = clampInt(parts[1], 1000, 8000, root.flingCap)
+    persistConfig()
+    send("FLING " + root.flingDecay + " " + root.flingCap)
+    return "ok"
+  }
+
   // ---- IPC: the bar applet (and scripts) drive settings through here -----
   // `omarchy-shell ekollof.osk <method> [args…]`. The shell target's generic
   // `call` verb is currently broken for panel plugins, so the applet routes
@@ -219,6 +239,10 @@ Item {
 
     function setRepeatEnabled(on: string): string {
       return root.setRepeatEnabled(on)
+    }
+
+    function setFling(decay: string, cap: string): string {
+      return root.setFling(decay + " " + cap)
     }
 
     function toggle(): string {
@@ -261,6 +285,7 @@ Item {
     send("LAYOUT " + root.layout)
     send("ROWS")
     send("MON")
+    send("FLING " + root.flingDecay + " " + root.flingCap)
     if (root.opened)
       Qt.callLater(root.syncPanel)
   }
@@ -567,6 +592,6 @@ Item {
 
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
-  Component.onCompleted: console.log("[ekollof.osk] loaded rev8 layout=" + root.layout +
+  Component.onCompleted: console.log("[ekollof.osk] loaded rev9 layout=" + root.layout +
                                      " cfg=" + root.cfgPath())
 }

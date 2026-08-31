@@ -27,10 +27,10 @@ window has focus — exactly like wvkbd, but native to the Omarchy shell.
 
 - **Touch → pointer**: the plugin consumes all touchscreen input and
   re-emits it as pointer input — one finger = cursor under the finger +
-  left click (drag = move), two fingers = scroll (touchpad-style pixels,
-  1:1 with the hand), two-finger pinch = zoom (ctrl+wheel), quick
-  two-finger tap = right click, 3+ fingers are left to hyprgrass for
-  workspace gestures.
+  left click (drag = move), two fingers = scroll (touchpad-style pixels
+  with acceleration and a decaying fling on lift), two-finger pinch =
+  zoom (ctrl+wheel), quick two-finger tap = right click, 3+ fingers are
+  left to hyprgrass for workspace gestures.
 - **Key tap → typed text**: taps inside the keyboard panel become synthetic
   clicks on the keyboard layer (keyboard focus never leaves the target
   window). Keys travel over a unix socket to the compositor plugin, which

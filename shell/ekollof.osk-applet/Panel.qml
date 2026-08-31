@@ -23,6 +23,8 @@ Panel {
   property bool repeatEnabled: true
   property int repeatDelay: 400
   property int repeatInterval: 60
+  property int flingDecay: 320
+  property int flingCap: 5500
   property var layouts: []
 
   implicitWidth: button.implicitWidth
@@ -73,6 +75,10 @@ Panel {
       root.repeatDelay = parseInt(cfg.repeatDelay, 10) || 400
     if (cfg.repeatInterval)
       root.repeatInterval = parseInt(cfg.repeatInterval, 10) || 60
+    if (cfg.flingDecay)
+      root.flingDecay = parseInt(cfg.flingDecay, 10) || 320
+    if (cfg.flingCap)
+      root.flingCap = parseInt(cfg.flingCap, 10) || 5500
   }
 
   function setLayouts(raw) {
@@ -279,6 +285,62 @@ Panel {
           integer: true
           onMoved: function(v) { root.repeatInterval = Math.round(v) }
           onReleased: function(v) { root.callOsk("setRepeat", root.repeatDelay + " " + root.repeatInterval) }
+        }
+      }
+
+      // ---------- fling ----------
+      PanelSectionHeader {
+        width: parent.width
+        text: "Scroll fling (momentum after lifting the fingers)"
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+      }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(4)
+
+        Text {
+          text: "Glide · " + root.flingDecay + " ms"
+          color: root.bar ? root.bar.foreground : Color.foreground
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        PanelSlider {
+          width: parent.width
+          bar: root.bar
+          value: root.flingDecay
+          minimum: 100
+          maximum: 800
+          step: 20
+          integer: true
+          onMoved: function(v) { root.flingDecay = Math.round(v) }
+          onReleased: function(v) { root.callOsk("setFling", root.flingDecay + " " + root.flingCap) }
+        }
+      }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(4)
+
+        Text {
+          text: "Speed cap · " + root.flingCap + " px/s"
+          color: root.bar ? root.bar.foreground : Color.foreground
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        PanelSlider {
+          width: parent.width
+          bar: root.bar
+          value: root.flingCap
+          minimum: 1000
+          maximum: 8000
+          step: 250
+          integer: true
+          onMoved: function(v) { root.flingCap = Math.round(v) }
+          onReleased: function(v) { root.callOsk("setFling", root.flingDecay + " " + root.flingCap) }
         }
       }
     }
