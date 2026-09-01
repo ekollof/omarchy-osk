@@ -43,6 +43,10 @@ Item {
   property bool repeatEnabled: true   // hold-to-repeat on/off (bar applet toggle)
   property int flingDecay: 320        // fling momentum decay constant (ms)
   property int flingCap: 5500         // fling entry velocity cap (px/s)
+  property int dragSlop: 12           // px of movement before a touch becomes a drag
+  property int longPress: 450         // ms still-hold → right click (0 = off)
+  property int scrollGain: 100        // two-finger scroll speed (percent)
+  property bool scrollAxisPx: false   // true: axis value is pixels (terminals); false: Chromium-scaled
   property bool touchSwallow: true    // on: virtual pointer device; off: native touchscreen
   property var grid: null             // letter grid from the plugin (ROWS)
   property string touchMonitor: ""    // monitor with the touch surface (plugin MON reply)
@@ -147,11 +151,17 @@ Item {
     root.repeatEnabled = cfg.repeat !== undefined ? !!cfg.repeat : true // default on
     root.flingDecay = clampInt(cfg.flingDecay, 100, 800, 320)
     root.flingCap = clampInt(cfg.flingCap, 1000, 8000, 5500)
+    root.dragSlop = clampInt(cfg.dragSlop, 4, 40, 12)
+    root.longPress = clampInt(cfg.longPress, 0, 2000, 450)
+    root.scrollGain = clampInt(cfg.scrollGain, 50, 200, 100)
+    root.scrollAxisPx = cfg.scrollAxisPx !== undefined ? !!cfg.scrollAxisPx : false
     root.touchSwallow = cfg.touchSwallow !== undefined ? !!cfg.touchSwallow : true
     root.cfgLoaded = true
     // persist on first run so the applet sees the LANG-derived default too
     if (!raw || !cfg.layout || cfg.repeat === undefined || cfg.flingDecay === undefined ||
         cfg.flingCap === undefined || cfg.touchSwallow === undefined ||
+        cfg.dragSlop === undefined || cfg.longPress === undefined ||
+        cfg.scrollGain === undefined || cfg.scrollAxisPx === undefined ||
         cfg.repeatDelay !== root.repeatDelay || cfg.repeatInterval !== root.repeatInterval)
       persistConfig()
     // pushes the (possibly changed) layout to the plugin and pulls the grid
@@ -166,6 +176,10 @@ Item {
       repeatInterval: root.repeatInterval,
       flingDecay: root.flingDecay,
       flingCap: root.flingCap,
+      dragSlop: root.dragSlop,
+      longPress: root.longPress,
+      scrollGain: root.scrollGain,
+      scrollAxisPx: root.scrollAxisPx,
       touchSwallow: root.touchSwallow
     }) + "\n")
   }
@@ -180,6 +194,10 @@ Item {
       repeatInterval: root.repeatInterval,
       flingDecay: root.flingDecay,
       flingCap: root.flingCap,
+      dragSlop: root.dragSlop,
+      longPress: root.longPress,
+      scrollGain: root.scrollGain,
+      scrollAxisPx: root.scrollAxisPx,
       touchSwallow: root.touchSwallow,
       gridLoaded: !!root.grid,
       opened: root.opened
@@ -229,6 +247,39 @@ Item {
     return "ok"
   }
 
+  function setPointer(arg) {
+    const parts = String(arg || "").trim().split(/[\s,]+/)
+    if (parts.length !== 2)
+      return "err need 'slop longPress'"
+    root.dragSlop = clampInt(parts[0], 4, 40, root.dragSlop)
+    root.longPress = clampInt(parts[1], 0, 2000, root.longPress)
+    persistConfig()
+    send("POINTER " + root.dragSlop + " " + root.longPress)
+    return "ok"
+  }
+
+  function setScroll(arg) {
+    const parts = String(arg || "").trim().split(/[\s,]+/)
+    root.scrollGain = clampInt(parts[0], 50, 200, root.scrollGain)
+    if (parts.length >= 2) {
+      const v = parts[1].toLowerCase()
+      root.scrollAxisPx = (v === "1" || v === "on" || v === "true")
+    }
+    persistConfig()
+    send("SCROLL " + root.scrollGain + " " + (root.scrollAxisPx ? "1" : "0"))
+    return "ok"
+  }
+
+  function setScrollAxis(arg) {
+    const v = String(arg || "").trim().toLowerCase()
+    if (v !== "on" && v !== "off" && v !== "true" && v !== "false" && v !== "1" && v !== "0")
+      return "err need on|off"
+    root.scrollAxisPx = (v === "on" || v === "true" || v === "1")
+    persistConfig()
+    send("SCROLL " + root.scrollGain + " " + (root.scrollAxisPx ? "1" : "0"))
+    return "ok"
+  }
+
   function setTouchSwallow(arg) {
     const v = String(arg || "").trim().toLowerCase()
     if (v !== "on" && v !== "off" && v !== "true" && v !== "false" && v !== "1" && v !== "0")
@@ -262,6 +313,18 @@ Item {
 
     function setFling(decay: string, cap: string): string {
       return root.setFling(decay + " " + cap)
+    }
+
+    function setPointer(slop: string, hold: string): string {
+      return root.setPointer(slop + " " + hold)
+    }
+
+    function setScroll(gain: string): string {
+      return root.setScroll(gain)
+    }
+
+    function setScrollAxis(on: string): string {
+      return root.setScrollAxis(on)
     }
 
     function setTouchSwallow(on: string): string {
@@ -309,6 +372,8 @@ Item {
     send("ROWS")
     send("MON")
     send("FLING " + root.flingDecay + " " + root.flingCap)
+    send("POINTER " + root.dragSlop + " " + root.longPress)
+    send("SCROLL " + root.scrollGain + " " + (root.scrollAxisPx ? "1" : "0"))
     send("SWALLOW " + (root.touchSwallow ? "1" : "0"))
     if (root.opened)
       Qt.callLater(root.syncPanel)
@@ -621,6 +686,6 @@ Item {
 
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
-  Component.onCompleted: console.log("[ekollof.osk] loaded rev11 layout=" + root.layout +
+  Component.onCompleted: console.log("[ekollof.osk] loaded rev14 layout=" + root.layout +
                                      " cfg=" + root.cfgPath())
 }

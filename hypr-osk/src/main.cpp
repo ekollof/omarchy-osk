@@ -4,13 +4,15 @@
  *
  * Runs inside the compositor:
  *   - Single-finger touch: cursor under the finger (warpTo, no
- *     acceleration). Button-down is deferred ~130 ms so a landing second
- *     finger can become a scroll without drag-selecting text; a quick tap
- *     clicks on lift. Touches are consumed before they reach applications:
+ *     acceleration). A landing second finger before the drag slop becomes
+ *     a scroll (no drag-select). Movement past ~12 px presses left and
+ *     drags; a quick tap clicks on lift; a still hold (~450 ms) is a
+ *     right click. Touches are consumed before they reach applications:
  *     no double input, no browser touch gestures.
- *   - Two-finger drag: pixel scroll (v120 wheel source, acceleration +
- *     decaying fling on lift). Two-finger pinch: ctrl+wheel zoom.
- *   - Quick two-finger tap: right click.
+ *   - Two-finger drag: pixel scroll on both axes. SOURCE_FINGER so Chromium
+ *     uses a precision ScrollEvent (no wheel animation lag). Legacy axis
+ *     value is /12 so Chromium's OnAxis (÷10 × 120) does not 12×-stack on
+ *     v120. Fling after lift. Two-finger pinch: ctrl+wheel zoom.
  *   - 3+ fingers: consumed for apps, left to hyprgrass (workspace swipes).
  *
  * IPC for the QML on-screen keyboard panel: unix socket
@@ -37,6 +39,11 @@
  *                                needs HYPR_OSK_ALLOW_ANY_PEER=1)
  *   FLING <tau_ms> <cap_px_s>    scroll momentum: decay time constant and
  *                                entry-velocity cap for the post-lift fling
+ *   POINTER <slop_px> <long_ms>  drag slop (px before left-down) and
+ *                                long-press delay (ms; 0 = right-click off)
+ *   SCROLL <gain_pct> [0|1]      two-finger scroll speed (50–200, 100 = 1×);
+ *                                optional 1 = pixel axis value (terminals),
+ *                                0 = Chromium-scaled (value = px/12)
  *   SWALLOW <0|1>                consume touchscreen input (virtual pointer
  *                                + gestures) or pass it to Hyprland's native
  *                                touchscreen support
@@ -55,6 +62,8 @@
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
+#include <hyprland/src/protocols/core/Seat.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
 #include <hyprland/src/pointer/PointerController.hpp>
@@ -101,7 +110,7 @@ static int    debug   = 1;
  * corrupt under event-loop reentrancy (the crash mechanism). TEXT is
  * bounded to 95 bytes. */
 struct SOskCommand {
-    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, SWALLOW, PANEL } type;
+    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, POINTER, SCROLL, SWALLOW, PANEL } type;
     int   a = 0, b = 0;
     float panel[4]      = {0, 0, 0, 0}; /* PANEL nx ny nw nh */
     char  text[TEXT_CAP] = {0};
@@ -577,7 +586,7 @@ static void execPbtn(unsigned code, int press)
 static int      fingers = 0;
 static bool     ignore_until_zero = false;      /* gesture ended; wait for all fingers up */
 static bool     scroll_mode = false;
-static double   scroll_anchor_y = 0;            /* normalized y anchor */
+static Vector2D scroll_anchor;                  /* normalized contact-center at last scroll sample */
 static double   scroll_travel_px = 0;           /* px moved this gesture (tap-vs-scroll heuristic) */
 static double   scroll_raw_px = 0;              /* unaccelerated travel (scroll->pinch handoff math) */
 static uint32_t dual_start_ms = 0;
@@ -589,10 +598,12 @@ static bool     down_flag = false, up_flag = false, motion_flag = false;
 static std::string touchDeviceOutput = ""; /* resolved per gesture from the touch device's
                                             * bound output (touchDown); empty → focus monitor */
 static bool     apply_pending = false;
-static bool     press_pending = false;          /* single-finger button-down deferred ~130 ms:
-                                                 * a landing second finger cancels it, so two-finger
-                                                 * scroll never drag-selects text */
-static bool     press_due = false;              /* deferred-press timer fired (main thread) */
+static bool     press_pending = false;          /* single finger, no button yet: tap / slop-drag /
+                                                 * long-press; a landing second finger cancels it */
+static bool     long_press_due = false;         /* long-press timer fired (main thread) */
+static Vector2D press_origin;                   /* normalized down point for slop */
+static double   drag_slop_px  = 12.0;           /* POINTER cmd; px before left-down */
+static int      long_press_ms = 450;            /* POINTER cmd; 0 disables right-click hold */
 static std::unordered_map<int32_t, Vector2D> g_slotPos; /* live contact positions (touchID → pos) */
 static bool     gesture_decided = false;        /* scroll-vs-pinch latch for the current gesture */
 static bool     pinch_mode = false;             /* latched pinch (mutually exclusive with scroll) */
@@ -600,7 +611,7 @@ static double   pinch_delta = 0;                /* signed contact-distance chang
 static double   pinch_prev_d = 0;               /* previous frame's contact distance */
 static bool     pinch_prev_valid = false;
 static int      pinch_ctrl_held = 0;            /* ctrl held on the synthetic keyboard for zoom */
-static double   scroll_vel = 0;                 /* smoothed finger velocity, px/s (signed) */
+static Vector2D scroll_vel;                     /* smoothed finger velocity, px/s */
 static uint32_t scroll_last_ms = 0;             /* last scroll-frame timestamp */
 static bool     fling_active = false;           /* momentum scrolling after lift */
 static uint32_t fling_last_ms = 0;
@@ -608,6 +619,8 @@ static SP<CEventLoopTimer> g_flingTimer;
 static double   fling_tau = 0.32;               /* momentum decay constant (s, FLING cmd) */
 static double   fling_cap = 5500.0;             /* fling entry velocity cap (px/s) */
 static double   fling_min = 200.0;              /* minimum lift velocity to fling (px/s) */
+static double   scroll_gain = 1.0;              /* SCROLL cmd; 1.0 = 100% */
+static bool     scroll_axis_px = false;         /* SCROLL 2nd arg: full-pixel axis value */
 static bool     touch_swallow = true;           /* consume all touch input (virtual pointer);
                                                  * off = native touchscreen support */
 
@@ -776,27 +789,144 @@ static void traceGeom(const std::string &line)
     f << nowMs() << " " << line << "\n";
 }
 
-/* emit one finger-equivalent scroll delta through the universal v120 stream:
- * Hyprland 0.56 forwards v120 only for wheel source, and every relevant
- * client is wl_pointer v8+ — Chromium's v8 handler replaces the x12 legacy
- * rescale with the exact v120 pixels, kitty reads v120 as smooth pixel
- * scroll at (5 lines x cellHeight)/120 (~0.83x px on default fonts) */
-static void emitScroll(double px)
+/* Two-finger scroll: SOURCE_FINGER → Chromium ET_SCROLL (no wheel-smooth
+ * lag). Chromium OnAxis is `value/10*120` (=×12); terminals treat the
+ * continuous axis as HIGHRES pixels. Known terminal exes get value=px;
+ * everyone else gets value=px/12 + v120=px. Widget "pixel axis" forces
+ * the terminal encoding for all clients. */
+static bool g_fingerAxisLive = false;
+
+static void emitFingerAxisStop()
 {
-    if (px == 0.0)
+    if (!g_fingerAxisLive)
         return;
-    g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, -px, 0,
-                                    (int32_t)std::lround(-px), WL_POINTER_AXIS_SOURCE_WHEEL,
-                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+    g_fingerAxisLive = false;
+    auto seatRes     = g_pSeatManager->m_state.pointerFocusResource.lock();
+    if (!seatRes)
+        return;
+    const uint32_t t = nowMs();
+    for (auto &wp : seatRes->m_pointers) {
+        auto p = wp.lock();
+        if (!p || !p->good() || p->version() < 5)
+            continue;
+        p->sendAxisSource(WL_POINTER_AXIS_SOURCE_FINGER);
+        p->sendAxisStop(t, WL_POINTER_AXIS_VERTICAL_SCROLL);
+        p->sendAxisStop(t, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
+        p->sendFrame();
+    }
+}
+
+static bool pointerFocusIsTerminal()
+{
+    static const char *const terms[] = {
+        "kitty",
+        "alacritty",
+        "foot",
+        "footclient",
+        "wezterm",
+        "wezterm-gui",
+        "ghostty",
+        "rio",
+        "contour",
+        "kgx",
+        "gnome-terminal",
+        "gnome-terminal-server",
+        "konsole",
+        "qterminal",
+        "terminator",
+        "tilix",
+        "urxvt",
+        "rxvt",
+        "xterm",
+        "st",
+        "xfce4-terminal",
+        "lxterminal",
+        "mate-terminal",
+        "ptyxis",
+        "blackbox",
+        "cool-retro-term",
+        nullptr,
+    };
+    auto surf = g_pSeatManager->m_state.pointerFocus.lock();
+    if (!surf)
+        return false;
+    wl_client *cl = surf->client();
+    if (!cl)
+        return false;
+    pid_t pid = 0;
+    uid_t uid = 0;
+    gid_t gid = 0;
+    wl_client_get_credentials(cl, &pid, &uid, &gid);
+    if (pid <= 0)
+        return false;
+    char link[64], path[256];
+    snprintf(link, sizeof link, "/proc/%d/exe", (int)pid);
+    ssize_t n = readlink(link, path, sizeof path - 1);
+    if (n <= 0)
+        return false;
+    path[n] = 0;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    for (const char *const *t = terms; *t; t++) {
+        if (strcmp(base, *t) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void emitScroll(double pxx, double pxy)
+{
+    pxx *= scroll_gain;
+    pxy *= scroll_gain;
+    if (pxx == 0.0 && pxy == 0.0)
+        return;
+    const bool   px  = scroll_axis_px || pointerFocusIsTerminal();
+    const double div = px ? 1.0 : 12.0;
+    uint32_t     t   = nowMs();
+    if (pxx != 0.0)
+        g_pSeatManager->sendPointerAxis(t, WL_POINTER_AXIS_HORIZONTAL_SCROLL, -pxx / div, 0,
+                                        (int32_t)std::lround(-pxx), WL_POINTER_AXIS_SOURCE_FINGER,
+                                        WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+    if (pxy != 0.0)
+        g_pSeatManager->sendPointerAxis(t, WL_POINTER_AXIS_VERTICAL_SCROLL, -pxy / div, 0,
+                                        (int32_t)std::lround(-pxy), WL_POINTER_AXIS_SOURCE_FINGER,
+                                        WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
     g_pSeatManager->sendPointerFrame();
-    scroll_travel_px += std::abs(px);
+    g_fingerAxisLive = true;
+    scroll_travel_px += std::hypot(pxx, pxy);
+}
+
+static void pointerWarp(SP<Monitor::CMonitor> mon, Vector2D npos)
+{
+    if (!mon)
+        return;
+    Vector2D global = mon->m_position + (npos * mon->m_size);
+    Pointer::pointerController()->warpTo(global, true);
+    g_pInputManager->simulateMouseMovement();
+}
+
+static void pointerClick(uint32_t btn)
+{
+    uint32_t t = nowMs();
+    g_pSeatManager->sendPointerButton(t, btn, WL_POINTER_BUTTON_STATE_PRESSED);
+    g_pSeatManager->sendPointerFrame();
+    g_pSeatManager->sendPointerButton(t + 1, btn, WL_POINTER_BUTTON_STATE_RELEASED);
+    g_pSeatManager->sendPointerFrame();
+}
+
+static double distPx(Vector2D a, Vector2D b, SP<Monitor::CMonitor> mon)
+{
+    if (!mon)
+        return 0;
+    return std::hypot((a.x - b.x) * mon->m_size.x, (a.y - b.y) * mon->m_size.y);
 }
 
 /* ---------------- fling momentum (android-style) ---------------- */
 static void stopFling()
 {
     fling_active = false;
-    scroll_vel   = 0;
+    scroll_vel   = Vector2D{0, 0};
+    emitFingerAxisStop();
 }
 
 static void flingTick()
@@ -810,35 +940,47 @@ static void flingTick()
         stopFling();
         return;
     }
-    scroll_vel *= std::exp(-dt / fling_tau); /* friction: ~28% velocity loss per 100 ms at 0.32 s */
-    if (std::abs(scroll_vel) < 130.0) {
+    double decay = std::exp(-dt / fling_tau); /* friction: ~28% velocity loss per 100 ms at 0.32 s */
+    scroll_vel.x *= decay;
+    scroll_vel.y *= decay;
+    if (std::hypot(scroll_vel.x, scroll_vel.y) < 130.0) {
         stopFling();
         return;
     }
-    emitScroll(scroll_vel * dt);
+    emitScroll(scroll_vel.x * dt, scroll_vel.y * dt);
     if (g_flingTimer)
         g_flingTimer->updateTimeout(std::chrono::milliseconds(16));
 }
 
-/* the single-finger button-down waits PRESS_DELAY_MS before firing: a second
- * finger landing inside that window converts the gesture to a two-finger
- * scroll without ever dragging the button (which drag-selects text) */
-#define PRESS_DELAY_MS 130
-static SP<CEventLoopTimer> g_pressTimer;
+/* still single-finger hold → right click. Cancelled by slop-drag, a second
+ * finger, lift, or swallow-off. */
+static SP<CEventLoopTimer> g_pressTimer; /* reused: long-press, not the old 130 ms left-down */
 
-static void armPressTimer()
+static void cancelLongPress()
 {
+    long_press_due = false;
+    if (g_pressTimer)
+        g_pressTimer->updateTimeout(std::nullopt);
+}
+
+static void armLongPressTimer()
+{
+    if (long_press_ms <= 0) {
+        cancelLongPress();
+        return;
+    }
+    auto delay = std::chrono::milliseconds(long_press_ms);
     if (!g_pressTimer) {
         g_pressTimer = makeShared<CEventLoopTimer>(
-            std::chrono::milliseconds(PRESS_DELAY_MS),
-            [](SP<CEventLoopTimer>, void*) {
-                press_due = true;
+            delay,
+            [](SP<CEventLoopTimer>, void *) {
+                long_press_due = true;
                 applyTouches();
             },
             nullptr);
         g_pEventLoopManager->addTimer(g_pressTimer);
     } else
-        g_pressTimer->updateTimeout(std::chrono::milliseconds(PRESS_DELAY_MS));
+        g_pressTimer->updateTimeout(delay);
 }
 
 /* handlers: record state + schedule only — no compositor calls (calling
@@ -862,10 +1004,11 @@ static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
         contact_is_panel_native = posInPanel(ev.pos.x, ev.pos.y); /* primary contact decides the mode */
     down_flag = true; /* EVERY down must apply: the resolver needs to see finger #2 to enter scroll */
     if (fingers == 1 && !contact_is_panel_native) {
-        /* defer the button-down: a second finger landing inside the window
-         * converts this gesture to a scroll without ever dragging the button */
+        /* no button yet: a second finger converts this to a scroll; movement
+         * past drag_slop_px left-drags; a still hold becomes a right click */
         press_pending = true;
-        armPressTimer();
+        press_origin  = ev.pos;
+        armLongPressTimer();
     }
     info.cancelled = true; /* consumed: Hyprland's touch refocus would steal keyboard focus */
     scheduleApply();
@@ -906,6 +1049,7 @@ static void applyTouches()
         up_flag = false;
         down_flag = false;
         press_pending = false;
+        cancelLongPress();
         stopFling();
         releasePinchCtrl();
         g_slotPos.clear();
@@ -934,20 +1078,22 @@ static void applyTouches()
             scroll_mode = false;
             /* two-finger tap without scrolling or pinching = right click */
             if (std::abs(scroll_travel_px) < 10 && !pinch_mode && nowMs() - dual_start_ms <= 250) {
-                g_pSeatManager->sendPointerButton(nowMs(), BTN_RIGHT, WL_POINTER_BUTTON_STATE_PRESSED);
-                g_pSeatManager->sendPointerFrame();
-                g_pSeatManager->sendPointerButton(nowMs(), BTN_RIGHT, WL_POINTER_BUTTON_STATE_RELEASED);
-                g_pSeatManager->sendPointerFrame();
+                pointerClick(BTN_RIGHT);
                 DBG("two-finger tap: right click");
             }
             releasePinchCtrl();
             pinch_mode      = false;
             gesture_decided = false;
             /* android-style fling: keep going with the lift velocity, decay */
-            if (std::abs(scroll_vel) > fling_min) {
+            double speed = std::hypot(scroll_vel.x, scroll_vel.y);
+            if (speed > fling_min) {
                 fling_active  = true;
                 fling_last_ms = nowMs();
-                scroll_vel    = std::max(-fling_cap, std::min(fling_cap, scroll_vel));
+                if (speed > fling_cap) {
+                    double s = fling_cap / speed;
+                    scroll_vel.x *= s;
+                    scroll_vel.y *= s;
+                }
                 if (!g_flingTimer) {
                     g_flingTimer = makeShared<CEventLoopTimer>(
                         std::chrono::milliseconds(16),
@@ -956,21 +1102,18 @@ static void applyTouches()
                     g_pEventLoopManager->addTimer(g_flingTimer);
                 } else
                     g_flingTimer->updateTimeout(std::chrono::milliseconds(16));
-            } else
-                scroll_vel = 0;
+            } else {
+                scroll_vel = Vector2D{0, 0};
+                emitFingerAxisStop();
+            }
         }
         if (fingers == 0 && press_pending) {
-            /* quick tap: the deferred press hadn't fired yet — click on lift */
+            /* quick tap: no slop, no long-press — click on lift */
             press_pending = false;
-            auto mon = resolveTouchMonitor();
-            Vector2D global = mon->m_position + (lastPos * mon->m_size);
-            Pointer::pointerController()->warpTo(global, true);
-            g_pInputManager->simulateMouseMovement();
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
-            g_pSeatManager->sendPointerFrame();
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
-            g_pSeatManager->sendPointerFrame();
-            DBG("tap: deferred press+release at lift");
+            cancelLongPress();
+            pointerWarp(resolveTouchMonitor(), lastPos);
+            pointerClick(BTN_LEFT);
+            DBG("tap: press+release at lift");
         } else if (fingers == 0 && pressed) {
             g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
             g_pSeatManager->sendPointerFrame();
@@ -1013,6 +1156,7 @@ static void applyTouches()
             scroll_mode  = false;
             scroll_travel_px = 0;
             press_pending = false; /* panel taps press immediately, nothing deferred */
+            cancelLongPress();
         } else if (fingers >= 3) {
             /* 3+ fingers: hyprgrass territory */
             if (pressed) {
@@ -1022,14 +1166,16 @@ static void applyTouches()
             }
             scroll_mode = false;
             press_pending = false;
+            cancelLongPress();
             releasePinchCtrl();
             pinch_mode      = false;
             gesture_decided = false;
         } else if (fingers == 2) {
             /* two fingers: end any drag, enter two-finger scroll — the
-             * deferred single-finger press (if it hadn't fired) dies here,
-             * so scrolling never starts with a held button */
+             * pending single-finger tap/long-press dies here, so scrolling
+             * never starts with a held button */
             press_pending = false;
+            cancelLongPress();
             if (pressed) {
                 g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
                 g_pSeatManager->sendPointerFrame();
@@ -1040,7 +1186,7 @@ static void applyTouches()
                 scroll_travel_px  = 0;
                 scroll_raw_px     = 0;
                 dual_start_ms     = nowMs();
-                scroll_vel        = 0;
+                scroll_vel        = Vector2D{0, 0};
                 scroll_last_ms    = 0;
                 gesture_decided   = false;
                 pinch_mode        = false;
@@ -1048,51 +1194,46 @@ static void applyTouches()
                 Vector2D c;
                 double   d;
                 if (contactGeometry(c, d)) {
-                    scroll_anchor_y  = c.y; /* scroll (if it wins) follows the contact center */
+                    scroll_anchor    = c; /* scroll (if it wins) follows the contact center */
                     pinch_prev_d     = d;
                     pinch_prev_valid = true;
                     traceGeom("entry slots=" + std::to_string(g_slotPos.size()) + " d=" + std::to_string(d));
                 } else {
-                    scroll_anchor_y  = lastPos.y;
+                    scroll_anchor    = lastPos;
                     pinch_prev_valid = false;
                     traceGeom("entry slots=" + std::to_string(g_slotPos.size()) + " no geometry");
                 }
                 DBG("two fingers: scroll mode");
             }
         } else if (press_pending) {
-            /* primary contact: button-down is deferred (PRESS_DELAY_MS) so a
-             * landing second finger can still turn this into a scroll; the
-             * cursor already tracks the finger (motion branch) and a quick
-             * lift clicks at the touch point (up branch) */
-            Vector2D global = mon->m_position + (lastPos * mon->m_size);
-            Pointer::pointerController()->warpTo(global, true);
-            g_pInputManager->simulateMouseMovement();
+            /* primary contact: no button yet; cursor tracks the finger */
+            pointerWarp(mon, lastPos);
         }
     }
 
-    if (press_due) {
-        /* deferred single-finger press: fire only if the gesture is still a
-         * lone, unpressed, non-panel contact */
-        press_due = false;
+    if (long_press_due) {
+        long_press_due = false;
         if (press_pending && fingers == 1 && !pressed && !contact_is_panel_native) {
-            auto mon = resolveTouchMonitor();
-            Vector2D global = mon->m_position + (lastPos * mon->m_size);
-            Pointer::pointerController()->warpTo(global, true);
-            g_pInputManager->simulateMouseMovement();
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
-            g_pSeatManager->sendPointerFrame();
-            pressed = true;
-            DBG("deferred press fired");
+            pointerWarp(resolveTouchMonitor(), lastPos);
+            pointerClick(BTN_RIGHT);
+            press_pending     = false;
+            ignore_until_zero = true;
+            DBG("long-press: right click");
         }
-        press_pending = false;
     }
 
     if (fingers == 1 && (pressed || press_pending)) {
-        /* motion: cursor follows the finger (button may still be deferred) */
+        /* motion: cursor follows the finger; past slop, left-down and drag */
         auto mon = resolveTouchMonitor();
-        Vector2D global = mon->m_position + (lastPos * mon->m_size);
-        Pointer::pointerController()->warpTo(global, true);
-        g_pInputManager->simulateMouseMovement();
+        pointerWarp(mon, lastPos);
+        if (press_pending && distPx(lastPos, press_origin, mon) > drag_slop_px) {
+            cancelLongPress();
+            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
+            g_pSeatManager->sendPointerFrame();
+            pressed       = true;
+            press_pending = false;
+            DBG("slop: left press, drag");
+        }
     } else if (fingers == 1 && panel_pressed) {
         /* drag on the panel: cursor follows, pointer focus stays on the layer.
          * Sliding off the keyboard must not become a click-drag into the client. */
@@ -1121,7 +1262,7 @@ static void applyTouches()
         if (!gesture_decided) {
             if (pinch_prev_valid)
                 pinch_delta += d - pinch_prev_d;
-            double centerPx = std::abs(center.y - scroll_anchor_y) * mon->m_size.y;
+            double centerPx = distPx(center, scroll_anchor, mon);
             double pinchPx  = std::abs(pinch_delta) * mon->m_size.y;
             static unsigned geom_dbg = 0;
             if (++geom_dbg % 5 == 0)
@@ -1130,7 +1271,7 @@ static void applyTouches()
             if (centerPx + pinchPx > 9) {
                 gesture_decided = true;
                 pinch_mode      = pinchPx > 1.4 * centerPx;
-                scroll_anchor_y = center.y; /* consume the dead-zone drift */
+                scroll_anchor   = center; /* consume the dead-zone drift */
                 traceGeom("decided pinch=" + std::string(pinch_mode ? "yes" : "no") +
                           " pinchPx=" + std::to_string(pinchPx) + " centerPx=" + std::to_string(centerPx));
             }
@@ -1159,25 +1300,26 @@ static void applyTouches()
              * spread starts to dominate (a pinch intent mislatched as scroll) */
             if (nowMs() - dual_start_ms <= 250 &&
                 std::abs(pinch_delta) * mon->m_size.y > 2.0 * scroll_raw_px + 9.0) {
+                emitFingerAxisStop();
                 pinch_mode = true;
                 traceGeom("handoff scroll->pinch");
             } else {
-                /* touchpad-style scroll: pixel deltas following the finger, with
+                /* touchpad-style scroll: pixel deltas following the fingers, with
                  * a velocity-scaled acceleration and a fling on lift */
-                double px = (center.y - scroll_anchor_y) * mon->m_size.y; /* logical px */
+                double pxx = (center.x - scroll_anchor.x) * mon->m_size.x;
+                double pxy = (center.y - scroll_anchor.y) * mon->m_size.y;
                 uint32_t now = nowMs();
                 double dt = scroll_last_ms ? (now - scroll_last_ms) / 1000.0 : 0.0;
                 scroll_last_ms = now;
-                scroll_anchor_y = center.y; /* consume the full delta: no drift */
-                scroll_raw_px += std::abs(px);
-                if (px != 0.0) {
+                scroll_anchor  = center; /* consume the full delta: no drift */
+                scroll_raw_px += std::hypot(pxx, pxy);
+                if (pxx != 0.0 || pxy != 0.0) {
                     if (dt > 0.001 && dt < 0.2) {
-                        double v = px / dt; /* instantaneous px/s, signed */
-                        scroll_vel = 0.5 * scroll_vel + 0.5 * v;
+                        scroll_vel.x = 0.5 * scroll_vel.x + 0.5 * (pxx / dt);
+                        scroll_vel.y = 0.5 * scroll_vel.y + 0.5 * (pxy / dt);
                     }
-                    /* acceleration: linear ramp up to 2x at 3000 px/s */
-                    double acc = 1.0 + std::min(std::abs(scroll_vel), 3000.0) / 3000.0;
-                    emitScroll(px * acc);
+                    /* 1:1 with the fingers (native wl_touch); speed is scrollGain */
+                    emitScroll(pxx, pxy);
                 }
             }
         }
@@ -1388,6 +1530,29 @@ static void handle_line(int cfd, char *line)
             cmd.type = SOskCommand::EType::FLING;
             cmd.a    = tau;
             cmd.b    = cap;
+            queueCommand(std::move(cmd));
+            reply = "ok";
+        } else
+            reply = "err bad args";
+    } else if (!strncmp(line, "POINTER ", 8)) {
+        /* POINTER <slop_px> <long_ms> — drag slop and long-press delay (0 = off) */
+        int slop, hold;
+        if (sscanf(line + 8, "%d %d", &slop, &hold) == 2 && slop >= 4 && slop <= 40 && hold >= 0 &&
+            hold <= 2000) {
+            cmd.type = SOskCommand::EType::POINTER;
+            cmd.a    = slop;
+            cmd.b    = hold;
+            queueCommand(std::move(cmd));
+            reply = "ok";
+        } else
+            reply = "err bad args";
+    } else if (!strncmp(line, "SCROLL ", 7)) {
+        int gain = 0, axispx = -1;
+        int n = sscanf(line + 7, "%d %d", &gain, &axispx);
+        if (n >= 1 && gain >= 50 && gain <= 200 && (n == 1 || axispx == 0 || axispx == 1)) {
+            cmd.type = SOskCommand::EType::SCROLL;
+            cmd.a    = gain;
+            cmd.b    = n == 2 ? axispx : -1;
             queueCommand(std::move(cmd));
             reply = "ok";
         } else
@@ -1688,6 +1853,18 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 fling_cap = std::max(500.0, std::min(20000.0, (double)c.b));
                 DBG("fling: tau=" + std::to_string(fling_tau) + " cap=" + std::to_string(fling_cap));
                 break;
+            case SOskCommand::EType::POINTER:
+                drag_slop_px  = std::max(4.0, std::min(40.0, (double)c.a));
+                long_press_ms = std::max(0, std::min(2000, c.b));
+                DBG("pointer: slop=" + std::to_string(drag_slop_px) + " long=" + std::to_string(long_press_ms));
+                break;
+            case SOskCommand::EType::SCROLL:
+                scroll_gain = std::max(0.5, std::min(2.0, c.a / 100.0));
+                if (c.b >= 0)
+                    scroll_axis_px = c.b != 0;
+                DBG("scroll gain: " + std::to_string(scroll_gain) +
+                    " axispx=" + std::to_string((int)scroll_axis_px));
+                break;
             case SOskCommand::EType::SWALLOW:
                 touch_swallow = c.a != 0;
                 traceGeom(std::string("swallow set: ") + (touch_swallow ? "on" : "off"));
@@ -1701,7 +1878,7 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                     stopFling();
                     releasePinchCtrl();
                     press_pending = false;
-                    press_due     = false;
+                    cancelLongPress();
                     down_flag = up_flag = motion_flag = false;
                     contact_is_panel_native = false;
                     fingers          = 0;
@@ -1710,8 +1887,6 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                     pinch_mode       = false;
                     gesture_decided  = false;
                     g_slotPos.clear();
-                    if (g_pressTimer)
-                        g_pressTimer->updateTimeout(std::nullopt);
                 }
                 DBG(std::string("touch swallow: ") + (touch_swallow ? "on" : "off"));
                 break;

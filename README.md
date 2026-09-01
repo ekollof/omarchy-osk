@@ -26,10 +26,11 @@ window has focus — exactly like wvkbd, but native to the Omarchy shell.
 ## How it works
 
 - **Touch → pointer**: the plugin consumes all touchscreen input and
-  re-emits it as pointer input — one finger = cursor under the finger +
-  left click (drag = move), two fingers = scroll (touchpad-style pixels
-  with acceleration and a decaying fling on lift), two-finger pinch =
-  zoom (ctrl+wheel), quick two-finger tap = right click, 3+ fingers are
+  re-emits it as pointer input — one finger = cursor under the finger,
+  tap = left click, move past a small slop = drag, still hold ≈450 ms =
+  right click; two fingers = scroll on both axes (touchpad-style pixels
+  with acceleration and a decaying fling on lift); two-finger pinch =
+  zoom (ctrl+wheel); quick two-finger tap = right click; 3+ fingers are
   left to hyprgrass for workspace gestures.
 - **Key tap → typed text**: taps inside the keyboard panel become synthetic
   clicks on the keyboard layer (keyboard focus never leaves the target
@@ -74,19 +75,22 @@ Toggle the keyboard:
 - SUPER+SHIFT+K,
 - bar applet: keyboard icon (left-click = settings, right-click = toggle).
 
-Touch gestures: tap = click, drag = move, two-finger drag = scroll,
-two-finger tap = right click, three+ fingers = hyprgrass workspace
-gestures. On-screen keys: hold backspace/arrows (or any key) for
-auto-repeat; sticky Ctrl/Alt/Super and one-shot shift behave phone-style.
+Touch gestures: tap = click, drag = move, hold = right click, two-finger
+drag = scroll (including sideways), two-finger tap = right click, three+
+fingers = hyprgrass workspace gestures. On-screen keys: hold
+backspace/arrows (or any key) for auto-repeat; sticky Ctrl/Alt/Super and
+one-shot shift behave phone-style.
 
-Settings live in `~/.config/omarchy/osk.json` (layout, repeat
-enabled/delay/interval) and are editable from the bar applet or the IPC:
+Settings live in `~/.config/omarchy/osk.json` (layout, repeat, fling,
+pointer slop/long-press, touch swallow) and are editable from the bar
+applet or the IPC:
 
 ```bash
 omarchy-shell ekollof.osk getState
 omarchy-shell ekollof.osk setLayout dk
 omarchy-shell ekollof.osk setRepeat 400 60
 omarchy-shell ekollof.osk setRepeatEnabled off
+omarchy-shell ekollof.osk setPointer 12 450
 omarchy-shell ekollof.osk toggle
 ```
 

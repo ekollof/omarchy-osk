@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -25,6 +26,10 @@ Panel {
   property int repeatInterval: 60
   property int flingDecay: 320
   property int flingCap: 5500
+  property int dragSlop: 12
+  property int longPress: 450
+  property int scrollGain: 100
+  property bool scrollAxisPx: false
   property bool touchSwallow: true
   property var layouts: []
 
@@ -86,6 +91,14 @@ Panel {
       root.flingDecay = parseInt(cfg.flingDecay, 10) || 320
     if (cfg.flingCap)
       root.flingCap = parseInt(cfg.flingCap, 10) || 5500
+    if (cfg.dragSlop)
+      root.dragSlop = parseInt(cfg.dragSlop, 10) || 12
+    if (cfg.longPress !== undefined)
+      root.longPress = parseInt(cfg.longPress, 10) || 0
+    if (cfg.scrollGain)
+      root.scrollGain = parseInt(cfg.scrollGain, 10) || 100
+    if (cfg.scrollAxisPx !== undefined)
+      root.scrollAxisPx = !!cfg.scrollAxisPx
     if (cfg.touchSwallow !== undefined)
       root.touchSwallow = !!cfg.touchSwallow
   }
@@ -126,12 +139,31 @@ Panel {
     contentWidth: panel.fittedContentWidth(Style.space(380))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
-    Column {
-      id: column
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.top: parent.top
-      spacing: Style.space(14)
+    Item {
+      anchors.fill: parent
+
+    Flickable {
+      id: panelFlick
+      anchors.fill: parent
+      readonly property bool overflow: contentHeight > height + 1
+      contentWidth: width
+      contentHeight: column.implicitHeight
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
+      flickableDirection: Flickable.VerticalFlick
+      // One-finger drags land on sliders/toggles, so don't rely on
+      // Flickable stealing the press. Wheel/two-finger and the scrollbar do.
+      interactive: false
+      ScrollBar.vertical: ScrollBar {
+        policy: panelFlick.overflow ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
+        implicitWidth: Style.space(16)
+        interactive: true
+      }
+
+      Column {
+        id: column
+        width: panelFlick.width - (panelFlick.overflow ? Style.space(20) : 0)
+        spacing: Style.space(12)
 
       // ---------- hero ----------
       Row {
@@ -156,6 +188,7 @@ Panel {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
             font.bold: true
+            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev6")
           }
 
           Text {
@@ -214,15 +247,6 @@ Panel {
         text: "Layout"
         foreground: root.bar ? root.bar.foreground : Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-      }
-
-      Text {
-        width: parent.width
-        text: "Any layout installed under /usr/share/X11/xkb; variants like us(intl) work via the keyboard plugin's IPC."
-        wrapMode: Text.WordWrap
-        color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Color.foreground, 1.4)
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-        font.pixelSize: Style.font.caption
       }
 
       Dropdown {
@@ -312,6 +336,112 @@ Panel {
         }
       }
 
+      // Pointer/scroll knobs only apply while the compositor swallows
+      // touch; hide them in native-touchscreen mode so the panel is shorter.
+      Column {
+        width: parent.width
+        spacing: Style.space(12)
+        visible: root.touchSwallow
+
+      PanelSectionHeader {
+        width: parent.width
+        text: "Pointer (touch → mouse)"
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+      }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(4)
+
+        Text {
+          text: "Drag slop · " + root.dragSlop + " px"
+          color: root.bar ? root.bar.foreground : Color.foreground
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        PanelSlider {
+          width: parent.width
+          bar: root.bar
+          value: root.dragSlop
+          minimum: 4
+          maximum: 40
+          step: 1
+          integer: true
+          onMoved: function(v) { root.dragSlop = Math.round(v) }
+          onReleased: function(v) { root.callOsk("setPointer", root.dragSlop + " " + root.longPress) }
+        }
+      }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(4)
+
+        Text {
+          text: root.longPress === 0 ? "Long-press right click · off" : "Long-press right click · " + root.longPress + " ms"
+          color: root.bar ? root.bar.foreground : Color.foreground
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        PanelSlider {
+          width: parent.width
+          bar: root.bar
+          value: root.longPress
+          minimum: 0
+          maximum: 1000
+          step: 50
+          integer: true
+          onMoved: function(v) { root.longPress = Math.round(v) }
+          onReleased: function(v) { root.callOsk("setPointer", root.dragSlop + " " + root.longPress) }
+        }
+      }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(4)
+
+        Text {
+          text: "Scroll speed · " + root.scrollGain + "%"
+          color: root.bar ? root.bar.foreground : Color.foreground
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        PanelSlider {
+          width: parent.width
+          bar: root.bar
+          value: root.scrollGain
+          minimum: 50
+          maximum: 200
+          step: 10
+          integer: true
+          onMoved: function(v) { root.scrollGain = Math.round(v) }
+          onReleased: function(v) { root.callOsk("setScroll", root.scrollGain + " " + (root.scrollAxisPx ? "1" : "0")) }
+        }
+      }
+
+      Toggle {
+        width: parent.width
+        label: "Pixel axis value"
+        description: root.scrollAxisPx
+                     ? "On: force pixel axis for every app (terminals already get this automatically)"
+                     : "Off: auto — terminals get pixels, Chromium-style clients get the ×12-safe axis"
+        checked: root.scrollAxisPx
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        onClicked: {
+          root.scrollAxisPx = !root.scrollAxisPx
+          root.callOsk("setScrollAxis", root.scrollAxisPx ? "on" : "off")
+        }
+      }
+
+      PanelSeparator {
+        width: parent.width
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+      }
+
       // ---------- fling ----------
       PanelSectionHeader {
         width: parent.width
@@ -367,7 +497,35 @@ Panel {
           onReleased: function(v) { root.callOsk("setFling", root.flingDecay + " " + root.flingCap) }
         }
       }
+      } // virtual-pointer settings
+      } // column
+    } // flickable
+
+    // Two-finger scroll is a pointer axis (wheel). PanelSlider eats wheel
+    // to nudge its value, so capture it above the controls. NoButton keeps
+    // taps and slider drags going through to the children below.
+    MouseArea {
+      anchors.fill: parent
+      anchors.rightMargin: panelFlick.overflow ? Style.space(18) : 0
+      z: 10
+      acceptedButtons: Qt.NoButton
+      onWheel: function(wheel) {
+        // hypr-osk two-finger scroll is high-res v120 with 1 unit ≈ 1 px
+        // (SOURCE_WHEEL, so Qt leaves pixelDelta empty). Notch wheels send
+        // multiples of 120; those become a ~48 px step. Dividing by 8 made
+        // virtual-pointer scrolling ~8× too slow.
+        const a = wheel.angleDelta.y
+        let dy = wheel.pixelDelta.y
+        // Finger-source axis: Qt pixelDelta is the tiny legacy value (px/12);
+        // v120 lands in angleDelta as 1:1 pixels. Prefer that.
+        if (dy === 0 || Math.abs(a) > Math.abs(dy) * 2)
+          dy = (Math.abs(a) >= 120 && a % 120 === 0) ? (a / 120) * 48 : a
+        const maxY = Math.max(0, panelFlick.contentHeight - panelFlick.height)
+        panelFlick.contentY = Math.max(0, Math.min(maxY, panelFlick.contentY - dy))
+        wheel.accepted = true
+      }
     }
+    } // viewport
   }
 
   FileView {

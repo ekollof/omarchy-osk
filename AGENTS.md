@@ -99,12 +99,16 @@ right-click = toggle).
   locale: LC_ALL > LC_CTYPE > LANG territory → xkb layout (en_US → us,
   da_DK → dk, …), persisted on first run to `~/.config/omarchy/osk.json`.
 - **Config**: `~/.config/omarchy/osk.json` — `{layout, repeat, repeatDelay,
-  repeatInterval, flingDecay, flingCap, touchSwallow}`. The OSK plugin owns
-  the file; the bar applet edits through its IPC target (`omarchy-shell
-  ekollof.osk setLayout dk`, `setRepeat d r`, `setRepeatEnabled on|off`,
-  `setFling tau cap`, `setTouchSwallow on|off`, `getState`) and watches the
-  file for display. Fling values and the swallow flag ride to the compositor
-  plugin as `FLING`/`SWALLOW` on handshake and on change. Applet
+  repeatInterval, flingDecay, flingCap, dragSlop, longPress, scrollGain,
+  touchSwallow}`.
+  The OSK plugin owns the file; the bar applet edits through its IPC target
+  (`omarchy-shell ekollof.osk setLayout dk`, `setRepeat d r`,
+  `setRepeatEnabled on|off`, `setFling tau cap`, `setPointer slop hold`,
+  `setScroll gain [0|1]`, `setScrollAxis on|off`, `setTouchSwallow on|off`,
+  `getState`) and watches the
+  file for display. Fling, pointer slop/long-press, scroll gain and the
+  swallow flag ride to the compositor as `FLING`/`POINTER`/`SCROLL`/`SWALLOW`
+  on handshake and on change. Applet
   enable/disable toggles the whole `ekollof.osk` plugin via
   `shell.pluginRegistry.setEnabled`.
 - **Touch swallowing off = native mode**: `SWALLOW 0` makes the plugin stop
@@ -122,6 +126,10 @@ unsolicited. Commands: `PING`, `KEY <evdev> <1|0>`, `MOD <shift|ctrl|alt|super>
 <on|off>`, `MODS off`, `TEXT <utf8>`, `LAYOUT <name>[(<variant>)]`, `ROWS`,
 `PANEL x y w h`, `PMOVE x y`, `PBTN <code> <1|0>`, `MON`, `CALIB` (no-op),
 `FLING <tau_ms> <cap_px_s>` (scroll momentum decay + speed cap),
+`POINTER <slop_px> <long_ms>` (drag slop and long-press right-click delay;
+0 ms disables hold-to-right-click),
+`SCROLL <gain_pct> [0|1]` (speed; optional 1 = force pixel axis value,
+0 = auto: terminals get pixels, other clients get Chromium-scaled px/12),
 `SWALLOW <0|1>` (touch input swallowing on/off), `STATS`.
 Full docs: header of `hypr-osk/src/main.cpp`.
 
@@ -220,15 +228,19 @@ outright.
   gesture hands off to pinch within the first 250 ms when spread dominates
   the unaccelerated scroll travel 2:1. Pinch emits ctrl+wheel —
   continuous per-frame v120 (smooth zoom + preset snap in Chromium).
-  Scrolling carries android-feel dynamics: velocity is tracked per frame
-  (smoothed), emission is accelerated up to 2x at 3000 px/s, and lifting
-  the fingers hands the velocity to a 16 ms fling timer that decays
-  exponentially (~28%/100 ms, `FLING`-configurable) until any new touch,
-  an aborted gesture, or plugin unload cancels it.
-  Finger #1's
-  button-down is deferred ~130 ms (`PRESS_DELAY_MS`) so a landing second
-  finger cancels it — two-finger scroll never drag-selects text; quick taps
-  click on lift, held single-finger drags get the button after the delay.
+  Scrolling is 2-axis SOURCE_FINGER (Chromium precision ScrollEvent, no
+  wheel-smooth lag). Chromium OnAxis is `value/10*120` (=×12); terminals
+  treat the continuous axis as HIGHRES pixels. Focused `/proc/<pid>/exe`
+  basename in a terminal list (kitty, alacritty, foot, ghostty, wezterm, …)
+  gets `value=px`; other clients get `value=px/12` + `v120=px`. Widget
+  `scrollAxisPx` forces the terminal encoding for everyone. Lift flings
+  then `axis_stop`.
+  Finger #1 does not press left on a timer. A second finger cancels the
+  pending tap so two-finger scroll never drag-selects; movement past
+  `dragSlop` (osk.json / `POINTER`, default 12 px) left-presses and drags;
+  a still hold of `longPress` ms (default 450, 0 = off) is a right click;
+  a quick lift with no slop is a left click (press/release timestamps 1 ms
+  apart so toolkits see a real click).
 - **Bar widget popup**: use the shell's `qs.Ui` `Panel` base + `BarIconButton`
   + `KeyboardPanel` (see `shell/ekollof.osk-applet/Panel.qml` and
   `~/src/omarchy/shell/plugins/panels/power/Panel.qml` as the canonical
@@ -252,8 +264,10 @@ outright.
    uppercases them), ISO extra key on `de`, hyphenated variant
    `setLayout us(altgr-intl)`, then back (`setLayout us`). Hold backspace:
    first delete is immediate, then repeat.
-5. Touch: tap = left click under finger, drag = move, two-finger drag =
-   scroll, two-finger tap = right click, keys on the OSK panel = taps.
+5. Touch: tap = left click under finger, move past ~12 px = drag, still
+   hold ~450 ms = right click, two-finger drag = scroll (vertical *and*
+   horizontal) with fling, two-finger tap = right click, keys on the OSK
+   panel = taps.
 6. Hold backspace/arrows → key repeat at configured delay/rate.
 7. Bar applet: layout picker lists `localectl list-x11-keymap-layouts`;
    sliders persist to `~/.config/omarchy/osk.json`.
