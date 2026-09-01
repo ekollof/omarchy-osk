@@ -69,8 +69,8 @@ right-click = toggle).
    frequently serves the old code — verify via the `loaded rev<N>` marker in
    `journalctl --user` (`Component.onCompleted` in Osk.qml; bump the marker
    when editing) and `omarchy restart shell` when it doesn't land.
-   C++ changes: `install.sh` + `hyprctl plugin unload <path> && hyprctl plugin
-   load <path>` (unload wants the full path, not the plugin name).
+   C++ changes: `install.sh` unloads and reloads the compositor plugin by
+   full `.so` path (a `hyprctl reload` alone keeps the old inode mapped).
 
 ## Architecture / data flow
 
@@ -147,12 +147,28 @@ outright.
   singleton, so a plugin .so gets its own never-printed instance — every
   `DBG()` line in main.cpp is a silent no-op. When you need eyes on
   compositor-side gesture state, use `traceGeom()` (appends to
-  `/tmp/hypr-osk-geom.log`), or `hyprctl rollinglog`-adjacent sources —
-  never the log.
+  `/tmp/hypr-osk-geom.log` when `HYPR_OSK_TRACE=1` is set in Hyprland's
+  environment — off by default, low power), or `hyprctl rollinglog`-adjacent
+  sources — never the log.
+- **Idle = zero wakeups (low power).** The command-drain timer is created
+  disarmed in `PLUGIN_INIT` and only armed from the compositor Wayland loop:
+  the socket thread writes an eventfd, `onDrainReadable` (main thread) sets
+  a 0 ms timeout. Never `addTimer`/`updateTimeout` from the socket thread —
+  those mutate the event loop. The socket thread's polls sleep indefinitely
+  and are woken by a self-pipe write from `PLUGIN_EXIT` (fallback: 200 ms
+  flag-poll if the pipe failed; 10 ms drain poll if eventfd failed); the QML
+  guard timer runs only while the handshake is incomplete. Don't reintroduce
+  unconditional repeating timers — they cost the whole compositor/shell 100+
+  wakeups per second.
 - **xkb keycodes are evdev + 8.** `xkb_keymap_*` iteration yields xkb codes;
   `IKeyboard::SKeyEvent.keycode` and the wire protocol are EVDEV codes. The
-  textmap stores `key - 8` and the grid lookup adds `+ 8` — mixing them up
-  shifts every key by one row-half (q types o).
+  textmap stores `key - 8` (evdev) and every `xkb_keymap_*` call (including
+  `key_get_mods_for_level`) must add `+ 8`. The grid JSON `c` field is evdev
+  too. Mixing them up shifts every key by one row-half (q types o) or drops
+  Shift/AltGr on `TEXT` (so `!` types `1`).
+- **Socket thread never calls compositor APIs.** `PANEL` is queued; `MON`/`STATS`
+  read main-thread snapshots. `panel_rect_valid` is main-thread only;
+  `g_panelVisible` is the atomic the socket uses for the hidden gate.
 - **quickshell v0.3.1 `Socket` never retries**: a failed connect keeps the
   dead QLocalSocket and `connected = true` becomes a no-op; a successful
   connect clears the internal reconnect target so server-side drops also
@@ -175,10 +191,12 @@ outright.
   may keep serving the old component. Bump the `rev<N>` marker in
   Osk.qml's `Component.onCompleted` and `omarchy restart shell` until the
   new marker shows in the journal.
-- **`PLUGIN_EXIT` ordering matters** (thread join → bus disconnect → timer
-  removal → key release → device destroy): the .so is unmapped after unload
-  and anything still referencing it crashes the compositor. Preserve the
-  teardown order in main.cpp.
+- **`PLUGIN_EXIT` ordering matters** (socket flag + wake pipe → thread join
+  → drain eventfd source remove + close → bus disconnect → timer removal →
+  key release → device destroy): the .so is unmapped after unload and
+  anything still referencing it crashes the compositor. Preserve the
+  teardown order in main.cpp. Layout names allow `[a-z0-9_-]` so variants
+  like `us(altgr-intl)` compile.
 - **Calling input/monitor code from touch event callbacks deadlocks the
   input pipeline** — handlers only record state and schedule the zero-time
   apply timer; all compositor mutations happen in `applyTouches()` on the
@@ -228,9 +246,12 @@ outright.
 2. `omarchy-shell ekollof.osk getState` → JSON with `gridLoaded: true`.
 3. Toggle: SUPER+SHIFT+K, edge swipe, bar applet right-click → layer
    `ekollof-osk` appears/disappears in `hyprctl layers`.
-4. Typing: summon over a text field, tap keys — output matches labels; test a
-   non-US layout (`omarchy-shell ekollof.osk setLayout dk` → æ ø å type and
-   render), then back (`setLayout us`).
+4. Typing: summon over a text field, tap keys — output matches labels
+   including shifted symbols (`!` `@` not `1` `2`); test a non-US layout
+   (`omarchy-shell ekollof.osk setLayout dk` → æ ø å type and render, Caps
+   uppercases them), ISO extra key on `de`, hyphenated variant
+   `setLayout us(altgr-intl)`, then back (`setLayout us`). Hold backspace:
+   first delete is immediate, then repeat.
 5. Touch: tap = left click under finger, drag = move, two-finger drag =
    scroll, two-finger tap = right click, keys on the OSK panel = taps.
 6. Hold backspace/arrows → key repeat at configured delay/rate.

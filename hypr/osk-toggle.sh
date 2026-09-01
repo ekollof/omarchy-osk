@@ -4,13 +4,18 @@
 # The plugin's open() toggles visibility. Debounced: hyprgrass can fire the
 # edge gesture twice per swipe; without a lock the double toggle opens+closes.
 
-LOCK=/tmp/.osk-toggle-lock
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/osk-toggle.lock"
+exec 9>>"$LOCK"
+flock 9
 NOW=$(date +%s%N)
 LAST=0
-[ -f "$LOCK" ] && LAST=$(cat "$LOCK")
+read -r LAST <"$LOCK" || LAST=0
+case "$LAST" in
+  ''|*[!0-9]*) LAST=0 ;;
+esac
 if [ $(( (NOW - LAST) / 1000000 )) -lt 1500 ]; then
   exit 0
 fi
-echo "$NOW" > "$LOCK"
+printf '%s\n' "$NOW" >"$LOCK"
 
 omarchy-shell shell summon ekollof.osk '{}'

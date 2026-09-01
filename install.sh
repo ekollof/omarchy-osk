@@ -17,13 +17,16 @@ DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # 1+2. Build the compositor plugin and install it where Hyprland plugins
 # live — unless hyprpm manages it (see hyprpm.toml): then its copy wins and
 # a flat copy here would fight it (rebuild with: hyprpm update).
+OSK_SO="$HOME/.local/share/hyprland/plugins/libhypr-osk.so"
+OSK_LOCAL_BUILT=0
 if hyprpm list 2>/dev/null | grep -q hypr-osk; then
   echo "hypr-osk is hyprpm-managed: skipping the local build (rebuild with: hyprpm update)."
 else
   [[ -d "$DIR/hypr-osk/build" ]] || meson setup "$DIR/hypr-osk/build" "$DIR/hypr-osk" >/dev/null
   meson compile -C "$DIR/hypr-osk/build"
   mkdir -p "$HOME/.local/share/hyprland/plugins"
-  install -m 644 "$DIR/hypr-osk/build/libhypr-osk.so" "$HOME/.local/share/hyprland/plugins/"
+  install -m 644 "$DIR/hypr-osk/build/libhypr-osk.so" "$OSK_SO"
+  OSK_LOCAL_BUILT=1
 fi
 
 # 3. Build the vendored hyprgrass (edge-swipe gesture) the same way: upstream
@@ -60,6 +63,15 @@ omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 omarchy-shell shell putBarWidget ekollof.osk-applet '{}' >/dev/null 2>&1 || true
 omarchy-shell shell setPluginEnabled ekollof.osk true >/dev/null 2>&1 || true
 hyprctl reload >/dev/null 2>&1 || true
+
+# hyprctl reload does not remap an already-loaded .so (the old inode stays
+# mapped). Unload by full path, then load the copy we just installed —
+# only when this script built that copy (hyprpm-managed machines rebuild
+# with `hyprpm update`).
+if [[ "$OSK_LOCAL_BUILT" == 1 ]]; then
+  hyprctl plugin unload "$OSK_SO" >/dev/null 2>&1 || true
+  hyprctl plugin load "$OSK_SO" >/dev/null 2>&1 || true
+fi
 
 echo "omarchy-osk installed."
 hyprctl plugin list | grep -q hypr-osk && echo "compositor plugin: loaded" \

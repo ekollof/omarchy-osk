@@ -59,10 +59,16 @@ Panel {
       root.bar.run("omarchy-shell shell toggle " + root.oskPluginId + " '{}'")
   }
 
+  function shellQuote(s) {
+    return "'" + String(s).replace(/'/g, "'\\''") + "'"
+  }
+
   // Settings changes ride the OSK plugin's own IPC target.
   function callOsk(method, arg) {
-    if (root.bar)
-      root.bar.run("omarchy-shell ekollof.osk " + method + " " + arg)
+    if (!root.bar)
+      return
+    const parts = String(arg).trim().split(/\s+/).map(root.shellQuote).join(" ")
+    root.bar.run("omarchy-shell ekollof.osk " + method + " " + parts)
   }
 
   function applyConfig(raw) {
@@ -190,7 +196,7 @@ Panel {
 
       Button {
         width: parent.width
-        text: root.oskEnabled ? "Hide keyboard" : "Show keyboard"
+        text: "Toggle keyboard"
         foreground: root.bar ? root.bar.foreground : Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         enabled: root.oskEnabled

@@ -74,6 +74,10 @@ Item {
     root.opened = false
     root.shift = false
     root.capsLock = false
+    stopRepeat()
+    for (const m in root.stickyMods)
+      root.stickyMods[m] = false
+    root.stickyModsChanged()
     setLayer("main")
     send("PANEL 0 0 0 0")
     send("MODS off")
@@ -135,7 +139,7 @@ Item {
     let cfg = {}
     try { cfg = JSON.parse(raw || "{}") || {} } catch (e) { cfg = {} }
     let layout = String(cfg.layout || "")
-    if (!/^[a-z0-9_]+(\([a-z0-9_]+\))?$/.test(layout))
+    if (!/^[a-z0-9_-]+(\([a-z0-9_-]+\))?$/.test(layout))
       layout = defaultLayout()
     root.layout = layout
     root.repeatDelay = clampInt(cfg.repeatDelay, 100, 2000, 400)
@@ -177,13 +181,14 @@ Item {
       flingDecay: root.flingDecay,
       flingCap: root.flingCap,
       touchSwallow: root.touchSwallow,
-      gridLoaded: !!root.grid
+      gridLoaded: !!root.grid,
+      opened: root.opened
     })
   }
 
   function setLayout(arg) {
     const layout = String(arg || "").trim()
-    if (!/^[a-z0-9_]+(\([a-z0-9_]+\))?$/.test(layout)) {
+    if (!/^[a-z0-9_-]+(\([a-z0-9_-]+\))?$/.test(layout)) {
       console.warn("[ekollof.osk] setLayout: bad layout " + layout)
       return "err bad layout"
     }
@@ -352,10 +357,12 @@ Item {
   }
 
   // Safety net for any missed announce (races between file load, connects
-  // and layout switches): retry every 2s until the handshake is through
+  // and layout switches): retry every 2s while the handshake is incomplete.
+  // `running` is bound, so a completed handshake stops the timer entirely —
+  // an idle session carries zero active timers.
   Timer {
     interval: 2000
-    running: true
+    running: root.cfgLoaded && (!root.announced || !connected())
     repeat: true
     onTriggered: root.announce()
   }
@@ -408,7 +415,7 @@ Item {
 
   // caps lock shifts letters only; caps+shift gives lowercase (real caps)
   function resolveChar(k) {
-    const isLetter = /^[a-z]$/.test(k.l || "")
+    const isLetter = /^\p{L}$/u.test(k.l || "")
     const wantUpper = k.s && (root.shift ? (root.capsLock ? false : true) : (root.capsLock && isLetter))
     if (wantUpper)
       return k.s
@@ -511,7 +518,7 @@ Item {
       bottom: true
       right: true
     }
-    exclusiveZone: root.panelH
+    exclusiveZone: root.opened ? root.panelH : 0
     color: "transparent"
     WlrLayershell.namespace: "ekollof-osk"
     WlrLayershell.layer: WlrLayer.Top
@@ -590,8 +597,11 @@ Item {
                     if (pressed) {
                       key.repeatFired = false
                       const t = key.modelData.t
-                      if (t === "char" || t === "code")
+                      if (t === "char" || t === "code") {
                         root.startRepeat(key.modelData, key)
+                        root.activate(key.modelData)
+                        key.repeatFired = true
+                      }
                     } else {
                       root.stopRepeat()
                     }
@@ -611,6 +621,6 @@ Item {
 
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
-  Component.onCompleted: console.log("[ekollof.osk] loaded rev10 layout=" + root.layout +
+  Component.onCompleted: console.log("[ekollof.osk] loaded rev11 layout=" + root.layout +
                                      " cfg=" + root.cfgPath())
 }

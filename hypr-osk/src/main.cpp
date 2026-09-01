@@ -3,11 +3,13 @@
  * keyboard use.
  *
  * Runs inside the compositor:
- *   - Single-finger touch: exact cursor placement under the finger
- *     (warpTo + client update — no acceleration, no dispatcher, no wiggle),
- *     press on contact, release on lift. Touches are consumed before they
- *     reach applications: no double input, no browser touch gestures.
- *   - Two-finger drag: scroll (natural direction, discrete wheel steps).
+ *   - Single-finger touch: cursor under the finger (warpTo, no
+ *     acceleration). Button-down is deferred ~130 ms so a landing second
+ *     finger can become a scroll without drag-selecting text; a quick tap
+ *     clicks on lift. Touches are consumed before they reach applications:
+ *     no double input, no browser touch gestures.
+ *   - Two-finger drag: pixel scroll (v120 wheel source, acceleration +
+ *     decaying fling on lift). Two-finger pinch: ctrl+wheel zoom.
  *   - Quick two-finger tap: right click.
  *   - 3+ fingers: consumed for apps, left to hyprgrass (workspace swipes).
  *
@@ -66,6 +68,9 @@
 
 #include <cmath>
 #include <fstream>
+#include <fcntl.h>
+#include <cerrno>
+#include <sys/eventfd.h>
 
 #include <atomic>
 #include <cstring>
@@ -96,9 +101,10 @@ static int    debug   = 1;
  * corrupt under event-loop reentrancy (the crash mechanism). TEXT is
  * bounded to 95 bytes. */
 struct SOskCommand {
-    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, SWALLOW } type;
-    int  a = 0, b = 0;
-    char text[TEXT_CAP] = {0};
+    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, SWALLOW, PANEL } type;
+    int   a = 0, b = 0;
+    float panel[4]      = {0, 0, 0, 0}; /* PANEL nx ny nw nh */
+    char  text[TEXT_CAP] = {0};
 };
 static constexpr size_t RING_SIZE = 64;
 static SOskCommand      g_ring[RING_SIZE];
@@ -106,16 +112,28 @@ static std::mutex       g_ringMutex;
 static size_t           g_ringHead = 0, g_ringCount = 0;
 static bool             g_inDrain = false;
 static std::atomic<bool> g_socketRunning{false};
+static std::atomic<bool> g_panelVisible{false}; /* main thread writes; socket thread reads for the hidden gate */
+static int               g_wakePipe[2] = {-1, -1}; /* self-pipe: wakes the socket thread's polls */
+static int               g_drainEventFd = -1;      /* eventfd: socket thread → compositor loop */
+static wl_event_source  *g_drainEventSource = nullptr;
+
+static void wakeDrain();
 
 static void queueCommand(SOskCommand cmd)
 {
-    std::lock_guard<std::mutex> lg(g_ringMutex);
-    if (g_ringCount >= RING_SIZE) {
-        DBG("ring full: command dropped");
-        return;
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lg(g_ringMutex);
+        if (g_ringCount >= RING_SIZE) {
+            DBG("ring full: command dropped");
+        } else {
+            g_ring[(g_ringHead + g_ringCount) % RING_SIZE] = cmd;
+            g_ringCount++;
+            queued = true;
+        }
     }
-    g_ring[(g_ringHead + g_ringCount) % RING_SIZE] = cmd;
-    g_ringCount++;
+    if (queued)
+        wakeDrain(); /* main thread only: the eventfd callback arms the drain timer */
 }
 
 /* ---------------- keyboard state ---------------- */
@@ -320,7 +338,7 @@ static void appendGridRow(std::string &out, const unsigned *codes, size_t len)
         if (!first)
             out += ",";
         first = false;
-        out += "{\"c\":" + std::to_string(key);
+        out += "{\"c\":" + std::to_string(codes[i]); /* evdev; KEY on the wire is evdev */
         if (!l0.empty()) {
             out += ",\"l\":\"";
             jsonAppendEscaped(out, l0);
@@ -339,18 +357,18 @@ static void appendGridRow(std::string &out, const unsigned *codes, size_t len)
 
 static void rebuildGrid()
 {
-    static const unsigned rows[][14] = {
-        {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 41, 0},          /* digits + - = ` */
-        {16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 43, 0},  /* q .. ] \ */
-        {30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 0},          /* a .. ' */
-        {44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 0},              /* z .. / */
+    static const unsigned rows[][15] = {
+        {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 41, 0},              /* digits + - = ` */
+        {16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 43, 0},      /* q .. ] \ */
+        {30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 0},              /* a .. ' */
+        {KEY_102ND, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 0},      /* ISO <> , z .. / */
     };
     std::string json = "{\"rows\":[";
     for (size_t r = 0; r < 4; r++) {
         if (r)
             json += ",";
         json += "[";
-        appendGridRow(json, rows[r], 14);
+        appendGridRow(json, rows[r], 15);
         json += "]";
     }
     json += "]}";
@@ -482,7 +500,8 @@ static void execText(const std::string &text)
         xkb_mod_mask_t maskBuf[8] = {0};
         size_t nmasks = 0;
         if (km && it->second.level > 0) {
-            nmasks = xkb_keymap_key_get_mods_for_level(km, it->second.key, it->second.layout,
+            /* SKeyHit.key is evdev; xkb_keymap_* wants evdev+8 */
+            nmasks = xkb_keymap_key_get_mods_for_level(km, it->second.key + 8, it->second.layout,
                                                        it->second.level, maskBuf, 8);
         }
         if (nmasks > 0) {
@@ -521,6 +540,8 @@ static void execLayout(const std::string &spec)
     /* release everything held: the fresh xkb state knows nothing about them */
     for (auto it = g_pressedKeys.begin(); it != g_pressedKeys.end();)
         execKey(*it++, 0);
+    held_mods = 0;
+    sent_mods = 0;
     IKeyboard::SStringRuleNames rules;
     rules.layout  = layout;
     rules.variant = variant;
@@ -598,6 +619,59 @@ static double panel_nx = 0, panel_ny = 0, panel_nw = 0, panel_nh = 0;
 static bool   panel_rect_valid = false;
 static bool   contact_is_panel_native = false;
 
+/* snapshot of the touch monitor — written on the main thread, read by MON/STATS */
+struct SMonSnap {
+    char name[64] = {0};
+    int  x = 0, y = 0, w = 0, h = 0;
+    bool valid = false;
+};
+static std::mutex g_monMutex;
+static SMonSnap   g_monSnap;
+
+struct SStatsSnap {
+    int      fingers = 0, pressed = 0, ignore = 0, scroll = 0, down = 0, up = 0;
+    int      contact = 0, panel_valid = 0, inject = 0, anypeer = 0, swallow = 0, indrain = 0;
+    unsigned fires     = 0;
+    size_t   ring      = 0;
+    size_t   textmap   = 0;
+    double   panel_ny = 0, panel_nh = 0, lastx = 0, lasty = 0, fling_tau_ms = 0, fling_cap = 0;
+    char     layout[64] = {0};
+};
+static std::mutex  g_statsMutex;
+static SStatsSnap  g_statsSnap;
+
+static void publishStats()
+{
+    SStatsSnap s;
+    s.fingers     = fingers;
+    s.pressed     = (int)pressed;
+    s.ignore      = (int)ignore_until_zero;
+    s.scroll      = (int)scroll_mode;
+    s.down        = (int)down_flag;
+    s.up          = (int)up_flag;
+    s.contact     = (int)contact_is_panel_native;
+    s.panel_valid = (int)panel_rect_valid;
+    s.inject      = (int)g_panelVisible.load(std::memory_order_relaxed);
+    s.anypeer     = 0; /* filled at STATS read: g_allowAnyPeer is init-only */
+    s.swallow     = (int)touch_swallow;
+    s.indrain     = (int)g_inDrain;
+    s.fires       = g_drain_fires;
+    s.panel_ny    = panel_ny;
+    s.panel_nh    = panel_nh;
+    s.lastx       = lastPos.x;
+    s.lasty       = lastPos.y;
+    s.fling_tau_ms = fling_tau * 1000.0;
+    s.fling_cap    = fling_cap;
+    s.textmap      = g_textMap.size();
+    {
+        std::lock_guard<std::mutex> lg(g_ringMutex);
+        s.ring = g_ringCount;
+    }
+    snprintf(s.layout, sizeof s.layout, "%s", g_layoutSpec.c_str());
+    std::lock_guard<std::mutex> lg(g_statsMutex);
+    g_statsSnap = s;
+}
+
 static bool posInPanel(double nx, double ny)
 {
     return panel_rect_valid && nx >= panel_nx && nx < panel_nx + panel_nw && ny >= panel_ny &&
@@ -637,6 +711,19 @@ static SP<Monitor::CMonitor> resolveTouchMonitor()
                    .run();
     if (!mon)
         mon = Desktop::focusState()->monitor();
+    SMonSnap snap{};
+    if (mon) {
+        snprintf(snap.name, sizeof snap.name, "%s", mon->m_name.c_str());
+        snap.x     = (int)mon->m_position.x;
+        snap.y     = (int)mon->m_position.y;
+        snap.w     = (int)mon->m_size.x;
+        snap.h     = (int)mon->m_size.y;
+        snap.valid = true;
+    }
+    {
+        std::lock_guard<std::mutex> lg(g_monMutex);
+        g_monSnap = snap;
+    }
     return mon;
 }
 
@@ -674,10 +761,16 @@ static void releasePinchCtrl()
 }
 
 /* DBG is a silent no-op from inside a plugin (header-inline logger singleton),
- * so the gesture geometry traces go straight to a file */
+ * so the gesture geometry traces go straight to a file — gated behind
+ * HYPR_OSK_TRACE=1 in the compositor's environment (low power: no writes,
+ * no open() calls unless explicitly asked for) */
 static void traceGeom(const std::string &line)
 {
-    if (!debug)
+    static const bool enabled = [] {
+        const char *e = getenv("HYPR_OSK_TRACE");
+        return e && *e && strcmp(e, "0") != 0;
+    }();
+    if (!enabled)
         return;
     std::ofstream f("/tmp/hypr-osk-geom.log", std::ios::app);
     f << nowMs() << " " << line << "\n";
@@ -1001,11 +1094,20 @@ static void applyTouches()
         Pointer::pointerController()->warpTo(global, true);
         g_pInputManager->simulateMouseMovement();
     } else if (fingers == 1 && panel_pressed) {
-        /* drag on the panel: cursor follows, pointer focus stays on the layer */
-        auto mon = resolveTouchMonitor();
-        Vector2D global = mon->m_position + (lastPos * mon->m_size);
-        Pointer::pointerController()->warpTo(global, true);
-        g_pInputManager->simulateMouseMovement();
+        /* drag on the panel: cursor follows, pointer focus stays on the layer.
+         * Sliding off the keyboard must not become a click-drag into the client. */
+        if (!posInPanel(lastPos.x, lastPos.y)) {
+            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+            g_pSeatManager->sendPointerFrame();
+            panel_pressed           = false;
+            contact_is_panel_native = false;
+            ignore_until_zero       = true;
+        } else {
+            auto mon = resolveTouchMonitor();
+            Vector2D global = mon->m_position + (lastPos * mon->m_size);
+            Pointer::pointerController()->warpTo(global, true);
+            g_pInputManager->simulateMouseMovement();
+        }
     } else if (scroll_mode && fingers == 2) {
         /* two-finger gesture: the contact-center delta scrolls, the contact-
          * distance delta zooms; whichever dominates by the decision threshold
@@ -1082,157 +1184,9 @@ static void applyTouches()
         pinch_prev_d     = d;
         pinch_prev_valid = true;
     }
+    publishStats();
 }
 
-#if 0
-static void touchDown(ITouch::SDownEvent ev, Event::SCallbackInfo &info)
-{
-    fingers++;
-
-    /* resolve the global position (the event carries normalized coords) */
-    auto mon = State::monitorState()
-                   ->query()
-                   .name(!ev.device->m_boundOutput.empty() ? ev.device->m_boundOutput : "")
-                   .run();
-    if (!mon)
-        mon = Desktop::focusState()->monitor();
-    g_touchMonitor = mon;
-    Vector2D global = mon->m_position + (ev.pos * mon->m_size);
-
-    /* OSK surface passthrough: wvkbd bridge + QML panel rect. Touches there
-     * belong to the keyboard's own Qt/client handling. */
-    int wx, wy, ww, wh;
-    bool onOskSurface = (wvkbd_rect(&wx, &wy, &ww, &wh) && global.x >= wx && global.x < wx + ww &&
-                         global.y >= wy && global.y < wy + wh) ||
-                        posInPanel((int)global.x, (int)global.y);
-    contact_is_panel_native = onOskSurface;
-    info.cancelled          = onOskSurface ? false : true;
-    if (onOskSurface) {
-        DBG("touch on OSK surface: passed through");
-        return;
-    }
-
-    if (ignore_until_zero)
-        return;
-
-    if (fingers == 1) {
-        /* absolute: cursor under the finger, button pressed */
-        Pointer::pointerController()->warpTo(global, true);
-        g_pInputManager->simulateMouseMovement();
-        g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
-        g_pSeatManager->sendPointerFrame();
-        pressed     = true;
-        scroll_mode = false;
-        scroll_steps = 0;
-        DBG("touch down: pointer under finger, pressed");
-    } else if (fingers == 2) {
-        /* second finger: end drag, enter two-finger scroll */
-        if (pressed) {
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
-            g_pSeatManager->sendPointerFrame();
-            pressed = false;
-        }
-        scroll_mode       = true;
-        scroll_anchor_y   = ev.pos.y;
-        scroll_steps      = 0;
-        dual_start_ms     = nowMs();
-        last_motion_y     = ev.pos.y;
-        last_motion_valid = true;
-        DBG("two fingers: scroll mode");
-    } else {
-        /* 3+ fingers: hyprgrass territory */
-        scroll_mode = false;
-        DBG("3+ fingers: handed to hyprgrass");
-    }
-}
-
-static void touchUp(ITouch::SUpEvent ev, Event::SCallbackInfo &info)
-{
-    info.cancelled = contact_is_panel_native ? false : true;
-    if (fingers > 0)
-        fingers--;
-    DBG("touch up, fingers left: " + std::to_string(fingers));
-
-    if (fingers == 0) {
-        ignore_until_zero = false;
-        contact_is_panel_native = false;
-        g_touchMonitor    = nullptr;
-        if (pressed) {
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
-            g_pSeatManager->sendPointerFrame();
-            pressed = false;
-        }
-        scroll_mode = false;
-        return;
-    }
-
-    if (scroll_mode && fingers < 2) {
-        /* finger lifted mid-scroll: gesture over */
-        scroll_mode       = false;
-        ignore_until_zero = true;
-        /* two-finger tap without scrolling = right click */
-        if (scroll_steps == 0 && nowMs() - dual_start_ms <= 250) {
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_RIGHT, WL_POINTER_BUTTON_STATE_PRESSED);
-            g_pSeatManager->sendPointerFrame();
-            g_pSeatManager->sendPointerButton(nowMs(), BTN_RIGHT, WL_POINTER_BUTTON_STATE_RELEASED);
-            g_pSeatManager->sendPointerFrame();
-            DBG("two-finger tap: right click");
-        }
-        return;
-    }
-
-    if (fingers == 1 && pressed) {
-        /* can't tell which finger lifted: end the drag to be safe */
-        g_pSeatManager->sendPointerButton(nowMs(), BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
-        g_pSeatManager->sendPointerFrame();
-        pressed           = false;
-        ignore_until_zero = true;
-    }
-}
-
-static void touchMotion(ITouch::SMotionEvent ev, Event::SCallbackInfo &info)
-{
-    info.cancelled = contact_is_panel_native ? false : true;
-    if (contact_is_panel_native)
-        return;
-    if (ignore_until_zero) {
-        last_motion_y     = ev.pos.y;
-        last_motion_valid = true;
-        return;
-    }
-
-    if (fingers == 1 && pressed) {
-        /* absolute: cursor follows the finger exactly. The monitor is
-         * re-resolved per event: with no monitor config the layout is
-         * dynamic (screens are placed wherever Hyprland puts them). */
-        auto mon = g_touchMonitor;
-        if (!mon)
-            mon = Desktop::focusState()->monitor();
-        g_touchMonitor = mon;
-        Vector2D global = mon->m_position + (ev.pos * mon->m_size);
-        Pointer::pointerController()->warpTo(global, true);
-        g_pInputManager->simulateMouseMovement();
-    } else if (scroll_mode && fingers == 2) {
-        /* scroll from the vertical delta (whichever finger moved);
-         * ev.pos is normalized — 0.025 ≈ 20 logical px on an 800-tall screen */
-        double dy = last_motion_valid ? (ev.pos.y - last_motion_y) : 0.0;
-        last_motion_y     = ev.pos.y;
-        last_motion_valid = true;
-        int steps         = (int)(dy / 0.025);
-        if (steps == 0)
-            return;
-        scroll_anchor_y += steps * 0.025;
-        scroll_steps += abs(steps);
-        /* natural scrolling: content follows the fingers */
-        g_pSeatManager->sendPointerAxis(nowMs(), WL_POINTER_AXIS_VERTICAL_SCROLL, steps * -10.0, -steps,
-                                        steps * -120, WL_POINTER_AXIS_SOURCE_WHEEL,
-                                        WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
-        g_pSeatManager->sendPointerFrame();
-        DBG("scroll " + std::to_string(steps) + " steps");
-    }
-}
-
-#endif
 
 /* ---------------- socket protocol ---------------- */
 static void send_reply(int cfd, const char *msg)
@@ -1285,37 +1239,6 @@ static bool peerAllowed(int cfd)
     return true;
 }
 
-/* ---------------- safe parsing helpers ---------------- */
-static int parse_uint(const char *s, unsigned long max, unsigned *out)
-{
-    char *end = NULL;
-    if (!s || !*s)
-        return 0;
-    errno = 0;
-    unsigned long v = strtoul(s, &end, 10);
-    while (end && (*end == ' ' || *end == '\n' || *end == '\t' || *end == '\r' || *end == ',' || *end == '}' || *end == '"'))
-        end++;
-    if (errno || end == s || *end != '\0' || v > max)
-        return 0;
-    *out = (unsigned)v;
-    return 1;
-}
-
-static int parse_int(const char *s, long min, long max, int *out)
-{
-    char *end = NULL;
-    if (!s || !*s)
-        return 0;
-    errno = 0;
-    long v = strtol(s, &end, 10);
-    while (end && (*end == ' ' || *end == '\n' || *end == '\t' || *end == '\r' || *end == ',' || *end == '}' || *end == '"'))
-        end++;
-    if (errno || end == s || *end != '\0' || v < min || v > max)
-        return 0;
-    *out = (int)v;
-    return 1;
-}
-
 static void handle_line(int cfd, char *line)
 {
     size_t len = strlen(line);
@@ -1323,13 +1246,15 @@ static void handle_line(int cfd, char *line)
         line[--len] = 0;
     DBG("cmd: " + std::string(line));
 
-    const char *reply = "err unknown command";
+    std::string reply = "err unknown command";
     SOskCommand cmd;
+
+    auto hidden = [] { return !g_panelVisible.load(std::memory_order_acquire); };
 
     if (strcmp(line, "PING") == 0) {
         reply = "PONG";
     } else if (!strncmp(line, "KEY ", 4)) {
-        if (!panel_rect_valid) { /* input injection only while the panel is on screen */
+        if (hidden()) {
             reply = "err hidden";
         } else {
             cmd.type = SOskCommand::EType::KEY;
@@ -1341,7 +1266,7 @@ static void handle_line(int cfd, char *line)
         }
     } else if (!strncmp(line, "MOD ", 4)) {
         char name[16], state[8];
-        if (!panel_rect_valid) { /* input injection only while the panel is on screen */
+        if (hidden()) {
             reply = "err hidden";
         } else if (sscanf(line + 4, "%15s %7s", name, state) != 2) {
             reply = "err bad args";
@@ -1385,7 +1310,7 @@ static void handle_line(int cfd, char *line)
             bool valid = !layout.empty() && variant.size() < 48 && layout.size() < 48;
             if (valid) {
                 for (char c : layout + variant) {
-                    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) {
+                    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
                         valid = false;
                         break;
                     }
@@ -1419,11 +1344,9 @@ static void handle_line(int cfd, char *line)
         /* cached grid, rebuilt on the main thread with every keymap change;
          * no keymap access from this thread */
         std::lock_guard<std::mutex> lg(g_gridMutex);
-        static std::string          gridReply;
-        gridReply = "grid " + (g_gridJson.empty() ? std::string("{\"rows\":[[],[],[],[]]}") : g_gridJson);
-        reply     = gridReply.c_str();
+        reply = "grid " + (g_gridJson.empty() ? std::string("{\"rows\":[[],[],[],[]]}") : g_gridJson);
     } else if (!strncmp(line, "TEXT ", 5)) {
-        if (!panel_rect_valid) { /* input injection only while the panel is on screen */
+        if (hidden()) {
             reply = "err hidden";
         } else {
             cmd.type = SOskCommand::EType::TEXT;
@@ -1479,63 +1402,70 @@ static void handle_line(int cfd, char *line)
             reply = "ok";
         } else
             reply = "err bad args";
-    } else if (!strncmp(line, "MON", 3)) {
-        /* MON — reply with the touch monitor's logical frame (x y w h), the
-         * exact frame touch ev.pos is normalized against (m_position/m_size) */
-        auto mon = resolveTouchMonitor();
-        if (mon) {
+    } else if (!strcmp(line, "MON")) {
+        /* MON — reply from the main-thread snapshot (never call into
+         * monitor/input code from this thread) */
+        SMonSnap snap;
+        {
+            std::lock_guard<std::mutex> lg(g_monMutex);
+            snap = g_monSnap;
+        }
+        if (snap.valid) {
             char buf[160];
-            snprintf(buf, sizeof buf, "mon %s %d %d %d %d", mon->m_name.c_str(), (int)mon->m_position.x,
-                     (int)mon->m_position.y, (int)mon->m_size.x, (int)mon->m_size.y);
+            snprintf(buf, sizeof buf, "mon %s %d %d %d %d", snap.name, snap.x, snap.y, snap.w, snap.h);
             reply = buf;
         } else
             reply = "err no monitor";
-    } else if (!strncmp(line, "STATS", 5)) {
-        /* live touch state for debugging */
+    } else if (!strcmp(line, "STATS")) {
+        SStatsSnap s;
+        {
+            std::lock_guard<std::mutex> lg(g_statsMutex);
+            s = g_statsSnap;
+        }
         char buf[320];
         snprintf(buf, sizeof buf,
                  "state fingers=%d pressed=%d ignore=%d scroll=%d down=%d up=%d contact_osk=%d "
                  "panel_valid=%d inject=%d anypeer=%d panel_ny=%.3f panel_nh=%.3f last=%.3f,%.3f "
                  "fires=%u ring=%zu indrain=%d layout=%s textmap=%zu fling=%.0fms/%.0fpx swallow=%d",
-                 fingers, (int)pressed, (int)ignore_until_zero, (int)scroll_mode, (int)down_flag,
-                 (int)up_flag, (int)contact_is_panel_native, (int)panel_rect_valid,
-                 (int)panel_rect_valid, (int)g_allowAnyPeer, panel_ny,
-                 panel_nh, lastPos.x, lastPos.y, g_drain_fires, g_ringCount, (int)g_inDrain,
-                 g_layoutSpec.c_str(), g_textMap.size(), fling_tau * 1000.0, fling_cap, (int)touch_swallow);
+                 s.fingers, s.pressed, s.ignore, s.scroll, s.down, s.up, s.contact, s.panel_valid,
+                 s.inject, (int)g_allowAnyPeer, s.panel_ny, s.panel_nh, s.lastx, s.lasty, s.fires,
+                 s.ring, s.indrain, s.layout, s.textmap, s.fling_tau_ms, s.fling_cap, s.swallow);
         reply = buf;
-    } else if (!strncmp(line, "CALIB ", 6)) {
+    } else if (!strncmp(line, "CALIB", 5)) {
         reply = "ok"; /* accepted for protocol compatibility; the frame comes from the compositor */
     } else if (!strncmp(line, "PANEL ", 6)) {
-        /* PANEL x y w h — QML panel rect in normalized (0..1) coords, matching
-         * the touch event frame (panel_nx/ny/nw/nh); 0 0 0 0 clears it */
+        /* PANEL x y w h — queued to the main thread (applyTouches reads the rect) */
         char *a = line + 6;
         char *b = strchr(a, ' ');
         char *c = b ? strchr(b + 1, ' ') : NULL;
         char *d = c ? strchr(c + 1, ' ') : NULL;
-        double px, py, pw, ph;
         if (b && c && d) {
             *b = 0; *c = 0; *d = 0;
             char *endp;
-            px = strtod(a, &endp);   bool ok1 = endp != a;
-            py = strtod(b + 1, &endp); bool ok2 = endp != b + 1;
-            pw = strtod(c + 1, &endp); bool ok3 = endp != c + 1;
-            ph = strtod(d + 1, &endp); bool ok4 = endp != d + 1;
+            float px = strtof(a, &endp);     bool ok1 = endp != a;
+            float py = strtof(b + 1, &endp); bool ok2 = endp != b + 1;
+            float pw = strtof(c + 1, &endp); bool ok3 = endp != c + 1;
+            float ph = strtof(d + 1, &endp); bool ok4 = endp != d + 1;
             if (ok1 && ok2 && ok3 && ok4) {
-                panel_nx = px; panel_ny = py; panel_nw = pw; panel_nh = ph;
-                panel_rect_valid = (panel_nw > 0 && panel_nh > 0);
-                DBG("panel rect (norm): " + std::string(line + 6));
+                cmd.type     = SOskCommand::EType::PANEL;
+                cmd.panel[0] = px;
+                cmd.panel[1] = py;
+                cmd.panel[2] = pw;
+                cmd.panel[3] = ph;
+                queueCommand(std::move(cmd));
                 reply = "ok";
             } else
                 reply = "err bad args";
         } else {
-            panel_rect_valid = false; /* PANEL 0 0 0 0 = clear */
+            cmd.type     = SOskCommand::EType::PANEL;
+            cmd.panel[0] = cmd.panel[1] = cmd.panel[2] = cmd.panel[3] = 0;
+            queueCommand(std::move(cmd));
             reply = "ok";
         }
     }
-    send_reply(cfd, reply);
+    send_reply(cfd, reply.c_str());
 }
 
-/* ---------------- socket thread ---------------- */
 static void socket_thread_fn(std::string path)
 {
     unlink(path.c_str());
@@ -1556,13 +1486,31 @@ static void socket_thread_fn(std::string path)
     chmod(path.c_str(), 0600);
     DBG("listening on " + path);
 
+    /* self-pipe: PLUGIN_EXIT writes a byte so the blocked polls wake instantly
+     * (no periodic flag-polling — an idle socket thread sleeps forever) */
+    if (pipe(g_wakePipe) == 0) {
+        fcntl(g_wakePipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(g_wakePipe[1], F_SETFL, O_NONBLOCK);
+    } else {
+        g_wakePipe[0] = g_wakePipe[1] = -1; /* fallback: 200 ms flag-poll */
+    }
+
     int  cfd  = -1;
     char rbuf[MAX_LINE];
     size_t rlen = 0;
     while (g_socketRunning) {
-        struct pollfd pfd = {.fd = sock_fd, .events = POLLIN};
-        int r = poll(&pfd, 1, 200);
-        if (r <= 0 || !g_socketRunning)
+        struct pollfd pfd[2] = {{.fd = sock_fd, .events = POLLIN},
+                                {.fd = g_wakePipe[0], .events = POLLIN}};
+        int r = poll(pfd, 2, g_wakePipe[0] >= 0 ? -1 : 200);
+        if (!g_socketRunning)
+            break;
+        if (r <= 0)
+            continue;
+        if (g_wakePipe[0] >= 0 && (pfd[1].revents & POLLIN)) {
+            char b;
+            while (read(g_wakePipe[0], &b, 1) > 0) {}
+        }
+        if (!(pfd[0].revents & POLLIN))
             continue;
         int nfd = accept(sock_fd, NULL, NULL);
         if (nfd < 0)
@@ -1585,11 +1533,19 @@ static void socket_thread_fn(std::string path)
         DBG("client connected");
         pushGrid(); /* proactively hand the fresh grid to the new client */
 
-        struct pollfd cfds[2] = {{.fd = sock_fd, .events = POLLIN}, {.fd = cfd, .events = POLLIN}};
+        struct pollfd cfds[3] = {{.fd = sock_fd, .events = POLLIN},
+                                 {.fd = cfd, .events = POLLIN},
+                                 {.fd = g_wakePipe[0], .events = POLLIN}};
         while (g_socketRunning) {
-            int r2 = poll(cfds, 2, 200);
-            if (r2 <= 0 || !g_socketRunning)
+            int r2 = poll(cfds, 3, g_wakePipe[0] >= 0 ? -1 : 200);
+            if (!g_socketRunning)
+                break;
+            if (r2 <= 0)
                 continue;
+            if (g_wakePipe[0] >= 0 && (cfds[2].revents & POLLIN)) {
+                char b;
+                while (read(g_wakePipe[0], &b, 1) > 0) {}
+            }
             if (cfds[0].revents & POLLIN) {
                 int newer = accept(sock_fd, NULL, NULL);
                 if (newer >= 0) {
@@ -1638,24 +1594,55 @@ static void socket_thread_fn(std::string path)
             g_clientFd = -1;
         }
     }
+    if (g_wakePipe[0] >= 0)
+        close(g_wakePipe[0]);
+    if (g_wakePipe[1] >= 0)
+        close(g_wakePipe[1]);
+    g_wakePipe[0] = g_wakePipe[1] = -1;
     close(sock_fd);
     unlink(path.c_str());
 }
 
 /* ---------------- queue drain (main thread) ---------------- */
 static SP<CEventLoopTimer> g_drainTimer;
+static bool                g_drainPollFallback = false;
+static void drainQueue(SP<CEventLoopTimer> self, void *data);
+
+/* socket thread: write the eventfd. The compositor loop's fd callback (main
+ * thread) arms the drain timer. Never addTimer/updateTimeout from here. */
+static void wakeDrain()
+{
+    if (g_drainEventFd < 0)
+        return;
+    uint64_t one = 1;
+    ssize_t  r;
+    do {
+        r = write(g_drainEventFd, &one, sizeof one);
+    } while (r < 0 && errno == EINTR);
+}
+
+static int onDrainReadable(int fd, uint32_t /*mask*/, void * /*data*/)
+{
+    uint64_t n;
+    while (read(fd, &n, sizeof n) > 0) {}
+    if (g_drainTimer)
+        g_drainTimer->updateTimeout(std::chrono::milliseconds(0));
+    return 0;
+}
 
 static void drainQueue(SP<CEventLoopTimer> self, void *data)
 {
     g_drain_fires++;
     if (!g_socketRunning) {
         /* shutting down: never re-arm, leave nothing pending */
-        self->updateTimeout(std::nullopt);
+        if (self)
+            self->updateTimeout(std::nullopt);
         return;
     }
     if (g_inDrain) {
         /* nested event dispatch: leave work for the next tick */
-        self->updateTimeout(std::chrono::milliseconds(10));
+        if (self)
+            self->updateTimeout(std::chrono::milliseconds(g_drainPollFallback ? 10 : 0));
         return;
     }
     g_inDrain = true;
@@ -1667,8 +1654,13 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
             g_ringCount--;
             g_ringMutex.unlock();
             switch (c.type) {
-            case SOskCommand::EType::KEY: execKey((unsigned)c.a, c.b); break;
+            case SOskCommand::EType::KEY:
+                if (g_panelVisible.load(std::memory_order_relaxed))
+                    execKey((unsigned)c.a, c.b);
+                break;
             case SOskCommand::EType::MOD: {
+                if (!g_panelVisible.load(std::memory_order_relaxed))
+                    break;
                 unsigned bit = modnames[c.a].modbit; /* xkb mask: shift=1 ctrl=4 alt=8 super=64 */
                 if (c.b && !(held_mods & bit)) {
                     held_mods |= bit;
@@ -1685,8 +1677,8 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 break;
             }
             case SOskCommand::EType::TEXT:
-                Log::logger->log(Log::INFO, "[hypr-osk] execText: '{}'", std::string(c.text));
-                execText(c.text);
+                if (g_panelVisible.load(std::memory_order_relaxed))
+                    execText(c.text);
                 break;
             case SOskCommand::EType::LAYOUT: execLayout(c.text); break;
             case SOskCommand::EType::PMOVE: execPmove(c.a, c.b); break;
@@ -1710,6 +1702,7 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                     releasePinchCtrl();
                     press_pending = false;
                     press_due     = false;
+                    down_flag = up_flag = motion_flag = false;
                     contact_is_panel_native = false;
                     fingers          = 0;
                     ignore_until_zero = false;
@@ -1717,16 +1710,36 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                     pinch_mode       = false;
                     gesture_decided  = false;
                     g_slotPos.clear();
+                    if (g_pressTimer)
+                        g_pressTimer->updateTimeout(std::nullopt);
                 }
                 DBG(std::string("touch swallow: ") + (touch_swallow ? "on" : "off"));
+                break;
+            case SOskCommand::EType::PANEL:
+                panel_nx = c.panel[0];
+                panel_ny = c.panel[1];
+                panel_nw = c.panel[2];
+                panel_nh = c.panel[3];
+                panel_rect_valid = (panel_nw > 0 && panel_nh > 0);
+                g_panelVisible.store(panel_rect_valid, std::memory_order_release);
+                DBG("panel rect (norm): " + std::to_string(panel_nx) + " " + std::to_string(panel_ny) +
+                    " " + std::to_string(panel_nw) + " " + std::to_string(panel_nh));
                 break;
             }
             g_ringMutex.lock();
         }
     }
     g_inDrain = false; /* CRITICAL: without this the drain stalls forever after the first tick */
-    if (g_socketRunning)
-        self->updateTimeout(std::chrono::milliseconds(10));
+    publishStats();
+    /* low power: re-arm only while work remains. eventfd delivers the next
+     * wakeup; the 10 ms path is only the poll fallback when eventfd failed */
+    {
+        std::lock_guard<std::mutex> lg(g_ringMutex);
+        if (g_ringCount > 0 && g_drainTimer)
+            g_drainTimer->updateTimeout(std::chrono::milliseconds(g_drainPollFallback ? 10 : 0));
+        else if (g_drainPollFallback && g_drainTimer)
+            g_drainTimer->updateTimeout(std::chrono::milliseconds(10));
+    }
 }
 
 /* ---------------- plugin init ---------------- */
@@ -1783,8 +1796,25 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         rebuildGrid();
     }
 
-    g_drainTimer = makeShared<CEventLoopTimer>(std::chrono::milliseconds(10), drainQueue, nullptr);
+    /* drain timer lives on the main thread for the whole plugin lifetime,
+     * disarmed until the eventfd callback (or the 10 ms fallback) arms it */
+    g_drainTimer = makeShared<CEventLoopTimer>(
+        std::nullopt, [](SP<CEventLoopTimer> self, void *) { drainQueue(self, nullptr); }, nullptr);
     g_pEventLoopManager->addTimer(g_drainTimer);
+
+    g_drainEventFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (g_drainEventFd >= 0 && g_pCompositor && g_pCompositor->m_wlEventLoop) {
+        g_drainEventSource = wl_event_loop_add_fd(g_pCompositor->m_wlEventLoop, g_drainEventFd,
+                                                  WL_EVENT_READABLE, onDrainReadable, nullptr);
+    }
+    if (!g_drainEventSource) {
+        g_drainPollFallback = true;
+        g_drainTimer->updateTimeout(std::chrono::milliseconds(10));
+        Log::logger->log(Log::WARN, "[hypr-osk] drain eventfd unavailable, polling every 10 ms");
+    }
+
+    resolveTouchMonitor(); /* seed the MON snapshot so the first MON need not wait for a touch */
+    publishStats();
 
     const char *anypeer = getenv("HYPR_OSK_ALLOW_ANY_PEER");
     g_allowAnyPeer = anypeer && *anypeer && strcmp(anypeer, "0") != 0;
@@ -1804,8 +1834,24 @@ APICALL EXPORT void PLUGIN_EXIT() {
     /* stop the socket thread and join it BEFORE the .so is unmapped: the
      * thread's code lives in this library */
     g_socketRunning = false;
+    /* wake its blocked polls instantly (they sleep without a timeout) */
+    if (g_wakePipe[1] >= 0) {
+        char b = 1;
+        ssize_t r;
+        do {
+            r = write(g_wakePipe[1], &b, 1);
+        } while (r < 0 && errno == EINTR);
+    }
     if (g_socketThread.joinable())
         g_socketThread.join();
+    if (g_drainEventSource) {
+        wl_event_source_remove(g_drainEventSource);
+        g_drainEventSource = nullptr;
+    }
+    if (g_drainEventFd >= 0) {
+        close(g_drainEventFd);
+        g_drainEventFd = -1;
+    }
     /* disconnect the bus listeners: their lambdas also live in this library */
     g_touchDownHook.reset();
     g_touchUpHook.reset();
