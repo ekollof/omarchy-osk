@@ -123,7 +123,7 @@ function buildMain(grid) {
       [{ l: "Enter", w: 1.75, t: "code", c: 28, scheme: 1 }]
     ),
     [{ l: "⇧", w: 1.5, t: "shift", scheme: 1 }].concat(
-      rows[3].map(gridKey), // may start with ISO KEY_102ND (<>) when the keymap has it
+      rows[3].map(gridKey), // ISO KEY_102ND only when it adds a glyph (de, gb, … — not us)
       [{ l: "⇧", w: 1.5, t: "shift", scheme: 1 }]
     ),
     functionalRow

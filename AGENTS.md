@@ -261,7 +261,8 @@ outright.
 4. Typing: summon over a text field, tap keys — output matches labels
    including shifted symbols (`!` `@` not `1` `2`); test a non-US layout
    (`omarchy-shell ekollof.osk setLayout dk` → æ ø å type and render, Caps
-   uppercases them), ISO extra key on `de`, hyphenated variant
+   uppercases them), ISO extra key on `de` (not on `us` — pc105's inherited
+   `<>` duplicates Shift+comma), hyphenated variant
    `setLayout us(altgr-intl)`, then back (`setLayout us`). Hold backspace:
    first delete is immediate, then repeat.
 5. Touch: tap = left click under finger, move past ~12 px = drag, still

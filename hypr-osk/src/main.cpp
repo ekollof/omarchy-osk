@@ -86,6 +86,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -320,64 +321,99 @@ static void jsonAppendEscaped(std::string &out, const std::string &s)
     }
 }
 
-/* the main layer's letter grid, from physical evdev rows: keycode order IS the
- * physical arrangement (Q is 16, A is 30, Z is 44 for every latin layout) */
-static void appendGridRow(std::string &out, const unsigned *codes, size_t len)
+/* one letter-grid key: evdev code plus level-0/1 labels from the keymap */
+struct SGridKey {
+    unsigned    c = 0;
+    std::string l0, l1;
+    bool        raw = false;
+};
+
+static bool gridKeyFromMap(xkb_keymap *km, unsigned evdev, SGridKey &out)
 {
-    xkb_keymap *km = g_oskKeyboard ? g_oskKeyboard->m_xkbKeymap : nullptr;
-    if (!km)
-        return;
-    xkb_layout_index_t layout = 0;
-    bool               first  = true;
-    for (size_t i = 0; i < len && codes[i]; i++) {
-        xkb_keycode_t key = codes[i] + 8; /* grid carries evdev codes; xkb is evdev+8 */
-        xkb_level_index_t     nlev = xkb_keymap_num_levels_for_key(km, key, layout);
-        const xkb_keysym_t   *syms = nullptr;
-        std::string           l0, l1;
-        bool                  raw  = false;
-        if (nlev > 0 && xkb_keymap_key_get_syms_by_level(km, key, layout, 0, &syms) > 0 && syms[0]) {
-            l0 = symLabel(syms[0]);
-            if (l0.empty())
-                raw = true; /* dead key or modifier: type the raw keycode */
-        }
-        if (nlev > 1 && xkb_keymap_key_get_syms_by_level(km, key, layout, 1, &syms) > 0 && syms[0])
-            l1 = symLabel(syms[0]);
-        if (l0.empty() && l1.empty() && !raw)
-            continue;
-        if (!first)
-            out += ",";
-        first = false;
-        out += "{\"c\":" + std::to_string(codes[i]); /* evdev; KEY on the wire is evdev */
-        if (!l0.empty()) {
-            out += ",\"l\":\"";
-            jsonAppendEscaped(out, l0);
-            out += "\"";
-        }
-        if (!l1.empty()) {
-            out += ",\"s\":\"";
-            jsonAppendEscaped(out, l1);
-            out += "\"";
-        }
-        if (raw)
-            out += ",\"raw\":1";
-        out += "}";
+    out = SGridKey{evdev, {}, {}, false};
+    xkb_keycode_t         key    = evdev + 8; /* grid carries evdev; xkb is evdev+8 */
+    xkb_layout_index_t    layout = 0;
+    xkb_level_index_t     nlev   = xkb_keymap_num_levels_for_key(km, key, layout);
+    const xkb_keysym_t   *syms   = nullptr;
+    if (nlev > 0 && xkb_keymap_key_get_syms_by_level(km, key, layout, 0, &syms) > 0 && syms[0]) {
+        out.l0 = symLabel(syms[0]);
+        if (out.l0.empty())
+            out.raw = true; /* dead key or modifier: type the raw keycode */
     }
+    if (nlev > 1 && xkb_keymap_key_get_syms_by_level(km, key, layout, 1, &syms) > 0 && syms[0])
+        out.l1 = symLabel(syms[0]);
+    return !(out.l0.empty() && out.l1.empty() && !out.raw);
 }
 
+static void jsonAppendGridKey(std::string &out, const SGridKey &k, bool &first)
+{
+    if (!first)
+        out += ",";
+    first = false;
+    out += "{\"c\":" + std::to_string(k.c);
+    if (!k.l0.empty()) {
+        out += ",\"l\":\"";
+        jsonAppendEscaped(out, k.l0);
+        out += "\"";
+    }
+    if (!k.l1.empty()) {
+        out += ",\"s\":\"";
+        jsonAppendEscaped(out, k.l1);
+        out += "\"";
+    }
+    if (k.raw)
+        out += ",\"raw\":1";
+    out += "}";
+}
+
+/* the main layer's letter grid, from physical evdev rows: keycode order IS the
+ * physical arrangement (Q is 16, A is 30, Z is 44 for every latin layout).
+ * KEY_102ND (the ISO key between LShift and Z) is in every pc105 keymap —
+ * even US, where it duplicates Shift+comma/period — so it is only prepended
+ * when it adds a glyph the rest of the letter grid does not already have. */
 static void rebuildGrid()
 {
     static const unsigned rows[][15] = {
-        {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 41, 0},              /* digits + - = ` */
-        {16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 43, 0},      /* q .. ] \ */
-        {30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 0},              /* a .. ' */
-        {KEY_102ND, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 0},      /* ISO <> , z .. / */
+        {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 41, 0},         /* digits + - = ` */
+        {16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 43, 0}, /* q .. ] \ */
+        {30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 0},         /* a .. ' */
+        {44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 0},             /* z .. / */
     };
+    xkb_keymap *km = g_oskKeyboard ? g_oskKeyboard->m_xkbKeymap : nullptr;
+    std::vector<SGridKey> dumped[4];
+    std::set<std::string> seen;
+    if (km) {
+        for (size_t r = 0; r < 4; r++) {
+            for (size_t i = 0; rows[r][i]; i++) {
+                SGridKey k;
+                if (!gridKeyFromMap(km, rows[r][i], k))
+                    continue;
+                dumped[r].push_back(k);
+                if (!k.l0.empty())
+                    seen.insert(k.l0);
+                if (!k.l1.empty())
+                    seen.insert(k.l1);
+            }
+        }
+        SGridKey iso;
+        if (gridKeyFromMap(km, KEY_102ND, iso)) {
+            bool unique = iso.raw;
+            if (!iso.l0.empty() && !seen.count(iso.l0))
+                unique = true;
+            if (!iso.l1.empty() && !seen.count(iso.l1))
+                unique = true;
+            if (unique)
+                dumped[3].insert(dumped[3].begin(), iso);
+        }
+    }
     std::string json = "{\"rows\":[";
     for (size_t r = 0; r < 4; r++) {
         if (r)
             json += ",";
         json += "[";
-        appendGridRow(json, rows[r], 15);
+        bool first = true;
+        for (const auto &k : dumped[r])
+            jsonAppendGridKey(json, k, first);
         json += "]";
     }
     json += "]}";
