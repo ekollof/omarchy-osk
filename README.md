@@ -20,7 +20,7 @@ window has focus — exactly like wvkbd, but native to the Omarchy shell.
 | `shell/ekollof.osk-applet/` | Bar widget: enable/disable, show/hide, layout picker, key-repeat settings |
 | `hypr/osk.lua` | Hyprland integration: plugin autostart, gesture bind, SUPER+SHIFT+K |
 | `hypr/osk-toggle.sh` | Debounced toggle script |
-| `vendor/hyprgrass/` | Vendored hyprgrass (upstream `hl-0.56.1`, incl. wf-touch) for the edge-swipe gesture |
+| `vendor/hyprgrass/` | Vendored hyprgrass + wf-touch (exact commits in [docs/PINS.md](docs/PINS.md)) for the edge-swipe gesture |
 | `hyprpm.toml` | Optional: build the compositor plugin with `hyprpm` instead of `install.sh` |
 
 ## How it works
@@ -51,9 +51,25 @@ window has focus — exactly like wvkbd, but native to the Omarchy shell.
 
 Builds both compositor plugins (hypr-osk + vendored hyprgrass), deploys the
 shell plugins, the Hyprland glue and registers everything. Idempotent —
-re-run after every edit. Requires Omarchy (Hyprland 0.56.x, quickshell),
-meson/ninja/gcc, glm; `install.sh` installs missing packages via
-`omarchy pkg add`.
+re-run after every edit.
+
+This is **manual setup**: `omarchy plugin add` installs the shell UI only.
+The compositor plugin (touch→pointer, key injection) still requires
+`./install.sh` (or the hyprpm route below). `install.sh` deploys the same
+plugins in its own layout and supersedes a plugin-add copy — pick one path.
+
+**Build inputs** (exact SHAs: [docs/PINS.md](docs/PINS.md)):
+
+- Hyprland **0.56.x** headers matching the running compositor (`v0.56.2` /
+  `efb50993780079460b0cbed1363e2166a2de1d9f` is known-good)
+- meson, ninja, gcc, pkg-config; meson deps: pixman, libinput,
+  wayland-server, xkbcommon, libdrm
+- `glm` for vendored hyprgrass/wf-touch (`install.sh` runs
+  `omarchy pkg add glm` only if `pacman -Q glm` is missing)
+- Vendored hyprgrass `hl-0.56.1` commit
+  `36df29f57f94a77b4d5dcf91100f620a46663fa9` and wf-touch
+  `8974eb0f6a65464b63dd03b842795cb441fb6403` — already in-tree; the
+  build does not clone git
 
 `hyprpm` is an alternative route for the compositor plugin
 (`hyprpm update && hyprpm add <repo-url> && hyprpm enable hypr-osk`); the
@@ -62,10 +78,7 @@ manages a plugin.
 
 The repository root also carries an Omarchy shell-plugin manifest, so the
 checkout validates with `omarchy plugin validate` and is discoverable for
-the plugin marketplace. Note `omarchy plugin add` installs the shell UI only
-— the compositor plugin (touch→pointer, key injection) still requires
-`./install.sh`, which deploys the same plugins in its own layout and
-supersedes a plugin-add copy.
+the plugin marketplace.
 
 ## Usage
 
@@ -106,6 +119,33 @@ moves the monitor and touch transforms together (see the
 [GPD Pocket 4 discussion](https://github.com/omacom/omarchy/discussions/9032)
 for a working example).
 
+## Privileged compositor surface
+
+All touch swallowing, virtual pointer/keyboard injection, socket access
+control, timers, threading and teardown live in one file:
+[`hypr-osk/src/main.cpp`](hypr-osk/src/main.cpp) (protocol and access
+control are in the header comment). Short map:
+
+- **Touch → pointer**: touch callbacks only record state and schedule a
+  zero-time apply timer. `applyTouches()` on the compositor idle phase
+  mutates input. `SWALLOW 0` stops consuming the touchscreen (native
+  `wl_touch` / Hyprland pointer emulation); toggling mid-gesture unwinds
+  (button release, fling/ctrl reset, slot clear).
+- **Key injection**: synthetic keyboard device `hypr-osk-vk`. `TEXT`/`KEY`/
+  `MOD` map through the *active* xkb keymap and the real input pipeline.
+- **Socket**: `$XDG_RUNTIME_DIR/hypr-osk.sock`, one client (a new connect
+  replaces the previous). `SO_PEERCRED` requires the same uid; unless
+  `HYPR_OSK_ALLOW_ANY_PEER=1` is in **Hyprland's** environment at plugin
+  load, `/proc/<pid>/exe` must be `quickshell`. Injection is refused with
+  `err hidden` until the shell publishes a `PANEL` rect. `PMOVE`/`PBTN`
+  stay debug-only (`err pointer disabled` without the env var).
+- **Threads**: the socket thread never calls compositor APIs. Commands go
+  through a fixed ring buffer; an eventfd wakes the Wayland loop, which
+  arms a 0 ms drain timer. Touch handlers likewise only schedule work.
+- **Teardown (`PLUGIN_EXIT`)**: socket stop flag + wake pipe → thread join →
+  drain eventfd source remove + close → bus disconnect → timer removal →
+  key release → device destroy. The `.so` is unmapped after unload.
+
 ## Security
 
 The IPC socket (`$XDG_RUNTIME_DIR/hypr-osk.sock`) can type into the focused
@@ -135,11 +175,13 @@ session, so:
 
 Edit this tree, run `./install.sh`. QML changes hot-reload (restart the
 shell if a stale component cache serves old code); C++ changes need
-`hyprctl plugin unload <path> && hyprctl plugin load <path>`. See
-[AGENTS.md](AGENTS.md) for the architecture, the socket protocol and a
-long list of hard-won gotchas.
+`hyprctl plugin unload <path> && hyprctl plugin load <path>` (full `.so`
+path — a `hyprctl reload` keeps the old inode mapped). Socket protocol,
+access control, threading and teardown: header of `hypr-osk/src/main.cpp`.
+Vendored/build pins: [docs/PINS.md](docs/PINS.md).
 
 ## License
 
-MIT for this repo's code; vendored hyprgrass keeps its upstream BSD license
-(`vendor/hyprgrass/LICENSE`).
+MIT for this repo's code (`LICENSE`). Vendored hyprgrass keeps its upstream
+BSD license (`vendor/hyprgrass/LICENSE`); wf-touch is MIT
+(`vendor/hyprgrass/subprojects/wf-touch/LICENSE`).

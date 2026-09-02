@@ -1,1 +1,4 @@
 build/
+# Local coding-agent notes; not part of the marketplace plugin.
+AGENTS.md
+

@@ -30,9 +30,8 @@ else
 fi
 
 # 3. Build the vendored hyprgrass (edge-swipe gesture) the same way: upstream
-# horriblename/hyprgrass pinned to hl-0.56.1 (known-good for Hyprland 0.56.x,
-# wf-touch included) — see AGENTS.md for re-vendoring. Skip when hyprpm
-# manages it instead.
+# horriblename/hyprgrass + wf-touch, pinned in docs/PINS.md (no git clone).
+# Skip when hyprpm manages it instead.
 if hyprpm list 2>/dev/null | grep -q hyprgrass; then
   echo "hyprgrass is hyprpm-managed: skipping the vendored build (rebuild with: hyprpm update)."
 else
