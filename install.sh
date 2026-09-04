@@ -187,22 +187,74 @@ if [[ -f $HYPRLAND ]]; then
     echo "refusing to edit file owned by uid $ou: $HYPRLAND" >&2
     exit 1
   fi
-  # Exclusive flock on the live inode, re-read, insert, write back (same inode
-  # so a concurrent writer cannot be replaced from a stale snapshot). On write
-  # failure the previous contents are restored before the lock is dropped.
+  # Crash-safe insert of require("hypr.osk"): exclusive flock, durable backup
+  # announced before any edit, complete write loops to a same-dir staging
+  # file, identity revalidation, then atomic rename. The live file is never
+  # truncated. Leftover staging is discarded on the next run.
   need /usr/bin/python3
   /usr/bin/python3 - "$HYPRLAND" <<'PY'
-import fcntl, os, stat, sys
+import fcntl, os, stat, sys, time
+
 path = sys.argv[1]
+uid = os.getuid()
+max_size = 1_000_000
+
+def die(msg, code=1):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+def read_all(fd, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = os.read(fd, n - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("short write")
+        view = view[n:]
+
+def fsync_dir(p):
+    dfd = os.open(os.path.dirname(p) or ".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+def unlink_ours(p):
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        die("refusing leftover path: " + p)
+    if st.st_uid != uid:
+        die("refusing leftover owned by uid %d: %s" % (st.st_uid, p))
+    os.unlink(p)
+
+def same_identity(st_a, st_b):
+    return (st_a.st_dev, st_a.st_ino) == (st_b.st_dev, st_b.st_ino)
+
+staging = path + ".osk-new"
+unlink_ours(staging)
+
 fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
 try:
     fcntl.flock(fd, fcntl.LOCK_EX)
     st = os.fstat(fd)
-    if st.st_uid != os.getuid() or not stat.S_ISREG(st.st_mode):
+    if st.st_uid != uid or not stat.S_ISREG(st.st_mode):
         sys.exit(1)
-    if st.st_size > 1_000_000:
+    if st.st_size > max_size:
         sys.exit(1)
-    data = os.read(fd, st.st_size)
+    data = read_all(fd, st.st_size)
+    if len(data) != st.st_size:
+        die("short read of hyprland.lua")
     text = data.decode("utf-8")
     if 'require("hypr.osk")' in text:
         sys.exit(0)
@@ -210,21 +262,45 @@ try:
     if needle not in text:
         sys.stderr.write("hyprland.lua has no require(\"hypr.gestures\"); not editing\n")
         sys.exit(0)
-    new = text.replace(needle, needle + '\nrequire("hypr.osk")', 1)
-    encoded = new.encode("utf-8")
+    encoded = text.replace(needle, needle + '\nrequire("hypr.osk")', 1).encode("utf-8")
+    mode = stat.S_IMODE(st.st_mode)
+
+    backup = path + ".bak-before-osk-" + time.strftime("%Y%m%dT%H%M%S")
+    bfd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
     try:
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        os.write(fd, encoded)
-        os.fsync(fd)
-    except OSError:
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        os.write(fd, data)
-        os.fsync(fd)
-        raise
+        write_all(bfd, data)
+        os.fsync(bfd)
+    finally:
+        os.close(bfd)
+    fsync_dir(backup)
+    sys.stdout.write("backed up %s to %s\n" % (path, backup))
+    sys.stdout.flush()
+
+    sfd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        write_all(sfd, encoded)
+        os.fchmod(sfd, mode)
+        os.fsync(sfd)
+        st_live = os.fstat(fd)
+        if st_live.st_uid != uid or not stat.S_ISREG(st_live.st_mode):
+            die("hyprland.lua identity changed under lock")
+        if not same_identity(st, st_live):
+            die("hyprland.lua inode changed under lock")
+        path_st = os.lstat(path)
+        if stat.S_ISLNK(path_st.st_mode) or not same_identity(st, path_st):
+            die("hyprland.lua path no longer names the locked inode")
+        os.rename(staging, path)
+        staging = None
+    finally:
+        os.close(sfd)
+    fsync_dir(path)
 finally:
     os.close(fd)
+    if staging is not None:
+        try:
+            unlink_ours(staging)
+        except Exception:
+            pass
 PY
 fi
 

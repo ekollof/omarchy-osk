@@ -46,13 +46,17 @@
  *                                + gestures) or pass it to Hyprland's native
  *                                touchscreen support
  *
- * Access control: the socket can type into the focused session, so peers are
- * validated on accept with SO_PEERCRED — the uid must match, and
- * /proc/<pid>/exe must realpath to a root-owned, non-group/world-writable
- * regular file that is the packaged shell (/usr/bin/quickshell). Basename
- * matching is not used. TEXT/KEY/MOD are refused unless that peer pid owns
- * a mapped Wayland layer namespace "ekollof-osk" (a second quickshell that
- * only connects cannot flip visibility with PANEL). Sends are non-blocking.
+ * Access control: the socket can type into the focused session. A well-known
+ * path plus "this pid is packaged quickshell and mapped ekollof-osk" is not
+ * identity — any same-uid process can exec /usr/bin/quickshell and choose
+ * that namespace. Instead the compositor pins one intended shell instance:
+ * the Wayland client that already owns the session's omarchy-bar layer
+ * (a property of the installed omarchy-shell, not of this plugin). That
+ * pin is a pidfd (stable across pid reuse). The unix
+ * connection from that process is the instance-bound capability: when a pin
+ * is live, accept() refuses any other peer. TEXT/KEY/MOD additionally
+ * require that same instance to own a mapped ekollof-osk layer (visibility,
+ * not authority). Sends are non-blocking.
  *
  * Commands are queued from the socket thread and executed on the
  * compositor main thread via an EventLoop timer.
@@ -92,9 +96,34 @@
 #include <thread>
 #include <vector>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+
+#ifndef SO_PEERPIDFD
+#define SO_PEERPIDFD 77
+#endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_send_signal
+#define SYS_pidfd_send_signal 424
+#endif
+#ifndef PIDFD_NONBLOCK
+#define PIDFD_NONBLOCK O_NONBLOCK
+#endif
+
+/* glibc's pidfd_open is not reliably extern "C" for a C++ plugin .so
+ * (Hyprland died on `_Z10pidfd_openij`). Go through the syscalls. */
+static int oskPidfdOpen(pid_t pid, unsigned flags)
+{
+    return (int)syscall(SYS_pidfd_open, pid, flags);
+}
+static int oskPidfdSendSignal(int fd, int sig)
+{
+    return (int)syscall(SYS_pidfd_send_signal, fd, sig, (void *)nullptr, 0u);
+}
 #include <linux/limits.h>
 #include <linux/input-event-codes.h>
 #include <poll.h>
@@ -131,6 +160,9 @@ static std::atomic<bool> g_socketRunning{false};
 static std::atomic<bool> g_panelVisible{false}; /* main thread writes; socket thread reads for the hidden gate */
 static std::atomic<int>  g_listenFd{-1};
 static pid_t             g_panelPid = 0; /* peer pid that last published a PANEL rect */
+static std::mutex        g_shellIdentMutex;
+static int               g_shellPidfd = -1; /* compositor-pinned omarchy-shell instance */
+static std::atomic<pid_t> g_shellPid{0};
 static int               g_wakePipe[2] = {-1, -1}; /* self-pipe: wakes the socket thread's polls */
 static int               g_drainEventFd = -1;      /* eventfd: socket thread → compositor loop */
 static wl_event_source  *g_drainEventSource = nullptr;
@@ -759,6 +791,8 @@ static bool posInPanel(double nx, double ny)
 
 static void applyTouches(); /* deferred: all compositor mutations happen here */
 static bool layerAllowsInject(pid_t pid);
+static void refreshIntendedShell();
+static bool intendedShellAllows(pid_t pid);
 
 /* plugin-owned one-shot timer: unlike doLater (whose queued lambdas fire even
  * after dlclose — that crashed the compositor on unload), this stays
@@ -1407,47 +1441,151 @@ static bool send_reply(int cfd, const char *msg)
     return sendAllDontWait(cfd, out.c_str(), out.size());
 }
 
-/* Main thread only. TEXT/KEY/MOD require this peer to own the mapped OSK layer.
- * Walk each monitor's layer lists (what hyprctl layers uses). Desktop::layerState
- * is not the compositor's mapped-layer set. */
-static bool layerAllowsInject(pid_t pid)
+/* Main thread only. Walk each monitor's layer lists (what hyprctl layers uses).
+ * Desktop::layerState is not the compositor's mapped-layer set. */
+static void forEachMappedLayer(auto &&fn)
 {
-    if (pid <= 0)
-        return false;
-
-    auto ownsMapped = [pid](const PHLLS &ls) -> bool {
-        if (!ls || ls->m_namespace != "ekollof-osk")
-            return false;
-        if (!ls->m_mapped)
-            return false;
-        return ls->getPID() == pid;
-    };
-
     if (auto &ms = State::monitorState(); ms) {
         for (const auto &mon : ms->monitors()) {
             if (!mon)
                 continue;
             for (auto &vec : mon->m_layerSurfaceLayers) {
                 for (auto &ref : vec) {
-                    if (ownsMapped(ref.lock()))
-                        return true;
+                    if (auto ls = ref.lock()) {
+                        if (ls->m_mapped)
+                            fn(ls);
+                    }
                 }
             }
         }
     }
     if (auto &st = Desktop::layerState(); st) {
         for (const auto &ls : st->layers()) {
-            if (ownsMapped(ls))
-                return true;
+            if (ls && ls->m_mapped)
+                fn(ls);
         }
     }
     if (auto &vs = Desktop::viewState(); vs) {
         for (const auto &ls : vs->layers()) {
-            if (ownsMapped(ls))
-                return true;
+            if (ls && ls->m_mapped)
+                fn(ls);
         }
     }
-    return false;
+}
+
+static bool pidOwnsMappedNs(pid_t pid, const char *ns)
+{
+    if (pid <= 0 || !ns)
+        return false;
+    bool found = false;
+    forEachMappedLayer([&](const PHLLS &ls) {
+        if (!found && ls->m_namespace == ns && ls->getPID() == pid)
+            found = true;
+    });
+    return found;
+}
+
+static bool pidfdAlive(int fd)
+{
+    if (fd < 0)
+        return false;
+    return oskPidfdSendSignal(fd, 0) == 0;
+}
+
+static bool pidfdsSameProcess(int a, int b)
+{
+    struct stat sa = {}, sb = {};
+    if (a < 0 || b < 0 || fstat(a, &sa) != 0 || fstat(b, &sb) != 0)
+        return false;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+static void clearIntendedShell()
+{
+    std::lock_guard<std::mutex> lg(g_shellIdentMutex);
+    if (g_shellPidfd >= 0)
+        close(g_shellPidfd);
+    g_shellPidfd = -1;
+    g_shellPid.store(0, std::memory_order_release);
+}
+
+static void setIntendedShell(pid_t pid)
+{
+    if (pid <= 0) {
+        clearIntendedShell();
+        return;
+    }
+    int fd = oskPidfdOpen(pid, PIDFD_NONBLOCK);
+    if (fd < 0) {
+        clearIntendedShell();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lg(g_shellIdentMutex);
+        if (g_shellPidfd >= 0)
+            close(g_shellPidfd);
+        g_shellPidfd = fd;
+        g_shellPid.store(pid, std::memory_order_release);
+    }
+    DBG("intended shell instance pinned pid=" + std::to_string(pid));
+}
+
+/* Main thread only. Pin the installed omarchy-shell Wayland client — the
+ * process that already owns omarchy-bar — and keep that pin until its
+ * pidfd dies. A later process that maps the same namespace cannot steal
+ * the capability while the session shell is alive. Prefer a pid that also
+ * owns omarchy-background when several bars exist. */
+static void refreshIntendedShell()
+{
+    pid_t cur = g_shellPid.load(std::memory_order_acquire);
+    bool  keep = false;
+    {
+        std::lock_guard<std::mutex> lg(g_shellIdentMutex);
+        keep = pidfdAlive(g_shellPidfd);
+    }
+    if (keep && cur > 0 && pidOwnsMappedNs(cur, "omarchy-bar"))
+        return;
+    clearIntendedShell();
+
+    std::set<pid_t> bar, bg;
+    forEachMappedLayer([&](const PHLLS &ls) {
+        pid_t p = ls->getPID();
+        if (p <= 0)
+            return;
+        if (ls->m_namespace == "omarchy-bar")
+            bar.insert(p);
+        else if (ls->m_namespace == "omarchy-background")
+            bg.insert(p);
+    });
+
+    pid_t chosen = 0;
+    for (pid_t p : bar) {
+        if (bg.count(p)) {
+            chosen = p;
+            break;
+        }
+        if (!chosen)
+            chosen = p;
+    }
+    if (chosen)
+        setIntendedShell(chosen);
+}
+
+static bool intendedShellAllows(pid_t pid)
+{
+    refreshIntendedShell();
+    pid_t pinned = g_shellPid.load(std::memory_order_acquire);
+    if (pid <= 0 || pinned <= 0 || pid != pinned)
+        return false;
+    std::lock_guard<std::mutex> lg(g_shellIdentMutex);
+    return pidfdAlive(g_shellPidfd);
+}
+
+/* Visibility of the OSK panel, not identity: the pinned shell instance must
+ * own the mapped ekollof-osk layer. */
+static bool layerAllowsInject(pid_t pid)
+{
+    return intendedShellAllows(pid) && pidOwnsMappedNs(pid, "ekollof-osk");
 }
 
 static pid_t credPid(int cfd)
@@ -1466,11 +1604,12 @@ static void queueFromPeer(int cfd, SOskCommand cmd)
 }
 
 /* ---------------- peer validation ----------------
- * The socket can type into the focused session, so only the user's own
- * packaged shell may connect. SO_PEERCRED yields pid/uid from the kernel.
- * /proc/<pid>/exe is realpath'd and must be a root-owned, not group/world-
- * writable regular file equal to the packaged quickshell binary — not a
- * spoofable basename. There is no environment switch that skips this. */
+ * First filter: SO_PEERCRED uid + packaged /usr/bin/quickshell (realpath,
+ * root-owned, not group/world-writable). That is not identity.
+ * Capability: when the compositor has pinned the session shell pidfd,
+ * the peer must be that same process (pidfd inode, not a recycled pid).
+ * While unpinned (shell restarting), packaged quickshell may connect so
+ * the main thread can observe the new omarchy-bar and pin it. */
 static bool peerExeAllowed(pid_t pid)
 {
     char link[64];
@@ -1508,6 +1647,17 @@ static bool peerExeAllowed(pid_t pid)
     return false;
 }
 
+static int openPeerPidfd(int cfd, pid_t pid)
+{
+    int pfd = -1;
+    socklen_t plen = sizeof pfd;
+    if (getsockopt(cfd, SOL_SOCKET, SO_PEERPIDFD, &pfd, &plen) == 0 && pfd >= 0)
+        return pfd;
+    if (pid <= 0)
+        return -1;
+    return oskPidfdOpen(pid, PIDFD_NONBLOCK);
+}
+
 static bool peerAllowed(int cfd)
 {
     struct ucred cred = {};
@@ -1524,7 +1674,26 @@ static bool peerAllowed(int cfd)
         DBG("peer check: pid " + std::to_string(cred.pid) + " exe not packaged quickshell, rejected");
         return false;
     }
-    return true;
+
+    int peerfd = openPeerPidfd(cfd, cred.pid);
+    if (peerfd < 0) {
+        DBG("peer check: no pidfd for pid " + std::to_string(cred.pid));
+        return false;
+    }
+    bool ok = false;
+    bool pinned = false;
+    {
+        std::lock_guard<std::mutex> lg(g_shellIdentMutex);
+        pinned = pidfdAlive(g_shellPidfd);
+        if (pinned)
+            ok = pidfdsSameProcess(g_shellPidfd, peerfd);
+        else
+            ok = true; /* unpinned: main thread will pin the session shell */
+    }
+    close(peerfd);
+    if (pinned && !ok)
+        DBG("peer check: pid " + std::to_string(cred.pid) + " is not the pinned shell instance");
+    return ok;
 }
 
 static bool handle_line(int cfd, char *line)
@@ -1954,6 +2123,7 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
         return;
     }
     g_inDrain = true;
+    refreshIntendedShell();
     {
         std::lock_guard<std::mutex> lg(g_ringMutex);
         while (g_ringCount > 0) {
@@ -1961,13 +2131,14 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
             g_ringHead = (g_ringHead + 1) % RING_SIZE;
             g_ringCount--;
             g_ringMutex.unlock();
+            const bool fromShell = intendedShellAllows(c.pid);
             switch (c.type) {
             case SOskCommand::EType::KEY:
-                if (layerAllowsInject(c.pid))
+                if (fromShell && layerAllowsInject(c.pid))
                     execKey((unsigned)c.a, c.b);
                 break;
             case SOskCommand::EType::MOD: {
-                if (!layerAllowsInject(c.pid))
+                if (!fromShell || !layerAllowsInject(c.pid))
                     break;
                 unsigned bit = modnames[c.a].modbit; /* xkb mask: shift=1 ctrl=4 alt=8 super=64 */
                 if (c.b && !(held_mods & bit)) {
@@ -1980,30 +2151,39 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 break;
             }
             case SOskCommand::EType::MODS: {
-                if (!layerAllowsInject(c.pid))
+                if (!fromShell || !layerAllowsInject(c.pid))
                     break;
                 held_mods = 0;
                 sendMods(0);
                 break;
             }
             case SOskCommand::EType::TEXT:
-                if (layerAllowsInject(c.pid))
+                if (fromShell && layerAllowsInject(c.pid))
                     execText(c.text);
                 break;
-            case SOskCommand::EType::LAYOUT: execLayout(c.text); break;
+            case SOskCommand::EType::LAYOUT:
+                if (fromShell)
+                    execLayout(c.text);
+                break;
             case SOskCommand::EType::PMOVE: execPmove(c.a, c.b); break;
             case SOskCommand::EType::PBTN: execPbtn((unsigned)c.a, c.b); break;
             case SOskCommand::EType::FLING:
+                if (!fromShell)
+                    break;
                 fling_tau = std::max(0.05, std::min(2.0, c.a / 1000.0));
                 fling_cap = std::max(500.0, std::min(20000.0, (double)c.b));
                 DBG("fling: tau=" + std::to_string(fling_tau) + " cap=" + std::to_string(fling_cap));
                 break;
             case SOskCommand::EType::POINTER:
+                if (!fromShell)
+                    break;
                 drag_slop_px  = std::max(4.0, std::min(40.0, (double)c.a));
                 long_press_ms = std::max(0, std::min(2000, c.b));
                 DBG("pointer: slop=" + std::to_string(drag_slop_px) + " long=" + std::to_string(long_press_ms));
                 break;
             case SOskCommand::EType::SCROLL:
+                if (!fromShell)
+                    break;
                 scroll_gain = std::max(0.5, std::min(2.0, c.a / 100.0));
                 if (c.b >= 0)
                     scroll_axis_px = c.b != 0;
@@ -2011,6 +2191,8 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                     " axispx=" + std::to_string((int)scroll_axis_px));
                 break;
             case SOskCommand::EType::SWALLOW:
+                if (!fromShell)
+                    break;
                 touch_swallow = c.a != 0;
                 traceGeom(std::string("swallow set: ") + (touch_swallow ? "on" : "off"));
                 if (!touch_swallow) {
@@ -2036,6 +2218,8 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 DBG(std::string("touch swallow: ") + (touch_swallow ? "on" : "off"));
                 break;
             case SOskCommand::EType::PANEL:
+                if (!fromShell)
+                    break;
                 g_panelPid = c.pid;
                 panel_nx = c.panel[0];
                 panel_ny = c.panel[1];
@@ -2140,6 +2324,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_socketRunning = true;
     traceGeom(std::string("plugin init, swallow=") + (touch_swallow ? "on" : "off"));
+    refreshIntendedShell();
     g_socketThread = std::thread(socket_thread_fn, socketPath());
 
     Log::logger->log(Log::INFO, "[hypr-osk] plugin initialized, socket at " + socketPath());
@@ -2211,5 +2396,6 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_oskKeyboard->m_events.destroy.emit();
         g_oskKeyboard.reset();
     }
+    clearIntendedShell();
     Log::logger->log(Log::INFO, "[hypr-osk] unloaded");
 }
