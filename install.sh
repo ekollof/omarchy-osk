@@ -187,12 +187,45 @@ if [[ -f $HYPRLAND ]]; then
     echo "refusing to edit file owned by uid $ou: $HYPRLAND" >&2
     exit 1
   fi
-  if ! /usr/bin/grep -q 'require("hypr.osk")' "$HYPRLAND"; then
-    tmp=$(/usr/bin/mktemp "$(/usr/bin/dirname "$HYPRLAND")/.osk.XXXXXX")
-    /usr/bin/cp -T -- "$HYPRLAND" "$tmp"
-    /usr/bin/sed -i 's|^require("hypr.gestures")|require("hypr.gestures")\nrequire("hypr.osk")|' "$tmp"
-    /usr/bin/mv -T -- "$tmp" "$HYPRLAND"
-  fi
+  # Exclusive flock on the live inode, re-read, insert, write back (same inode
+  # so a concurrent writer cannot be replaced from a stale snapshot). On write
+  # failure the previous contents are restored before the lock is dropped.
+  need /usr/bin/python3
+  /usr/bin/python3 - "$HYPRLAND" <<'PY'
+import fcntl, os, stat, sys
+path = sys.argv[1]
+fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    st = os.fstat(fd)
+    if st.st_uid != os.getuid() or not stat.S_ISREG(st.st_mode):
+        sys.exit(1)
+    if st.st_size > 1_000_000:
+        sys.exit(1)
+    data = os.read(fd, st.st_size)
+    text = data.decode("utf-8")
+    if 'require("hypr.osk")' in text:
+        sys.exit(0)
+    needle = 'require("hypr.gestures")'
+    if needle not in text:
+        sys.stderr.write("hyprland.lua has no require(\"hypr.gestures\"); not editing\n")
+        sys.exit(0)
+    new = text.replace(needle, needle + '\nrequire("hypr.osk")', 1)
+    encoded = new.encode("utf-8")
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, encoded)
+        os.fsync(fd)
+    except OSError:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, data)
+        os.fsync(fd)
+        raise
+finally:
+    os.close(fd)
+PY
 fi
 
 # 6. Register with the shell and reload Hyprland

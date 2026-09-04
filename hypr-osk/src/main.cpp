@@ -50,8 +50,9 @@
  * validated on accept with SO_PEERCRED — the uid must match, and
  * /proc/<pid>/exe must realpath to a root-owned, non-group/world-writable
  * regular file that is the packaged shell (/usr/bin/quickshell). Basename
- * matching is not used. Injection commands (TEXT/KEY/MOD) are refused with
- * "err hidden" while the keyboard panel is not on screen (no PANEL rect).
+ * matching is not used. TEXT/KEY/MOD are refused unless that peer pid owns
+ * a mapped Wayland layer namespace "ekollof-osk" (a second quickshell that
+ * only connects cannot flip visibility with PANEL). Sends are non-blocking.
  *
  * Commands are queued from the socket thread and executed on the
  * compositor main thread via an EventLoop timer.
@@ -68,6 +69,8 @@
 #include <hyprland/src/devices/ITouch.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/desktop/state/LayerState.hpp>
+#include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <set>
@@ -114,6 +117,7 @@ static int    debug   = 1;
 struct SOskCommand {
     enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, POINTER, SCROLL, SWALLOW, PANEL } type;
     int   a = 0, b = 0;
+    pid_t pid           = 0; /* SO_PEERCRED pid stamped at queue time */
     float panel[4]      = {0, 0, 0, 0}; /* PANEL nx ny nw nh */
     char  text[TEXT_CAP] = {0};
 };
@@ -124,6 +128,8 @@ static size_t           g_ringHead = 0, g_ringCount = 0;
 static bool             g_inDrain = false;
 static std::atomic<bool> g_socketRunning{false};
 static std::atomic<bool> g_panelVisible{false}; /* main thread writes; socket thread reads for the hidden gate */
+static std::atomic<int>  g_listenFd{-1};
+static pid_t             g_panelPid = 0; /* peer pid that last published a PANEL rect */
 static int               g_wakePipe[2] = {-1, -1}; /* self-pipe: wakes the socket thread's polls */
 static int               g_drainEventFd = -1;      /* eventfd: socket thread → compositor loop */
 static wl_event_source  *g_drainEventSource = nullptr;
@@ -428,16 +434,38 @@ static void rebuildGrid()
 static std::mutex g_clientMutex;
 static int        g_clientFd = -1;
 
+static bool sendAllDontWait(int fd, const char *data, size_t n)
+{
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = send(fd, data + off, n - off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (r == 0)
+            return false;
+        off += (size_t)r;
+    }
+    return true;
+}
+
+static void dropClientFd(int fd)
+{
+    if (fd < 0)
+        return;
+    shutdown(fd, SHUT_RDWR);
+}
+
 static void sendToClient(const std::string &line)
 {
     std::lock_guard<std::mutex> lg(g_clientMutex);
     if (g_clientFd < 0)
         return;
     std::string out = line + "\n";
-    ssize_t     r;
-    do {
-        r = send(g_clientFd, out.c_str(), out.size(), MSG_NOSIGNAL);
-    } while (r < 0 && errno == EINTR);
+    if (!sendAllDontWait(g_clientFd, out.c_str(), out.size()))
+        dropClientFd(g_clientFd); /* wake the socket thread; it owns close() */
 }
 
 static void pushGrid()
@@ -729,6 +757,7 @@ static bool posInPanel(double nx, double ny)
 }
 
 static void applyTouches(); /* deferred: all compositor mutations happen here */
+static bool layerAllowsInject(pid_t pid);
 
 /* plugin-owned one-shot timer: unlike doLater (whose queued lambdas fire even
  * after dlclose — that crashed the compositor on unload), this stays
@@ -1082,6 +1111,9 @@ static void touchMotion(ITouch::SMotionEvent ev, Event::SCallbackInfo &info)
 /* ---------------- deferred application (idle phase, main thread) ---------- */
 static void applyTouches()
 {
+    panel_rect_valid = (panel_nw > 0 && panel_nh > 0 && layerAllowsInject(g_panelPid));
+    g_panelVisible.store(panel_rect_valid, std::memory_order_release);
+
     if (ignore_until_zero) {
         up_flag = false;
         down_flag = false;
@@ -1368,13 +1400,42 @@ static void applyTouches()
 
 
 /* ---------------- socket protocol ---------------- */
-static void send_reply(int cfd, const char *msg)
+static bool send_reply(int cfd, const char *msg)
 {
     std::string out = std::string(msg) + "\n";
-    ssize_t     r;
-    do {
-        r = send(cfd, out.c_str(), out.size(), MSG_NOSIGNAL);
-    } while (r < 0 && errno == EINTR);
+    return sendAllDontWait(cfd, out.c_str(), out.size());
+}
+
+/* Main thread only. TEXT/KEY/MOD require this peer to own the mapped OSK layer. */
+static bool layerAllowsInject(pid_t pid)
+{
+    if (pid <= 0)
+        return false;
+    auto &st = Desktop::layerState();
+    if (!st)
+        return false;
+    for (const auto &ls : st->layers()) {
+        if (!ls || ls->m_namespace != "ekollof-osk" || !ls->m_mapped)
+            continue;
+        if (ls->getPID() == pid)
+            return true;
+    }
+    return false;
+}
+
+static pid_t credPid(int cfd)
+{
+    struct ucred cred = {};
+    socklen_t clen = sizeof cred;
+    if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0)
+        return 0;
+    return cred.pid;
+}
+
+static void queueFromPeer(int cfd, SOskCommand cmd)
+{
+    cmd.pid = credPid(cfd);
+    queueCommand(std::move(cmd));
 }
 
 /* ---------------- peer validation ----------------
@@ -1439,7 +1500,7 @@ static bool peerAllowed(int cfd)
     return true;
 }
 
-static void handle_line(int cfd, char *line)
+static bool handle_line(int cfd, char *line)
 {
     size_t len = strlen(line);
     while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
@@ -1459,7 +1520,7 @@ static void handle_line(int cfd, char *line)
         } else {
             cmd.type = SOskCommand::EType::KEY;
             if (sscanf(line + 4, "%u %d", &cmd.a, &cmd.b) == 2) {
-                queueCommand(std::move(cmd));
+                queueFromPeer(cfd, std::move(cmd));
                 reply = "ok";
             } else
                 reply = "err bad args";
@@ -1482,7 +1543,7 @@ static void handle_line(int cfd, char *line)
                 cmd.type = SOskCommand::EType::MOD;
                 cmd.a    = found;
                 cmd.b    = (strcmp(state, "on") == 0) ? 1 : 0;
-                queueCommand(std::move(cmd));
+                queueFromPeer(cfd, std::move(cmd));
                 reply = "ok";
             }
         }
@@ -1491,7 +1552,7 @@ static void handle_line(int cfd, char *line)
             reply = "err bad args";
         } else {
             cmd.type = SOskCommand::EType::MODS;
-            queueCommand(std::move(cmd));
+            queueFromPeer(cfd, std::move(cmd));
             reply = "ok";
         }
     } else if (!strncmp(line, "LAYOUT ", 7)) {
@@ -1537,7 +1598,7 @@ static void handle_line(int cfd, char *line)
         } else {
             cmd.type = SOskCommand::EType::LAYOUT;
             snprintf(cmd.text, TEXT_CAP, "%s", spec);
-            queueCommand(std::move(cmd));
+            queueFromPeer(cfd, std::move(cmd));
             reply = "ok";
         }
     } else if (!strcmp(line, "ROWS")) {
@@ -1555,7 +1616,7 @@ static void handle_line(int cfd, char *line)
                 n = TEXT_CAP - 1;
             memcpy(cmd.text, line + 5, n);
             cmd.text[n] = 0;
-            queueCommand(std::move(cmd));
+            queueFromPeer(cfd, std::move(cmd));
             reply = "ok";
         }
     } else if (!strncmp(line, "PMOVE ", 6) || !strncmp(line, "PBTN ", 5)) {
@@ -1568,7 +1629,7 @@ static void handle_line(int cfd, char *line)
             cmd.type = SOskCommand::EType::FLING;
             cmd.a    = tau;
             cmd.b    = cap;
-            queueCommand(std::move(cmd));
+            queueFromPeer(cfd, std::move(cmd));
             reply = "ok";
         } else
             reply = "err bad args";
@@ -1580,7 +1641,7 @@ static void handle_line(int cfd, char *line)
             cmd.type = SOskCommand::EType::POINTER;
             cmd.a    = slop;
             cmd.b    = hold;
-            queueCommand(std::move(cmd));
+            queueFromPeer(cfd, std::move(cmd));
             reply = "ok";
         } else
             reply = "err bad args";
@@ -1591,7 +1652,7 @@ static void handle_line(int cfd, char *line)
             cmd.type = SOskCommand::EType::SCROLL;
             cmd.a    = gain;
             cmd.b    = n == 2 ? axispx : -1;
-            queueCommand(std::move(cmd));
+            queueFromPeer(cfd, std::move(cmd));
             reply = "ok";
         } else
             reply = "err bad args";
@@ -1601,7 +1662,7 @@ static void handle_line(int cfd, char *line)
         if (!strcmp(line + 8, "0") || !strcmp(line + 8, "1")) {
             cmd.type = SOskCommand::EType::SWALLOW;
             cmd.a    = line[8] - '0';
-            queueCommand(std::move(cmd));
+            queueFromPeer(cfd, std::move(cmd));
             reply = "ok";
         } else
             reply = "err bad args";
@@ -1655,24 +1716,24 @@ static void handle_line(int cfd, char *line)
                 cmd.panel[1] = py;
                 cmd.panel[2] = pw;
                 cmd.panel[3] = ph;
-                queueCommand(std::move(cmd));
+                queueFromPeer(cfd, std::move(cmd));
                 reply = "ok";
             } else
                 reply = "err bad args";
         } else {
             cmd.type     = SOskCommand::EType::PANEL;
             cmd.panel[0] = cmd.panel[1] = cmd.panel[2] = cmd.panel[3] = 0;
-            queueCommand(std::move(cmd));
+            queueFromPeer(cfd, std::move(cmd));
             reply = "ok";
         }
     }
-    send_reply(cfd, reply.c_str());
+    return send_reply(cfd, reply.c_str());
 }
 
 static void socket_thread_fn(std::string path)
 {
     unlink(path.c_str());
-    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (sock_fd < 0) {
         Log::logger->log(Log::ERR, "[hypr-osk] socket() failed");
         g_socketRunning = false;
@@ -1683,9 +1744,11 @@ static void socket_thread_fn(std::string path)
     strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
     if (bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(sock_fd, 4) < 0) {
         Log::logger->log(Log::ERR, "[hypr-osk] bind/listen failed");
+        close(sock_fd);
         g_socketRunning = false;
         return;
     }
+    g_listenFd.store(sock_fd, std::memory_order_release);
     chmod(path.c_str(), 0600);
     DBG("listening on " + path);
 
@@ -1715,7 +1778,7 @@ static void socket_thread_fn(std::string path)
         }
         if (!(pfd[0].revents & POLLIN))
             continue;
-        int nfd = accept(sock_fd, NULL, NULL);
+        int nfd = accept4(sock_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (nfd < 0)
             continue;
         if (!peerAllowed(nfd)) {
@@ -1749,17 +1812,26 @@ static void socket_thread_fn(std::string path)
                 char b;
                 while (read(g_wakePipe[0], &b, 1) > 0) {}
             }
+            bool replaced = false;
             if (cfds[0].revents & POLLIN) {
-                int newer = accept(sock_fd, NULL, NULL);
+                int newer = accept4(sock_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
                 if (newer >= 0) {
                     if (!peerAllowed(newer)) {
                         send_reply(newer, "err unauthorized");
                         close(newer);
                     } else {
                         send_reply(cfd, "err replaced");
+                        {
+                            std::lock_guard<std::mutex> lg(g_clientMutex);
+                            if (g_clientFd == cfd)
+                                g_clientFd = -1;
+                        }
                         close(cfd);
-                        cfd  = newer;
-                        rlen = 0;
+                        cfd            = newer;
+                        cfds[1].fd     = cfd;
+                        cfds[1].revents = 0;
+                        rlen           = 0;
+                        replaced       = true;
                         {
                             std::lock_guard<std::mutex> lg(g_clientMutex);
                             g_clientFd = newer;
@@ -1767,20 +1839,35 @@ static void socket_thread_fn(std::string path)
                     }
                 }
             }
-            if (cfds[1].revents & (POLLIN | POLLHUP)) {
+            if (!replaced && (cfds[1].revents & (POLLIN | POLLHUP))) {
                 ssize_t n = read(cfd, rbuf + rlen, MAX_LINE - 1 - rlen);
-                if (n <= 0) {
+                if (n < 0) {
+                    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                        continue;
                     DBG("client gone");
                     break;
-                }                rlen += (size_t)n;
+                }
+                if (n == 0) {
+                    DBG("client gone");
+                    break;
+                }
+                rlen += (size_t)n;
                 rbuf[rlen] = 0;
                 char *nl;
+                bool drop = false;
                 while ((nl = strchr(rbuf, '\n'))) {
                     *nl = 0;
-                    handle_line(cfd, rbuf);
+                    if (!handle_line(cfd, rbuf)) {
+                        drop = true;
+                        break;
+                    }
                     size_t consumed = (size_t)(nl - rbuf) + 1;
                     memmove(rbuf, rbuf + consumed, rlen - consumed + 1);
                     rlen -= consumed;
+                }
+                if (drop) {
+                    DBG("client dropped (send would block or peer gone)");
+                    break;
                 }
                 if (rlen >= MAX_LINE - 1) {
                     send_reply(cfd, "err line too long");
@@ -1802,6 +1889,7 @@ static void socket_thread_fn(std::string path)
     if (g_wakePipe[1] >= 0)
         close(g_wakePipe[1]);
     g_wakePipe[0] = g_wakePipe[1] = -1;
+    g_listenFd.store(-1, std::memory_order_release);
     close(sock_fd);
     unlink(path.c_str());
 }
@@ -1858,11 +1946,11 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
             g_ringMutex.unlock();
             switch (c.type) {
             case SOskCommand::EType::KEY:
-                if (g_panelVisible.load(std::memory_order_relaxed))
+                if (layerAllowsInject(c.pid))
                     execKey((unsigned)c.a, c.b);
                 break;
             case SOskCommand::EType::MOD: {
-                if (!g_panelVisible.load(std::memory_order_relaxed))
+                if (!layerAllowsInject(c.pid))
                     break;
                 unsigned bit = modnames[c.a].modbit; /* xkb mask: shift=1 ctrl=4 alt=8 super=64 */
                 if (c.b && !(held_mods & bit)) {
@@ -1875,12 +1963,14 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 break;
             }
             case SOskCommand::EType::MODS: {
+                if (!layerAllowsInject(c.pid))
+                    break;
                 held_mods = 0;
                 sendMods(0);
                 break;
             }
             case SOskCommand::EType::TEXT:
-                if (g_panelVisible.load(std::memory_order_relaxed))
+                if (layerAllowsInject(c.pid))
                     execText(c.text);
                 break;
             case SOskCommand::EType::LAYOUT: execLayout(c.text); break;
@@ -1929,14 +2019,16 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 DBG(std::string("touch swallow: ") + (touch_swallow ? "on" : "off"));
                 break;
             case SOskCommand::EType::PANEL:
+                g_panelPid = c.pid;
                 panel_nx = c.panel[0];
                 panel_ny = c.panel[1];
                 panel_nw = c.panel[2];
                 panel_nh = c.panel[3];
-                panel_rect_valid = (panel_nw > 0 && panel_nh > 0);
+                panel_rect_valid = (panel_nw > 0 && panel_nh > 0 && layerAllowsInject(c.pid));
                 g_panelVisible.store(panel_rect_valid, std::memory_order_release);
                 DBG("panel rect (norm): " + std::to_string(panel_nx) + " " + std::to_string(panel_ny) +
-                    " " + std::to_string(panel_nw) + " " + std::to_string(panel_nh));
+                    " " + std::to_string(panel_nw) + " " + std::to_string(panel_nh) +
+                    " inject=" + std::to_string((int)panel_rect_valid));
                 break;
             }
             g_ringMutex.lock();
@@ -2041,6 +2133,13 @@ APICALL EXPORT void PLUGIN_EXIT() {
     /* stop the socket thread and join it BEFORE the .so is unmapped: the
      * thread's code lives in this library */
     g_socketRunning = false;
+    int lfd = g_listenFd.exchange(-1);
+    if (lfd >= 0)
+        shutdown(lfd, SHUT_RDWR);
+    {
+        std::lock_guard<std::mutex> lg(g_clientMutex);
+        dropClientFd(g_clientFd);
+    }
     /* wake its blocked polls instantly (they sleep without a timeout) */
     if (g_wakePipe[1] >= 0) {
         char b = 1;

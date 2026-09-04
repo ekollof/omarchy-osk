@@ -136,10 +136,11 @@ control are in the header comment). Short map:
 - **Socket**: `$XDG_RUNTIME_DIR/hypr-osk.sock`, one client (a new connect
   replaces the previous). `SO_PEERCRED` requires the same uid, and
   `/proc/<pid>/exe` must realpath to the packaged `/usr/bin/quickshell`
-  (root-owned, not group/world-writable). Basename matching is not used
-  and there is no environment bypass. Injection is refused with
-  `err hidden` until the shell publishes a `PANEL` rect. `PMOVE`/`PBTN`
-  always return `err pointer disabled`.
+  (root-owned, not group/world-writable). `TEXT`/`KEY`/`MOD` additionally
+  require that peer pid to own a mapped layer namespace `ekollof-osk` —
+  `PANEL` alone cannot enable injection. Sends are non-blocking so a
+  stalled client cannot pin the compositor or block plugin unload.
+  `PMOVE`/`PBTN` always return `err pointer disabled`.
 - **Threads**: the socket thread never calls compositor APIs. Commands go
   through a fixed ring buffer; an eventfd wakes the Wayland loop, which
   arms a 0 ms drain timer. Touch handlers likewise only schedule work.
@@ -155,8 +156,8 @@ session, so:
 - connections are validated with `SO_PEERCRED` (same uid) plus a
   realpath allowlist of the packaged `/usr/bin/quickshell` binary
   (root-owned, not group/world-writable); everyone else is refused
-- input injection (`TEXT`/`KEY`/`MOD`) only works while the keyboard is
-  visible
+- input injection (`TEXT`/`KEY`/`MOD`) only runs for that peer if it owns
+  the mapped `ekollof-osk` layer (not merely a `PANEL` command)
 - `PMOVE`/`PBTN` are disabled (`err pointer disabled`)
 
 ## Removal
