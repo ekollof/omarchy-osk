@@ -169,7 +169,10 @@ Item {
   }
 
   function persistConfig() {
-    cfgFile.setText(JSON.stringify({
+    const helper = root.jsonHelper()
+    if (!helper)
+      return
+    const body = JSON.stringify({
       layout: root.layout,
       repeat: root.repeatEnabled,
       repeatDelay: root.repeatDelay,
@@ -181,7 +184,10 @@ Item {
       scrollGain: root.scrollGain,
       scrollAxisPx: root.scrollAxisPx,
       touchSwallow: root.touchSwallow
-    }) + "\n")
+    })
+    cfgSave.command = ["/usr/bin/python3", helper, "save", root.cfgPath(), body]
+    cfgSave.running = false
+    cfgSave.running = true
   }
 
   // ---- IPC methods for the bar applet (omarchy-shell shell call …) --------
@@ -443,22 +449,40 @@ Item {
   }
 
   // ---- config file --------------------------------------------------------
+  // FileView is not used: it blocks, follows symlinks, and has no size cap.
+  // osk-json.py opens the path with O_NOFOLLOW, checks owner/type, and caps
+  // the read/write at 8 KiB.
 
   function cfgPath() {
     const base = Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")
     return base + "/omarchy/osk.json"
   }
 
-  FileView {
-    id: cfgFile
-    path: root.cfgPath()
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    blockLoading: true
-    onLoaded: root.applyConfig(text())
-    onLoadFailed: root.applyConfig("") // missing file → LANG-derived defaults
-    onFileChanged: reload()
+  function jsonHelper() {
+    const d = root.manifest && root.manifest.__sourceDir ? String(root.manifest.__sourceDir) : ""
+    if (d.charAt(0) === "/" && d.indexOf("..") === -1)
+      return d + "/osk-json.py"
+    const u = Qt.resolvedUrl("osk-json.py").toString()
+    if (u.indexOf("file://") === 0)
+      return decodeURIComponent(u.slice(7))
+    return ""
+  }
+
+  Process {
+    id: cfgLoad
+    stdout: StdioCollector {
+      id: cfgLoadOut
+      waitForEnd: true
+    }
+    onExited: function(code) {
+      if (root.cfgLoaded)
+        return
+      root.applyConfig(code === 0 ? cfgLoadOut.text : "")
+    }
+  }
+
+  Process {
+    id: cfgSave
   }
 
   // press-and-hold auto-repeat (all char/code keys) — one key held at a time
@@ -686,6 +710,14 @@ Item {
 
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
-  Component.onCompleted: console.log("[ekollof.osk] loaded rev14 layout=" + root.layout +
-                                     " cfg=" + root.cfgPath())
+  Component.onCompleted: {
+    console.log("[ekollof.osk] loaded rev15 layout=" + root.layout + " cfg=" + root.cfgPath())
+    const helper = root.jsonHelper()
+    if (!helper) {
+      root.applyConfig("")
+      return
+    }
+    cfgLoad.command = ["/usr/bin/python3", helper, "load", root.cfgPath()]
+    cfgLoad.running = true
+  }
 }

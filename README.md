@@ -64,8 +64,8 @@ plugins in its own layout and supersedes a plugin-add copy — pick one path.
   `efb50993780079460b0cbed1363e2166a2de1d9f` is known-good)
 - meson, ninja, gcc, pkg-config; meson deps: pixman, libinput,
   wayland-server, xkbcommon, libdrm
-- `glm` for vendored hyprgrass/wf-touch (`install.sh` runs
-  `omarchy pkg add glm` only if `pacman -Q glm` is missing)
+- `glm` for vendored hyprgrass/wf-touch (must already be installed; the
+  installer does not invoke the package manager)
 - Vendored hyprgrass `hl-0.56.1` commit
   `36df29f57f94a77b4d5dcf91100f620a46663fa9` and wf-touch
   `8974eb0f6a65464b63dd03b842795cb441fb6403` — already in-tree; the
@@ -114,7 +114,7 @@ recommended. The touch mapping follows the monitor orientation, so if you
 rotate the device without keeping the touch device's transform in sync with
 the monitor, taps and scrolling land rotated. This is often not set up out
 of the box: Omarchy does not install `iio-sensor-proxy` by default. Install
-it (`omarchy pkg add iio-sensor-proxy`) and run a small rotation daemon that
+the `iio-sensor-proxy` package and run a small rotation daemon that
 moves the monitor and touch transforms together (see the
 [GPD Pocket 4 discussion](https://github.com/omacom/omarchy/discussions/9032)
 for a working example).
@@ -134,11 +134,12 @@ control are in the header comment). Short map:
 - **Key injection**: synthetic keyboard device `hypr-osk-vk`. `TEXT`/`KEY`/
   `MOD` map through the *active* xkb keymap and the real input pipeline.
 - **Socket**: `$XDG_RUNTIME_DIR/hypr-osk.sock`, one client (a new connect
-  replaces the previous). `SO_PEERCRED` requires the same uid; unless
-  `HYPR_OSK_ALLOW_ANY_PEER=1` is in **Hyprland's** environment at plugin
-  load, `/proc/<pid>/exe` must be `quickshell`. Injection is refused with
+  replaces the previous). `SO_PEERCRED` requires the same uid, and
+  `/proc/<pid>/exe` must realpath to the packaged `/usr/bin/quickshell`
+  (root-owned, not group/world-writable). Basename matching is not used
+  and there is no environment bypass. Injection is refused with
   `err hidden` until the shell publishes a `PANEL` rect. `PMOVE`/`PBTN`
-  stay debug-only (`err pointer disabled` without the env var).
+  always return `err pointer disabled`.
 - **Threads**: the socket thread never calls compositor APIs. Commands go
   through a fixed ring buffer; an eventfd wakes the Wayland loop, which
   arms a 0 ms drain timer. Touch handlers likewise only schedule work.
@@ -152,11 +153,11 @@ The IPC socket (`$XDG_RUNTIME_DIR/hypr-osk.sock`) can type into the focused
 session, so:
 
 - connections are validated with `SO_PEERCRED` (same uid) plus a
-  `/proc/<pid>/exe` allowlist (the Omarchy shell); everyone else is refused
+  realpath allowlist of the packaged `/usr/bin/quickshell` binary
+  (root-owned, not group/world-writable); everyone else is refused
 - input injection (`TEXT`/`KEY`/`MOD`) only works while the keyboard is
   visible
-- `PMOVE`/`PBTN` (remote pointer, debugging) require
-  `HYPR_OSK_ALLOW_ANY_PEER=1` in Hyprland's environment
+- `PMOVE`/`PBTN` are disabled (`err pointer disabled`)
 
 ## Removal
 

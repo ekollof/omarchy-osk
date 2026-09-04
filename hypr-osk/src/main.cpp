@@ -33,10 +33,8 @@
  *                                main layer, dumped from the active keymap:
  *                                {"rows":[[{"l":"q","s":"Q","c":16},...],...]}
  *                                (raw:1 means send KEY <c> instead of TEXT)
- *   PMOVE <x> <y>                absolute cursor move (global logical px;
- *                                debug only, needs HYPR_OSK_ALLOW_ANY_PEER=1)
- *   PBTN <code> <1|0>            pointer button (0x110 = left; debug only,
- *                                needs HYPR_OSK_ALLOW_ANY_PEER=1)
+ *   PMOVE / PBTN                 always "err pointer disabled" (no remote
+ *                                pointer injection)
  *   FLING <tau_ms> <cap_px_s>    scroll momentum: decay time constant and
  *                                entry-velocity cap for the post-lift fling
  *   POINTER <slop_px> <long_ms>  drag slop (px before left-down) and
@@ -49,11 +47,11 @@
  *                                touchscreen support
  *
  * Access control: the socket can type into the focused session, so peers are
- * validated on accept with SO_PEERCRED — the uid must match and (unless
- * HYPR_OSK_ALLOW_ANY_PEER=1 in the compositor's environment) the peer exe
- * must be the shell (quickshell); everyone else gets "err unauthorized".
- * Injection commands (TEXT/KEY/MOD) are refused with "err hidden" while the
- * keyboard panel is not on screen (no PANEL rect published).
+ * validated on accept with SO_PEERCRED — the uid must match, and
+ * /proc/<pid>/exe must realpath to a root-owned, non-group/world-writable
+ * regular file that is the packaged shell (/usr/bin/quickshell). Basename
+ * matching is not used. Injection commands (TEXT/KEY/MOD) are refused with
+ * "err hidden" while the keyboard panel is not on screen (no PANEL rect).
  *
  * Commands are queued from the socket thread and executed on the
  * compositor main thread via an EventLoop timer.
@@ -76,6 +74,8 @@
 #include <hyprland/src/event/EventBus.hpp>
 
 #include <cmath>
+#include <cstdlib>
+#include <climits>
 #include <fstream>
 #include <fcntl.h>
 #include <cerrno>
@@ -91,6 +91,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <linux/limits.h>
 #include <linux/input-event-codes.h>
 #include <poll.h>
 
@@ -701,7 +702,7 @@ static void publishStats()
     s.contact     = (int)contact_is_panel_native;
     s.panel_valid = (int)panel_rect_valid;
     s.inject      = (int)g_panelVisible.load(std::memory_order_relaxed);
-    s.anypeer     = 0; /* filled at STATS read: g_allowAnyPeer is init-only */
+    s.anypeer     = 0; /* remote pointer injection is not available */
     s.swallow     = (int)touch_swallow;
     s.indrain     = (int)g_inDrain;
     s.fires       = g_drain_fires;
@@ -1377,13 +1378,47 @@ static void send_reply(int cfd, const char *msg)
 }
 
 /* ---------------- peer validation ----------------
- * The socket can type into the focused session, so only the user's own shell
- * (quickshell — omarchy-shell is a wrapper script that execs it) may connect.
- * SO_PEERCRED yields the peer's pid/uid from the kernel; /proc/<pid>/exe
- * identifies the binary. HYPR_OSK_ALLOW_ANY_PEER=1 in the compositor's
- * environment skips the exe check (never the uid check) — it is also the
- * gate for the PMOVE/PBTN debug commands. */
-static bool g_allowAnyPeer = false;
+ * The socket can type into the focused session, so only the user's own
+ * packaged shell may connect. SO_PEERCRED yields pid/uid from the kernel.
+ * /proc/<pid>/exe is realpath'd and must be a root-owned, not group/world-
+ * writable regular file equal to the packaged quickshell binary — not a
+ * spoofable basename. There is no environment switch that skips this. */
+static bool peerExeAllowed(pid_t pid)
+{
+    char link[64];
+    snprintf(link, sizeof link, "/proc/%d/exe", (int)pid);
+    char raw[PATH_MAX];
+    ssize_t n = readlink(link, raw, sizeof raw);
+    if (n <= 0 || n >= (ssize_t)sizeof raw)
+        return false;
+    raw[n] = 0;
+    if (strstr(raw, " (deleted)"))
+        return false;
+
+    char real[PATH_MAX];
+    if (!realpath(raw, real))
+        return false;
+
+    struct stat st = {};
+    if (lstat(real, &st) != 0)
+        return false;
+    if (!S_ISREG(st.st_mode) || st.st_uid != 0)
+        return false;
+    if (st.st_mode & (S_IWGRP | S_IWOTH))
+        return false;
+    if (!(st.st_mode & S_IXUSR))
+        return false;
+
+    static const char *const kAllowed[] = {"/usr/bin/quickshell", "/bin/quickshell"};
+    for (const char *cand : kAllowed) {
+        char allowed[PATH_MAX];
+        if (!realpath(cand, allowed))
+            continue;
+        if (strcmp(real, allowed) == 0)
+            return true;
+    }
+    return false;
+}
 
 static bool peerAllowed(int cfd)
 {
@@ -1397,21 +1432,8 @@ static bool peerAllowed(int cfd)
         DBG("peer check: uid " + std::to_string(cred.uid) + " rejected");
         return false;
     }
-    if (g_allowAnyPeer)
-        return true;
-    char buf[4096];
-    std::string link = "/proc/" + std::to_string(cred.pid) + "/exe";
-    ssize_t n = readlink(link.c_str(), buf, sizeof buf - 1);
-    if (n <= 0) {
-        DBG("peer check: pid " + std::to_string(cred.pid) + " exe unreadable, rejected");
-        return false;
-    }
-    buf[n] = 0;
-    const char *slash = strrchr(buf, '/');
-    const char *base  = slash ? slash + 1 : buf;
-    if (strcmp(base, "quickshell") != 0) {
-        DBG("peer check: pid " + std::to_string(cred.pid) + " exe=" + std::string(base) +
-            ", rejected");
+    if (!peerExeAllowed(cred.pid)) {
+        DBG("peer check: pid " + std::to_string(cred.pid) + " exe not packaged quickshell, rejected");
         return false;
     }
     return true;
@@ -1536,28 +1558,8 @@ static void handle_line(int cfd, char *line)
             queueCommand(std::move(cmd));
             reply = "ok";
         }
-    } else if (!strncmp(line, "PMOVE ", 6)) {
-        if (!g_allowAnyPeer) { /* debug-only remote pointer control */
-            reply = "err pointer disabled";
-        } else {
-            cmd.type = SOskCommand::EType::PMOVE;
-            if (sscanf(line + 6, "%d %d", &cmd.a, &cmd.b) == 2) {
-                queueCommand(std::move(cmd));
-                reply = "ok";
-            } else
-                reply = "err bad args";
-        }
-    } else if (!strncmp(line, "PBTN ", 5)) {
-        if (!g_allowAnyPeer) { /* debug-only remote pointer control */
-            reply = "err pointer disabled";
-        } else {
-            cmd.type = SOskCommand::EType::PBTN;
-            if (sscanf(line + 5, "%i %d", &cmd.a, &cmd.b) == 2) { /* %i: accepts 0x hex */
-                queueCommand(std::move(cmd));
-                reply = "ok";
-            } else
-                reply = "err bad args";
-        }
+    } else if (!strncmp(line, "PMOVE ", 6) || !strncmp(line, "PBTN ", 5)) {
+        reply = "err pointer disabled";
     } else if (!strncmp(line, "FLING ", 6)) {
         /* FLING <tau_ms> <cap_px_s> — momentum decay + speed cap */
         int tau, cap;
@@ -1629,7 +1631,7 @@ static void handle_line(int cfd, char *line)
                  "panel_valid=%d inject=%d anypeer=%d panel_ny=%.3f panel_nh=%.3f last=%.3f,%.3f "
                  "fires=%u ring=%zu indrain=%d layout=%s textmap=%zu fling=%.0fms/%.0fpx swallow=%d",
                  s.fingers, s.pressed, s.ignore, s.scroll, s.down, s.up, s.contact, s.panel_valid,
-                 s.inject, (int)g_allowAnyPeer, s.panel_ny, s.panel_nh, s.lastx, s.lasty, s.fires,
+                 s.inject, s.anypeer, s.panel_ny, s.panel_nh, s.lastx, s.lasty, s.fires,
                  s.ring, s.indrain, s.layout, s.textmap, s.fling_tau_ms, s.fling_cap, s.swallow);
         reply = buf;
     } else if (!strncmp(line, "CALIB", 5)) {
@@ -2026,12 +2028,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     resolveTouchMonitor(); /* seed the MON snapshot so the first MON need not wait for a touch */
     publishStats();
-
-    const char *anypeer = getenv("HYPR_OSK_ALLOW_ANY_PEER");
-    g_allowAnyPeer = anypeer && *anypeer && strcmp(anypeer, "0") != 0;
-    if (g_allowAnyPeer)
-        Log::logger->log(Log::INFO,
-                         "[hypr-osk] HYPR_OSK_ALLOW_ANY_PEER=1: peer exe check skipped, PMOVE/PBTN enabled");
 
     g_socketRunning = true;
     traceGeom(std::string("plugin init, swallow=") + (touch_swallow ? "on" : "off"));

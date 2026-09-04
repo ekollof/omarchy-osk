@@ -10,70 +10,218 @@
 # Idempotent: safe to re-run after every edit. The shell hot-reloads plugin
 # code, but a stale component cache can serve old QML — run `omarchy restart
 # shell` if changes don't land.
+#
+# Tools are invoked by absolute path (PATH is reset). Destinations are
+# created/replaced only when they are directories/files owned by this uid
+# and not symlinks; files are published via temp + rename.
 
 set -euo pipefail
+umask 022
+export PATH=/usr/bin:/bin
+export LC_ALL=C
+
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+UID_SELF=$(/usr/bin/id -u)
+
+need() {
+  local p=$1
+  [[ -x $p ]] || { echo "missing executable: $p" >&2; exit 1; }
+}
+
+need /usr/bin/meson
+need /usr/bin/install
+need /usr/bin/cp
+need /usr/bin/rm
+need /usr/bin/mv
+need /usr/bin/mkdir
+need /usr/bin/mktemp
+need /usr/bin/stat
+need /usr/bin/dirname
+need /usr/bin/id
+need /usr/bin/grep
+need /usr/bin/sed
+
+ensure_user_dir() {
+  local d=$1
+  if [[ -z $d || $d == / ]]; then
+    echo "refusing directory: $d" >&2
+    exit 1
+  fi
+  if [[ -L $d ]]; then
+    echo "refusing symlink directory: $d" >&2
+    exit 1
+  fi
+  if [[ -d $d ]]; then
+    if [[ $d == "$HOME" || $d == "$HOME"/* ]]; then
+      local ou
+      ou=$(/usr/bin/stat -c '%u' "$d")
+      if [[ $ou != "$UID_SELF" ]]; then
+        echo "refusing directory owned by uid $ou: $d" >&2
+        exit 1
+      fi
+    fi
+    return 0
+  fi
+  if [[ -e $d ]]; then
+    echo "not a directory: $d" >&2
+    exit 1
+  fi
+  ensure_user_dir "$(/usr/bin/dirname "$d")"
+  /usr/bin/mkdir -m 755 "$d"
+}
+
+publish_file() {
+  local src=$1 dest=$2 mode=$3
+  [[ -f $src && ! -L $src ]] || { echo "refusing source: $src" >&2; exit 1; }
+  local parent
+  parent=$(/usr/bin/dirname "$dest")
+  ensure_user_dir "$parent"
+  if [[ -L $dest ]]; then
+    echo "refusing to overwrite symlink: $dest" >&2
+    exit 1
+  fi
+  if [[ -e $dest ]]; then
+    [[ -f $dest ]] || { echo "refusing non-file destination: $dest" >&2; exit 1; }
+    local ou
+    ou=$(/usr/bin/stat -c '%u' "$dest")
+    if [[ $ou != "$UID_SELF" ]]; then
+      echo "refusing file owned by uid $ou: $dest" >&2
+      exit 1
+    fi
+  fi
+  local tmp
+  tmp=$(/usr/bin/mktemp "$parent/.osk.XXXXXX")
+  /usr/bin/install -m "$mode" "$src" "$tmp"
+  if [[ -L $tmp ]]; then
+    /usr/bin/rm -f -- "$tmp"
+    echo "temp path became a symlink: $tmp" >&2
+    exit 1
+  fi
+  /usr/bin/mv -T -- "$tmp" "$dest"
+}
+
+publish_tree() {
+  local src=$1 dest=$2
+  [[ -d $src && ! -L $src ]] || { echo "refusing source tree: $src" >&2; exit 1; }
+  local parent
+  parent=$(/usr/bin/dirname "$dest")
+  ensure_user_dir "$parent"
+  if [[ -L $dest ]]; then
+    echo "refusing to overwrite symlink: $dest" >&2
+    exit 1
+  fi
+  if [[ -e $dest ]]; then
+    [[ -d $dest ]] || { echo "refusing non-directory destination: $dest" >&2; exit 1; }
+    local ou
+    ou=$(/usr/bin/stat -c '%u' "$dest")
+    if [[ $ou != "$UID_SELF" ]]; then
+      echo "refusing directory owned by uid $ou: $dest" >&2
+      exit 1
+    fi
+  fi
+  local tmp bak
+  tmp=$(/usr/bin/mktemp -d "$parent/.osk.XXXXXX")
+  /usr/bin/cp -a --no-dereference -- "$src"/. "$tmp"/
+  if [[ -d $dest ]]; then
+    bak=$(/usr/bin/mktemp -d "$parent/.osk-old.XXXXXX")
+    /usr/bin/mv -T -- "$dest" "$bak"
+    /usr/bin/mv -T -- "$tmp" "$dest"
+    /usr/bin/rm -rf -- "$bak"
+  else
+    /usr/bin/mv -T -- "$tmp" "$dest"
+  fi
+}
+
+hyprpm_has() {
+  [[ -x /usr/bin/hyprpm ]] || return 1
+  /usr/bin/hyprpm list 2>/dev/null | /usr/bin/grep -q -- "$1"
+}
 
 # 1+2. Build the compositor plugin and install it where Hyprland plugins
 # live — unless hyprpm manages it (see hyprpm.toml): then its copy wins and
 # a flat copy here would fight it (rebuild with: hyprpm update).
 OSK_SO="$HOME/.local/share/hyprland/plugins/libhypr-osk.so"
 OSK_LOCAL_BUILT=0
-if hyprpm list 2>/dev/null | grep -q hypr-osk; then
+if hyprpm_has hypr-osk; then
   echo "hypr-osk is hyprpm-managed: skipping the local build (rebuild with: hyprpm update)."
 else
-  [[ -d "$DIR/hypr-osk/build" ]] || meson setup "$DIR/hypr-osk/build" "$DIR/hypr-osk" >/dev/null
-  meson compile -C "$DIR/hypr-osk/build"
-  mkdir -p "$HOME/.local/share/hyprland/plugins"
-  install -m 644 "$DIR/hypr-osk/build/libhypr-osk.so" "$OSK_SO"
+  [[ -d "$DIR/hypr-osk/build" ]] || /usr/bin/meson setup "$DIR/hypr-osk/build" "$DIR/hypr-osk" >/dev/null
+  /usr/bin/meson compile -C "$DIR/hypr-osk/build"
+  publish_file "$DIR/hypr-osk/build/libhypr-osk.so" "$OSK_SO" 644
   OSK_LOCAL_BUILT=1
 fi
 
 # 3. Build the vendored hyprgrass (edge-swipe gesture) the same way: upstream
 # horriblename/hyprgrass + wf-touch, pinned in docs/PINS.md (no git clone).
-# Skip when hyprpm manages it instead.
-if hyprpm list 2>/dev/null | grep -q hyprgrass; then
+# Skip when hyprpm manages it instead. glm must already be installed.
+if hyprpm_has hyprgrass; then
   echo "hyprgrass is hyprpm-managed: skipping the vendored build (rebuild with: hyprpm update)."
 else
-  pacman -Q glm >/dev/null 2>&1 || omarchy pkg add glm || echo "warning: glm missing, the hyprgrass build below will fail"
-  [[ -d "$DIR/vendor/hyprgrass/build" ]] || meson setup "$DIR/vendor/hyprgrass/build" "$DIR/vendor/hyprgrass" >/dev/null
-  meson compile -C "$DIR/vendor/hyprgrass/build"
-  install -m 644 "$DIR/vendor/hyprgrass/build/src/libhyprgrass.so" "$HOME/.local/share/hyprland/plugins/hyprgrass.so"
+  if [[ -x /usr/bin/pacman ]] && ! /usr/bin/pacman -Q glm >/dev/null 2>&1; then
+    echo "warning: glm missing (pacman -Q glm); skipping vendored hyprgrass. Install glm and re-run." >&2
+  else
+    [[ -d "$DIR/vendor/hyprgrass/build" ]] || /usr/bin/meson setup "$DIR/vendor/hyprgrass/build" "$DIR/vendor/hyprgrass" >/dev/null
+    /usr/bin/meson compile -C "$DIR/vendor/hyprgrass/build"
+    publish_file "$DIR/vendor/hyprgrass/build/src/libhyprgrass.so" \
+      "$HOME/.local/share/hyprland/plugins/hyprgrass.so" 644
+  fi
 fi
 
 # 4. Deploy the shell plugins
-mkdir -p "$HOME/.config/omarchy/plugins"
+ensure_user_dir "$HOME/.config/omarchy/plugins"
 for p in ekollof.osk ekollof.osk-applet; do
-  rm -rf "$HOME/.config/omarchy/plugins/$p"
-  cp -r "$DIR/shell/$p" "$HOME/.config/omarchy/plugins/"
+  publish_tree "$DIR/shell/$p" "$HOME/.config/omarchy/plugins/$p"
 done
 
 # 5. Deploy the Hyprland integration
-mkdir -p "$HOME/.config/hypr/scripts"
-install -m 755 "$DIR/hypr/osk-toggle.sh" "$HOME/.config/hypr/scripts/osk-toggle.sh"
-install -m 644 "$DIR/hypr/osk.lua" "$HOME/.config/hypr/osk.lua"
+publish_file "$DIR/hypr/osk-toggle.sh" "$HOME/.config/hypr/scripts/osk-toggle.sh" 755
+publish_file "$DIR/hypr/osk.lua" "$HOME/.config/hypr/osk.lua" 644
 HYPRLAND="$HOME/.config/hypr/hyprland.lua"
-if ! grep -q 'require("hypr.osk")' "$HYPRLAND"; then
-  sed -i 's|^require("hypr.gestures")|require("hypr.gestures")\nrequire("hypr.osk")|' "$HYPRLAND"
+if [[ -L $HYPRLAND ]]; then
+  echo "refusing to edit symlink: $HYPRLAND" >&2
+  exit 1
+fi
+if [[ -f $HYPRLAND ]]; then
+  ou=$(/usr/bin/stat -c '%u' "$HYPRLAND")
+  if [[ $ou != "$UID_SELF" ]]; then
+    echo "refusing to edit file owned by uid $ou: $HYPRLAND" >&2
+    exit 1
+  fi
+  if ! /usr/bin/grep -q 'require("hypr.osk")' "$HYPRLAND"; then
+    tmp=$(/usr/bin/mktemp "$(/usr/bin/dirname "$HYPRLAND")/.osk.XXXXXX")
+    /usr/bin/cp -T -- "$HYPRLAND" "$tmp"
+    /usr/bin/sed -i 's|^require("hypr.gestures")|require("hypr.gestures")\nrequire("hypr.osk")|' "$tmp"
+    /usr/bin/mv -T -- "$tmp" "$HYPRLAND"
+  fi
 fi
 
 # 6. Register with the shell and reload Hyprland
-omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-omarchy-shell shell putBarWidget ekollof.osk-applet '{}' >/dev/null 2>&1 || true
-omarchy-shell shell setPluginEnabled ekollof.osk true >/dev/null 2>&1 || true
-hyprctl reload >/dev/null 2>&1 || true
+if [[ -x /usr/bin/omarchy-shell ]]; then
+  /usr/bin/omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  /usr/bin/omarchy-shell shell putBarWidget ekollof.osk-applet '{}' >/dev/null 2>&1 || true
+  /usr/bin/omarchy-shell shell setPluginEnabled ekollof.osk true >/dev/null 2>&1 || true
+fi
+if [[ -x /usr/bin/hyprctl ]]; then
+  /usr/bin/hyprctl reload >/dev/null 2>&1 || true
+fi
 
 # hyprctl reload does not remap an already-loaded .so (the old inode stays
 # mapped). Unload by full path, then load the copy we just installed —
 # only when this script built that copy (hyprpm-managed machines rebuild
 # with `hyprpm update`).
-if [[ "$OSK_LOCAL_BUILT" == 1 ]]; then
-  hyprctl plugin unload "$OSK_SO" >/dev/null 2>&1 || true
-  hyprctl plugin load "$OSK_SO" >/dev/null 2>&1 || true
+if [[ "$OSK_LOCAL_BUILT" == 1 && -x /usr/bin/hyprctl ]]; then
+  /usr/bin/hyprctl plugin unload "$OSK_SO" >/dev/null 2>&1 || true
+  /usr/bin/hyprctl plugin load "$OSK_SO" >/dev/null 2>&1 || true
 fi
 
 echo "omarchy-osk installed."
-hyprctl plugin list | grep -q hypr-osk && echo "compositor plugin: loaded" \
-  || echo "compositor plugin: NOT loaded yet (log out/in, or: hyprctl plugin load $HOME/.local/share/hyprland/plugins/libhypr-osk.so)"
-hyprctl plugin list | grep -q hyprgrass && echo "hyprgrass: loaded" \
-  || echo "hyprgrass: built and deployed; loads at next session (or: hyprctl plugin load $HOME/.local/share/hyprland/plugins/hyprgrass.so)"
+if [[ -x /usr/bin/hyprctl ]] && /usr/bin/hyprctl plugin list | /usr/bin/grep -q hypr-osk; then
+  echo "compositor plugin: loaded"
+else
+  echo "compositor plugin: NOT loaded yet (log out/in, or: /usr/bin/hyprctl plugin load $HOME/.local/share/hyprland/plugins/libhypr-osk.so)"
+fi
+if [[ -x /usr/bin/hyprctl ]] && /usr/bin/hyprctl plugin list | /usr/bin/grep -q hyprgrass; then
+  echo "hyprgrass: loaded"
+else
+  echo "hyprgrass: built and deployed; loads at next session (or: /usr/bin/hyprctl plugin load $HOME/.local/share/hyprland/plugins/hyprgrass.so)"
+fi

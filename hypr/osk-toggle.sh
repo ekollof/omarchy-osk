@@ -1,10 +1,11 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # Toggle the on-screen keyboard (ekollof.osk Quickshell plugin in omarchy-shell).
 # Used by the hyprgrass swipe-up-from-bottom-edge gesture and SUPER+SHIFT+K.
 # The plugin's open() toggles visibility. Debounced: hyprgrass can fire the
 # edge gesture twice per swipe; without a lock the double toggle opens+closes.
 
-LOCK="${XDG_RUNTIME_DIR:-/tmp}/osk-toggle.lock"
+export PATH=/usr/bin:/bin
+LOCK="${XDG_RUNTIME_DIR:-/run/user/$(/usr/bin/id -u)}/osk-toggle.lock"
 exec 9>>"$LOCK"
 flock 9
 NOW=$(date +%s%N)
@@ -18,4 +19,4 @@ if [ $(( (NOW - LAST) / 1000000 )) -lt 1500 ]; then
 fi
 printf '%s\n' "$NOW" >"$LOCK"
 
-omarchy-shell shell summon ekollof.osk '{}'
+/usr/bin/omarchy-shell shell summon ekollof.osk '{}'

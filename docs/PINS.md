@@ -49,7 +49,7 @@ offline-capable pin for this Hyprland.
 | Commit | `8974eb0f6a65464b63dd03b842795cb441fb6403` |
 | Tree | `vendor/hyprgrass/subprojects/wf-touch/` |
 | License | MIT (`vendor/hyprgrass/subprojects/wf-touch/LICENSE`) |
-| Extra system dep | `glm` (`omarchy pkg add glm` if missing; used only by this subproject) |
+| Extra system dep | `glm` (must already be installed; used only by this subproject) |
 
 ## hypr-osk (first-party compositor plugin)
 

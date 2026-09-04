@@ -111,6 +111,8 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       refreshState()
+      stateProc.running = false
+      stateProc.running = true
       if (root.layouts.length === 0)
         layoutsProc.running = true
     }
@@ -528,21 +530,18 @@ Panel {
     } // viewport
   }
 
-  FileView {
-    id: cfgFile
-    path: (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/omarchy/osk.json"
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    blockLoading: true
-    onLoaded: root.applyConfig(text())
-    onLoadFailed: root.applyConfig("")
-    onFileChanged: reload()
+  Process {
+    id: stateProc
+    command: ["/usr/bin/omarchy-shell", "ekollof.osk", "getState"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyConfig(text)
+    }
   }
 
   Process {
     id: layoutsProc
-    command: ["localectl", "list-x11-keymap-layouts"]
+    command: ["/usr/bin/localectl", "list-x11-keymap-layouts"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.setLayouts(text)
