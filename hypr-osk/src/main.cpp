@@ -70,6 +70,7 @@
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/LayerState.hpp>
+#include <hyprland/src/desktop/state/ViewState.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
@@ -1406,19 +1407,45 @@ static bool send_reply(int cfd, const char *msg)
     return sendAllDontWait(cfd, out.c_str(), out.size());
 }
 
-/* Main thread only. TEXT/KEY/MOD require this peer to own the mapped OSK layer. */
+/* Main thread only. TEXT/KEY/MOD require this peer to own the mapped OSK layer.
+ * Walk each monitor's layer lists (what hyprctl layers uses). Desktop::layerState
+ * is not the compositor's mapped-layer set. */
 static bool layerAllowsInject(pid_t pid)
 {
     if (pid <= 0)
         return false;
-    auto &st = Desktop::layerState();
-    if (!st)
-        return false;
-    for (const auto &ls : st->layers()) {
-        if (!ls || ls->m_namespace != "ekollof-osk" || !ls->m_mapped)
-            continue;
-        if (ls->getPID() == pid)
-            return true;
+
+    auto ownsMapped = [pid](const PHLLS &ls) -> bool {
+        if (!ls || ls->m_namespace != "ekollof-osk")
+            return false;
+        if (!ls->m_mapped)
+            return false;
+        return ls->getPID() == pid;
+    };
+
+    if (auto &ms = State::monitorState(); ms) {
+        for (const auto &mon : ms->monitors()) {
+            if (!mon)
+                continue;
+            for (auto &vec : mon->m_layerSurfaceLayers) {
+                for (auto &ref : vec) {
+                    if (ownsMapped(ref.lock()))
+                        return true;
+                }
+            }
+        }
+    }
+    if (auto &st = Desktop::layerState(); st) {
+        for (const auto &ls : st->layers()) {
+            if (ownsMapped(ls))
+                return true;
+        }
+    }
+    if (auto &vs = Desktop::viewState(); vs) {
+        for (const auto &ls : vs->layers()) {
+            if (ownsMapped(ls))
+                return true;
+        }
     }
     return false;
 }
@@ -1515,21 +1542,15 @@ static bool handle_line(int cfd, char *line)
     if (strcmp(line, "PING") == 0) {
         reply = "PONG";
     } else if (!strncmp(line, "KEY ", 4)) {
-        if (hidden()) {
-            reply = "err hidden";
-        } else {
-            cmd.type = SOskCommand::EType::KEY;
-            if (sscanf(line + 4, "%u %d", &cmd.a, &cmd.b) == 2) {
-                queueFromPeer(cfd, std::move(cmd));
-                reply = "ok";
-            } else
-                reply = "err bad args";
-        }
+        cmd.type = SOskCommand::EType::KEY;
+        if (sscanf(line + 4, "%u %d", &cmd.a, &cmd.b) == 2) {
+            queueFromPeer(cfd, std::move(cmd));
+            reply = hidden() ? "err hidden" : "ok";
+        } else
+            reply = "err bad args";
     } else if (!strncmp(line, "MOD ", 4)) {
         char name[16], state[8];
-        if (hidden()) {
-            reply = "err hidden";
-        } else if (sscanf(line + 4, "%15s %7s", name, state) != 2) {
+        if (sscanf(line + 4, "%15s %7s", name, state) != 2) {
             reply = "err bad args";
         } else {
             int found = -1;
@@ -1607,18 +1628,14 @@ static bool handle_line(int cfd, char *line)
         std::lock_guard<std::mutex> lg(g_gridMutex);
         reply = "grid " + (g_gridJson.empty() ? std::string("{\"rows\":[[],[],[],[]]}") : g_gridJson);
     } else if (!strncmp(line, "TEXT ", 5)) {
-        if (hidden()) {
-            reply = "err hidden";
-        } else {
-            cmd.type = SOskCommand::EType::TEXT;
-            size_t n = strlen(line + 5);
-            if (n > TEXT_CAP - 1) /* keep room for the NUL terminator */
-                n = TEXT_CAP - 1;
-            memcpy(cmd.text, line + 5, n);
-            cmd.text[n] = 0;
-            queueFromPeer(cfd, std::move(cmd));
-            reply = "ok";
-        }
+        cmd.type = SOskCommand::EType::TEXT;
+        size_t n = strlen(line + 5);
+        if (n > TEXT_CAP - 1)
+            n = TEXT_CAP - 1;
+        memcpy(cmd.text, line + 5, n);
+        cmd.text[n] = 0;
+        queueFromPeer(cfd, std::move(cmd));
+        reply = hidden() ? "err hidden" : "ok";
     } else if (!strncmp(line, "PMOVE ", 6) || !strncmp(line, "PBTN ", 5)) {
         reply = "err pointer disabled";
     } else if (!strncmp(line, "FLING ", 6)) {
