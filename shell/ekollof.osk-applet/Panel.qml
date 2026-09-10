@@ -40,10 +40,14 @@ Panel {
     return root.bar && root.bar.shell ? root.bar.shell : null
   }
 
+  // Third-party applets get a self-scoped pluginRegistry: isEnabled() is only
+  // true for this applet's own id. Asking about ekollof.osk always returns
+  // false, so the toggle showed "disabled" after every reload. Probe the
+  // overlay instead: if getState answers with JSON, the overlay is loaded.
   function refreshState() {
-    const shell = root.shellObj()
-    if (shell && shell.pluginRegistry && typeof shell.pluginRegistry.isEnabled === "function")
-      root.oskEnabled = shell.pluginRegistry.isEnabled(root.oskPluginId) === true
+    stateProc.gotState = false
+    stateProc.running = false
+    stateProc.running = true
   }
 
   function setOskEnabled(on) {
@@ -108,11 +112,11 @@ Panel {
     root.layouts = list.length > 0 ? list : ["us"]
   }
 
+  Component.onCompleted: refreshState()
+
   onOpenedChanged: {
     if (opened) {
       refreshState()
-      stateProc.running = false
-      stateProc.running = true
       if (root.layouts.length === 0)
         layoutsProc.running = true
     }
@@ -532,10 +536,23 @@ Panel {
 
   Process {
     id: stateProc
+    property bool gotState: false
     command: ["/usr/bin/omarchy-shell", "ekollof.osk", "getState"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyConfig(text)
+      onStreamFinished: {
+        const raw = String(text || "").trim()
+        stateProc.gotState = raw.charAt(0) === "{"
+        if (stateProc.gotState) {
+          root.oskEnabled = true
+          root.applyConfig(raw)
+        }
+      }
+    }
+    onExited: function() {
+      if (!stateProc.gotState)
+        root.oskEnabled = false
+      stateProc.gotState = false
     }
   }
 
