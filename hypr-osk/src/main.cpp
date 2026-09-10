@@ -61,6 +61,25 @@
  * Commands are queued from the socket thread and executed on the
  * compositor main thread via an EventLoop timer.
  */
+/* Pull signal deps with normal access, then re-open CSignalBase so PLUGIN_EXIT
+ * can unregister listenStatic handlers (they run after every regular plugin
+ * listener). */
+#include <functional>
+#include <any>
+#include <type_traits>
+#include <utility>
+#include <vector>
+#include <memory>
+#include <tuple>
+#include <hyprutils/memory/SharedPtr.hpp>
+#include <hyprutils/memory/WeakPtr.hpp>
+#include <hyprutils/signal/Listener.hpp>
+#define private public
+#define protected public
+#include <hyprutils/signal/Signal.hpp>
+#undef private
+#undef protected
+
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
@@ -793,6 +812,7 @@ static void applyTouches(); /* deferred: all compositor mutations happen here */
 static bool layerAllowsInject(pid_t pid);
 static void refreshIntendedShell();
 static bool intendedShellAllows(pid_t pid);
+static void bindTouchHooks();
 
 /* plugin-owned one-shot timer: unlike doLater (whose queued lambdas fire even
  * after dlclose — that crashed the compositor on unload), this stays
@@ -1143,9 +1163,26 @@ static void touchMotion(ITouch::SMotionEvent ev, Event::SCallbackInfo &info)
     scheduleApply();
 }
 
+/* Drop a native wl_touch sequence that leaked past the bus (another plugin
+ * can assign cancelled=false after us). Seat cancel + clear Hyprland's touch
+ * focus so later motion/up have nothing to deliver. Pointer emulation is
+ * the only stream while swallowing. */
+static void dropNativeTouch()
+{
+    if (!g_pSeatManager || !g_pInputManager)
+        return;
+    g_pSeatManager->sendTouchCancel();
+    g_pInputManager->m_touchData.touchFocusLockSurface.reset();
+    g_pInputManager->m_touchData.touchFocusWindow.reset();
+    g_pInputManager->m_touchData.touchFocusLS.reset();
+    g_pInputManager->m_touchData.touchFocusSurface.reset();
+}
+
 /* ---------------- deferred application (idle phase, main thread) ---------- */
 static void applyTouches()
 {
+    if (touch_swallow)
+        dropNativeTouch();
     panel_rect_valid = (panel_nw > 0 && panel_nh > 0 && layerAllowsInject(g_panelPid));
     g_panelVisible.store(panel_rect_valid, std::memory_order_release);
 
@@ -2259,15 +2296,40 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
 
+static void unbindTouchHooks()
+{
+    auto drop = [](auto &sig, Hyprutils::Signal::CHyprSignalListener &slot) {
+        if (!slot)
+            return;
+        std::erase_if(sig.m_vStaticListeners, [&](const auto &sp) { return sp.get() == slot.get(); });
+        slot.reset();
+    };
+    if (!Event::bus())
+        return;
+    auto &t = Event::bus()->m_events.input.touch;
+    drop(t.down, g_touchDownHook);
+    drop(t.up, g_touchUpHook);
+    drop(t.motion, g_touchMoveHook);
+}
+
+static void bindTouchHooks()
+{
+    /* listenStatic runs after every regular listener. hyprgrass uses listen()
+     * and writes cancelled=false for a 1-finger tap; we must run after that
+     * and set cancelled=true or Hyprland will send native wl_touch on top of
+     * the virtual pointer. */
+    unbindTouchHooks();
+    auto &t = Event::bus()->m_events.input.touch;
+    t.down.listenStatic([](ITouch::SDownEvent ev, Event::SCallbackInfo &info) { touchDown(ev, info); });
+    g_touchDownHook = t.down.m_vStaticListeners.back();
+    t.up.listenStatic([](ITouch::SUpEvent ev, Event::SCallbackInfo &info) { touchUp(ev, info); });
+    g_touchUpHook = t.up.m_vStaticListeners.back();
+    t.motion.listenStatic([](ITouch::SMotionEvent ev, Event::SCallbackInfo &info) { touchMotion(ev, info); });
+    g_touchMoveHook = t.motion.m_vStaticListeners.back();
+}
+
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     PHANDLE = handle;
-
-    g_touchDownHook = Event::bus()->m_events.input.touch.down.listen(
-        [](ITouch::SDownEvent ev, Event::SCallbackInfo &info) { touchDown(ev, info); });
-    g_touchUpHook = Event::bus()->m_events.input.touch.up.listen(
-        [](ITouch::SUpEvent ev, Event::SCallbackInfo &info) { touchUp(ev, info); });
-    g_touchMoveHook = Event::bus()->m_events.input.touch.motion.listen(
-        [](ITouch::SMotionEvent ev, Event::SCallbackInfo &info) { touchMotion(ev, info); });
 
     /* register the synthetic keyboard device — with a keymap FIRST: seat
      * paths throw for a keyboard device without one */
@@ -2326,12 +2388,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     traceGeom(std::string("plugin init, swallow=") + (touch_swallow ? "on" : "off"));
     refreshIntendedShell();
     g_socketThread = std::thread(socket_thread_fn, socketPath());
+    bindTouchHooks();
 
     Log::logger->log(Log::INFO, "[hypr-osk] plugin initialized, socket at " + socketPath());
     return {"hypr-osk", "On-screen keyboard: touch->pointer + keyboard synthesis", "ekollof", "0.1.0"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    unbindTouchHooks();
     /* stop the socket thread and join it BEFORE the .so is unmapped: the
      * thread's code lives in this library */
     g_socketRunning = false;
@@ -2360,10 +2424,6 @@ APICALL EXPORT void PLUGIN_EXIT() {
         close(g_drainEventFd);
         g_drainEventFd = -1;
     }
-    /* disconnect the bus listeners: their lambdas also live in this library */
-    g_touchDownHook.reset();
-    g_touchUpHook.reset();
-    g_touchMoveHook.reset();
     /* fully remove timers from the manager's list: a cancelled timer alone
      * still sits in that list, and the idle purge deletes it later — after
      * dlclose that ran into unmapped plugin code and crashed the compositor */
