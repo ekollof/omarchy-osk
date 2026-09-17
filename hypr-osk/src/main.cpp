@@ -2423,6 +2423,9 @@ static void padThreadFn()
             if (pr <= 0 || !(pfds[0].revents & POLLIN)) {
                 if (pr < 0 && errno != EINTR)
                     alive = false;
+                else if (pr > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)))
+                    alive = false; /* unplugged: poll reports ERR, not readable —
+                                      without this the thread busy-spins here forever */
                 continue;
             }
             ssize_t n;
@@ -2580,6 +2583,8 @@ static void padThreadFn()
          * holds, or keys/buttons stay stuck — a release that happens while
          * unplugged would otherwise never reach the seat. Duplicate
          * releases after a clean lift are harmless. */
+        if (!alive)
+            traceGeom("gamepad: device lost, rescanning");
         for (unsigned k : padKeys)
             padQueue(SOskCommand::EType::PADKEY, (int)k, 0);
         padKeys.clear();
