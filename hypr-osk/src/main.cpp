@@ -2409,6 +2409,7 @@ static void padThreadFn()
         bool     lastRT    = false, lastLT = false, lastLpadClick = false;
         bool     lastNavMode = false;
         int      lastNavDirs = 0; /* bit0=up bit1=down bit2=left bit3=right */
+        std::set<unsigned> padKeys; /* evdev codes the pad currently holds */
         int16_t  lastPX = 0, lastPY = 0;
         bool     padWasTouched = false;
         struct pollfd pfds[2]{{fd, POLLIN, 0}, {g_padPipe[0], POLLIN, 0}};
@@ -2457,8 +2458,13 @@ static void padThreadFn()
                         int press = (btn & k.bit) ? 1 : 0;
                         if (navMode && k.nav >= 0)
                             padQueue(SOskCommand::EType::PADNAV, k.nav, press);
-                        else
+                        else {
                             padQueue(SOskCommand::EType::PADKEY, (int)k.evdev, press);
+                            if (press)
+                                padKeys.insert(k.evdev);
+                            else
+                                padKeys.erase(k.evdev);
+                        }
                     }
                     /* right-pad click → left button (edges give press+release).
                      * Left-pad click arrives via the STATUS byte, below. */
@@ -2569,6 +2575,21 @@ static void padThreadFn()
                 alive = false; /* unplugged: rescan */
             if (n == 0)
                 alive = false;
+        }
+        /* device lost (or thread exiting): release everything the pad path
+         * holds, or keys/buttons stay stuck — a release that happens while
+         * unplugged would otherwise never reach the seat. Duplicate
+         * releases after a clean lift are harmless. */
+        for (unsigned k : padKeys)
+            padQueue(SOskCommand::EType::PADKEY, (int)k, 0);
+        padKeys.clear();
+        if (lastRT)
+            padQueue(SOskCommand::EType::PADPTR, BTN_LEFT, 0);
+        if (lastLT || lastLpadClick)
+            padQueue(SOskCommand::EType::PADPTR, BTN_RIGHT, 0);
+        for (int i = 0; i < 4; i++) {
+            if (lastNavDirs & (1 << i))
+                padQueue(SOskCommand::EType::PADNAV, i, 0);
         }
         for (int i = 0; i < ngrabbed; i++) {
             ioctl(grabbed[i], EVIOCGRAB, (void *)0);
