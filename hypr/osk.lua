@@ -4,6 +4,15 @@
 -- bar applet. Installed by ~/src/omarchy-osk/install.sh; edit the bundle, not
 -- this file.
 
+-- Gamepad prototype (Steam Controller 2026): right pad = mouse, left stick
+-- = scroll, triggers/pad clicks = buttons, GUIDE = OSK toggle, START =
+-- Omarchy menu. Requires HYPR_OSK_GAMEPAD=1 in the compositor environment
+-- (read once at plugin load). Quit Steam while testing: it reads the same
+-- hidraw reports in parallel. Tune motion with HYPR_OSK_PAD_GAIN.
+hl.env("HYPR_OSK_GAMEPAD", "1")
+-- hl.env("HYPR_OSK_PAD_GAIN", "1.0")
+hl.env("HYPR_OSK_TRACE", "1")
+
 -- Load the compositor plugin if built and not already loaded. Candidates:
 -- install.sh's flat deploy first, then hyprpm's store (hyprpm.toml route;
 -- hyprpm renames the build output to <name>.so under /var/cache/hyprpm on

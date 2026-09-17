@@ -51,6 +51,13 @@ Item {
   property var grid: null             // letter grid from the plugin (ROWS)
   property string touchMonitor: ""    // monitor with the touch surface (plugin MON reply)
 
+  // Gamepad grid navigation (Steam-like typing): the plugin routes pad
+  // buttons to `nav <action> <1|0>` lines while the panel is visible.
+  property bool navActive: false
+  property int navRow: 2
+  property int navCol: 6
+  property var navHeld: ({})          // action -> true while its direction is held
+
   readonly property real unit: (panel.width - Style.space(8) * 2) / 15.0 // widest row (home row)
   readonly property int keyH: Style.space(46)
   readonly property int panelH: rowsCol.implicitHeight + Style.space(8) * 2
@@ -70,8 +77,17 @@ Item {
 
   function show() {
     root.opened = true
+    root.navActive = true
+    root.navRow = 2
+    root.navCol = 6
+    root.clampNav()
     send("MON") // re-check which screen carries the touch surface
     syncPanel()
+    // The layer surface maps asynchronously after we show; a PANEL that
+    // lands first finds no mapped ekollof-osk layer, so the plugin gates
+    // TEXT/KEY/nav as hidden and nothing re-sends. Re-publish once the
+    // map has had time to complete (one-shot: zero steady-state cost).
+    panelResync.restart()
   }
 
   function hide() {
@@ -79,6 +95,9 @@ Item {
     root.shift = false
     root.capsLock = false
     stopRepeat()
+    root.navActive = false
+    root.navHeld = {}
+    navTimer.stop()
     for (const m in root.stickyMods)
       root.stickyMods[m] = false
     root.stickyModsChanged()
@@ -93,6 +112,7 @@ Item {
       // entering a layer drops one-shot shift, keeps sticky mods
       root.shift = false
     }
+    root.clampNav()
   }
 
   function syncPanel() {
@@ -389,9 +409,13 @@ Item {
     if (line.indexOf("grid ") === 0) {
       try {
         root.grid = JSON.parse(line.substring(5))
+        root.clampNav()
       } catch (e) {
         console.warn("[ekollof.osk] bad grid reply: " + e)
       }
+    } else if (line.indexOf("nav ") === 0) {
+      const p = line.split(/\s+/)
+      root.navEvent(p[1] || "", p[2] === "1")
     } else if (line.indexOf("mon ") === 0) {
       // "mon <name> x y w h" — the monitor whose frame touch ev.pos is
       // normalized against; dock the keyboard there
@@ -436,6 +460,17 @@ Item {
     running: root.cfgLoaded && (!root.announced || !connected())
     repeat: true
     onTriggered: root.announce()
+  }
+
+  // One-shot delayed PANEL re-publish after show(): the layer surface maps
+  // asynchronously, and a pre-map PANEL leaves the plugin gating us hidden.
+  Timer {
+    id: panelResync
+    interval: 800
+    onTriggered: {
+      if (root.opened)
+        root.syncPanel()
+    }
   }
 
   Timer {
@@ -595,6 +630,101 @@ Item {
     }
   }
 
+  // ---- gamepad grid navigation --------------------------------------------
+  // Highlight-committed typing: D-pad / left stick move, A commits, X =
+  // backspace, Y = space, B closes. Movement repeats while held (navTimer);
+  // commits reuse activate() + the hold-repeat machinery with no key item.
+
+  function navRows() {
+    return KeyboardLayout.rows(root.currentLayer, root.grid)
+  }
+
+  function clampNav() {
+    const rows = root.navRows()
+    if (!rows.length)
+      return
+    root.navRow = Math.min(Math.max(0, root.navRow), rows.length - 1)
+    const cols = rows[root.navRow].length
+    root.navCol = cols ? Math.min(Math.max(0, root.navCol), cols - 1) : 0
+  }
+
+  function navStep(dx, dy) {
+    if (!root.opened)
+      return
+    const rows = root.navRows()
+    if (!rows.length)
+      return
+    root.navRow = Math.min(Math.max(0, root.navRow + dy), rows.length - 1)
+    const cols = rows[root.navRow].length
+    root.navCol = cols ? Math.min(Math.max(0, root.navCol + dx), cols - 1) : 0
+  }
+
+  function navCommitKey() {
+    const rows = root.navRows()
+    if (!rows.length || !rows[root.navRow])
+      return null
+    return rows[root.navRow][root.navCol] || null
+  }
+
+  function navEvent(action, press) {
+    if (!root.opened || !root.navActive)
+      return
+    const dirs = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] }
+    if (action in dirs) {
+      if (press) {
+        const d = dirs[action]
+        root.navStep(d[0], d[1])
+        root.navHeld[action] = true
+        root.navHeldChanged()
+        navTimer.interval = Math.max(100, root.repeatDelay)
+        navTimer.restart()
+      } else {
+        delete root.navHeld[action]
+        root.navHeldChanged()
+        if (!Object.keys(root.navHeld).length)
+          navTimer.stop()
+      }
+      return
+    }
+    if (!press)
+      { if (action === "commit" || action === "back" || action === "space") root.stopRepeat(); return }
+    if (action === "commit") {
+      const k = root.navCommitKey()
+      if (k && (k.t === "char" || k.t === "code")) {
+        root.startRepeat(k, null)
+        root.activate(k)
+      } else if (k) {
+        root.activate(k) // mods / shift / caps / layers toggle, no repeat
+      }
+    } else if (action === "back") {
+      const k = { t: "code", c: 14 }
+      root.startRepeat(k, null)
+      root.activate(k)
+    } else if (action === "space") {
+      const k = { t: "code", c: 57 }
+      root.startRepeat(k, null)
+      root.activate(k)
+    } else if (action === "close") {
+      root.close()
+    }
+  }
+
+  Timer {
+    id: navTimer
+    interval: 400
+    repeat: true
+    onTriggered: {
+      interval = Math.max(15, root.repeatInterval)
+      const dirs = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] }
+      for (const a in root.navHeld) {
+        if (dirs[a])
+          root.navStep(dirs[a][0], dirs[a][1])
+      }
+      if (!Object.keys(root.navHeld).length)
+        navTimer.stop()
+    }
+  }
+
   // ---- window ------------------------------------------------------------
   PanelWindow {
     id: panel
@@ -635,10 +765,11 @@ Item {
         Repeater {
           model: KeyboardLayout.rows(root.currentLayer, root.grid)
 
-          Row {
-            id: keyRow
-            required property var modelData
-            spacing: Style.space(3)
+            Row {
+              id: keyRow
+              required property var modelData
+              required property int index
+              spacing: Style.space(3)
 
             // per-row unit: every row flexes to span the panel width exactly,
             // gaps included (rows differ in key count and width units)
@@ -657,10 +788,13 @@ Item {
               Rectangle {
                 id: key
                 required property var modelData
+                required property int index
                 property bool keyDown: false
                 property bool repeatFired: false // hold-repeat owned this press; suppress the tap
                 readonly property bool upper: root.shift || root.capsLock
-                readonly property bool active: keyDown ||
+                readonly property bool navHere: root.navActive && root.opened &&
+                                                 keyRow.index === root.navRow && index === root.navCol
+                readonly property bool active: keyDown || navHere ||
                                                (modelData.t === "shift" && root.shift) ||
                                                (modelData.t === "caps" && root.capsLock) ||
                                                (modelData.t === "mod" && root.stickyMods[modelData.m])
@@ -711,7 +845,7 @@ Item {
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
   Component.onCompleted: {
-    console.log("[ekollof.osk] loaded rev15 layout=" + root.layout + " cfg=" + root.cfgPath())
+    console.log("[ekollof.osk] loaded rev19 layout=" + root.layout + " cfg=" + root.cfgPath())
     const helper = root.jsonHelper()
     if (!helper) {
       root.applyConfig("")

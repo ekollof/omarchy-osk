@@ -60,6 +60,34 @@
  *
  * Commands are queued from the socket thread and executed on the
  * compositor main thread via an EventLoop timer.
+ *
+ * Gamepad prototype (Steam Controller 2026, "Puck"): off unless
+ * HYPR_OSK_GAMEPAD=1 is set in the compositor's environment. A reader
+ * thread opens the pad's hidraw node directly (VID 28de, PID 1302/1304),
+ * parses report 0x42 (wire layout from s3govesus/steam-controller-x
+ * crates/sc-protocol/src/report.rs — the only public decode of this
+ * hardware: buttons = bytes 2..4 bitmask, left stick i16le @10/12, right
+ * pad i16le @24/26, triggers u16le @6/8) and drives the same
+ * in-compositor primitives as touch: right pad → relative cursor motion,
+ * right-pad click / right trigger → left button, left pad click / left
+ * trigger → right button, left stick → scroll, face buttons/D-pad → keys,
+ * GUIDE → SUPER+SHIFT+K chord (OSK toggle), START → SUPER+SPACE chord
+ * (Omarchy menu). Chords go through execKey on the synthetic keyboard so
+ * real compositor keybinds fire — no new IPC needed. Pad input is trusted
+ * local hardware (like touch): no shell/visibility gate.
+ * Steam-like typing: while the OSK panel is visible the reader routes
+ * D-pad / A / X / Y / B and the left stick to unsolicited `nav <action>
+ * <1|0>` socket lines (action = up|down|left|right|commit|back|space|close)
+ * instead of desktop keys/scroll, and the QML owns the highlight, repeat
+ * and commit path. Hidden panel = desktop behavior, unchanged.
+ * Caveats: hidraw has no exclusive open — a running Steam client reads the
+ * same reports and acts on its own (mis)parse in parallel, so quit Steam
+ * (or silence its desktop config) while testing. The kernel's
+ * hid-generic phantom mouse/keyboard nodes for the pad are EVIOCGRABbed
+ * while gamepad mode holds the device so lizard-mode events don't double
+ * with the synthetic ones. Sign conventions (pad Y, stick rest) are
+ * calibrated live — see STATS padbtn/padraw. Tune motion with
+ * HYPR_OSK_PAD_GAIN (default 1.0).
  */
 /* Pull signal deps with normal access, then re-open CSignalBase so PLUGIN_EXIT
  * can unregister listenStatic handlers (they run after every regular plugin
@@ -89,6 +117,7 @@
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
 #include <hyprland/src/pointer/PointerController.hpp>
+#include <hyprland/src/devices/IPointer.hpp>
 #include <hyprland/src/devices/ITouch.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
@@ -146,6 +175,7 @@ static int oskPidfdSendSignal(int fd, int sig)
 #include <linux/limits.h>
 #include <linux/input-event-codes.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 
 using namespace Hyprutils::Math;
 
@@ -164,7 +194,8 @@ static int    debug   = 1;
  * corrupt under event-loop reentrancy (the crash mechanism). TEXT is
  * bounded to 95 bytes. */
 struct SOskCommand {
-    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, POINTER, SCROLL, SWALLOW, PANEL } type;
+    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, POINTER, SCROLL, SWALLOW, PANEL,
+                                 PADKEY, PADPTR, PADCHORD, PADWAKE, PADNAV, MONREFRESH } type;
     int   a = 0, b = 0;
     pid_t pid           = 0; /* SO_PEERCRED pid stamped at queue time */
     float panel[4]      = {0, 0, 0, 0}; /* PANEL nx ny nw nh */
@@ -185,6 +216,10 @@ static std::atomic<pid_t> g_shellPid{0};
 static int               g_wakePipe[2] = {-1, -1}; /* self-pipe: wakes the socket thread's polls */
 static int               g_drainEventFd = -1;      /* eventfd: socket thread → compositor loop */
 static wl_event_source  *g_drainEventSource = nullptr;
+/* gamepad prototype state (defined in the gamepad section below; declared
+ * here because publishStats/STATS read them) */
+static std::atomic<bool> g_padActive{false};
+static std::atomic<uint32_t> g_padButtons{0};
 
 static void wakeDrain();
 
@@ -761,6 +796,8 @@ static SMonSnap   g_monSnap;
 struct SStatsSnap {
     int      fingers = 0, pressed = 0, ignore = 0, scroll = 0, down = 0, up = 0;
     int      contact = 0, panel_valid = 0, inject = 0, anypeer = 0, swallow = 0, indrain = 0;
+    int      pad = 0;
+    uint32_t padbtn = 0;
     unsigned fires     = 0;
     size_t   ring      = 0;
     size_t   textmap   = 0;
@@ -785,6 +822,8 @@ static void publishStats()
     s.anypeer     = 0; /* remote pointer injection is not available */
     s.swallow     = (int)touch_swallow;
     s.indrain     = (int)g_inDrain;
+    s.pad         = (int)g_padActive.load(std::memory_order_relaxed);
+    s.padbtn      = g_padButtons.load(std::memory_order_relaxed);
     s.fires       = g_drain_fires;
     s.panel_ny    = panel_ny;
     s.panel_nh    = panel_nh;
@@ -839,10 +878,16 @@ static void scheduleApply()
 
 static SP<Monitor::CMonitor> resolveTouchMonitor()
 {
+    /* Touch docking wins while a touch device is bound (tap coordinates are
+     * normalized against that device's frame, so the panel rect must live in
+     * the same frame). Otherwise the OSK follows the pointer — the screen
+     * the controller/mouse user is actually looking at. */
     auto mon = State::monitorState()
                    ->query()
                    .name(!touchDeviceOutput.empty() ? touchDeviceOutput : "")
                    .run();
+    if (!mon && g_pInputManager)
+        mon = State::monitorState()->query().vec(g_pInputManager->getMouseCoordsInternal()).run();
     if (!mon)
         mon = Desktop::focusState()->monitor();
     SMonSnap snap{};
@@ -859,6 +904,25 @@ static SP<Monitor::CMonitor> resolveTouchMonitor()
         g_monSnap = snap;
     }
     return mon;
+}
+
+/* main thread only: refresh the MON snapshot and push it to the client
+ * (the QML re-docks + re-PANELs on a changed monitor name) */
+static std::string g_monPushedFor;
+static void pushMon()
+{
+    SP<Monitor::CMonitor> mon = resolveTouchMonitor();
+    SMonSnap snap{};
+    {
+        std::lock_guard<std::mutex> lg(g_monMutex);
+        snap = g_monSnap;
+    }
+    if (mon && snap.valid) {
+        char buf[160];
+        snprintf(buf, sizeof buf, "mon %s %d %d %d %d", snap.name, snap.x, snap.y, snap.w, snap.h);
+        sendToClient(buf);
+        g_monPushedFor = touchDeviceOutput;
+    }
 }
 
 /* center + distance of the two live contacts (scroll/pinch geometry).
@@ -1467,6 +1531,11 @@ static void applyTouches()
         pinch_prev_d     = d;
         pinch_prev_valid = true;
     }
+    if (touchDeviceOutput != g_monPushedFor) {
+        /* touch bound (or re-bound) a device: re-dock the panel to its
+         * frame so taps land — the QML re-PANELs on a changed mon name */
+        pushMon();
+    }
     publishStats();
 }
 
@@ -1890,33 +1959,30 @@ static bool handle_line(int cfd, char *line)
         } else
             reply = "err bad args";
     } else if (!strcmp(line, "MON")) {
-        /* MON — reply from the main-thread snapshot (never call into
-         * monitor/input code from this thread) */
-        SMonSnap snap;
-        {
-            std::lock_guard<std::mutex> lg(g_monMutex);
-            snap = g_monSnap;
-        }
-        if (snap.valid) {
-            char buf[160];
-            snprintf(buf, sizeof buf, "mon %s %d %d %d %d", snap.name, snap.x, snap.y, snap.w, snap.h);
-            reply = buf;
-        } else
-            reply = "err no monitor";
+        /* MON — answered deterministically: refresh on the main thread and
+         * push `mon ...` (never serve the possibly-stale snapshot here).
+         * The direct reply is just "ok"; the QML handles the push. */
+        SOskCommand mc;
+        mc.type = SOskCommand::EType::MONREFRESH;
+        mc.pid  = 0;
+        queueCommand(mc);
+        reply = "ok";
     } else if (!strcmp(line, "STATS")) {
         SStatsSnap s;
         {
             std::lock_guard<std::mutex> lg(g_statsMutex);
             s = g_statsSnap;
         }
-        char buf[320];
+        char buf[384];
         snprintf(buf, sizeof buf,
                  "state fingers=%d pressed=%d ignore=%d scroll=%d down=%d up=%d contact_osk=%d "
                  "panel_valid=%d inject=%d anypeer=%d panel_ny=%.3f panel_nh=%.3f last=%.3f,%.3f "
-                 "fires=%u ring=%zu indrain=%d layout=%s textmap=%zu fling=%.0fms/%.0fpx swallow=%d",
-                 s.fingers, s.pressed, s.ignore, s.scroll, s.down, s.up, s.contact, s.panel_valid,
-                 s.inject, s.anypeer, s.panel_ny, s.panel_nh, s.lastx, s.lasty, s.fires,
-                 s.ring, s.indrain, s.layout, s.textmap, s.fling_tau_ms, s.fling_cap, s.swallow);
+                 "fires=%u ring=%zu indrain=%d layout=%s textmap=%zu fling=%.0fms/%.0fpx swallow=%d "
+                 "pad=%d padbtn=%06x",
+                  s.fingers, s.pressed, s.ignore, s.scroll, s.down, s.up, s.contact, s.panel_valid,
+                  s.inject, s.anypeer, s.panel_ny, s.panel_nh, s.lastx, s.lasty, s.fires,
+                  s.ring, s.indrain, s.layout, s.textmap, s.fling_tau_ms, s.fling_cap, s.swallow,
+                  s.pad, s.padbtn);
         reply = buf;
     } else if (!strncmp(line, "CALIB", 5)) {
         reply = "ok"; /* accepted for protocol compatibility; the frame comes from the compositor */
@@ -2117,6 +2183,422 @@ static void socket_thread_fn(std::string path)
     unlink(path.c_str());
 }
 
+/* ---------------- gamepad (Steam Controller 2026 prototype) ----------------
+ * Reader thread, main-thread application. The reader NEVER calls compositor
+ * APIs: button edges go through the command ring (wakeDrain), motion/scroll
+ * accumulate in atomics and are consumed by a single coalesced PADWAKE per
+ * drain (270 Hz reports must not flood the 64-slot ring). Teardown mirrors
+ * the socket thread: flag + wake pipe → join in PLUGIN_EXIT before unmap;
+ * no event-loop timers of its own, so nothing extra to remove there. */
+static std::thread       g_padThread;
+static std::atomic<bool> g_padRunning{false};
+/* g_padActive/g_padButtons are declared near the top (STATS reads them) */
+static int               g_padPipe[2] = {-1, -1};
+static std::atomic<double> g_padDX{0}, g_padDY{0}, g_padSX{0}, g_padSY{0};
+static std::atomic<bool> g_padWakePending{false};
+static double            g_padGain = 1.0;
+
+#ifndef EVIOCGNAME_256
+#define EVIOCGNAME_256 0x80804506
+#endif
+#ifndef EVIOCGRAB
+#define EVIOCGRAB 0x40044590
+#endif
+
+/* report 0x42 offsets (s3govesus/steam-controller-x sc-protocol report.rs) */
+#define PAD_LEN_MIN 46
+#define PAD_B0 2
+#define PAD_STATUS 5
+#define PAD_LTRIG 6
+#define PAD_RTRIG 8
+#define PAD_LSTICK_X 10
+#define PAD_LSTICK_Y 12
+#define PAD_RSTICK_X 14
+#define PAD_RSTICK_Y 16
+#define PAD_RPAD_X 24
+#define PAD_RPAD_Y 26
+/* button bits over bytes 2..4 */
+#define PB_A (1u << 0)
+#define PB_B (1u << 1)
+#define PB_X (1u << 2)
+#define PB_Y (1u << 3)
+#define PB_START (1u << 6)
+#define PB_RT_LOWER (1u << 8)
+#define PB_DPAD_DOWN (1u << 10)
+#define PB_DPAD_RIGHT (1u << 11)
+#define PB_DPAD_LEFT (1u << 12)
+#define PB_DPAD_UP (1u << 13)
+#define PB_BACK (1u << 14)
+#define PB_GUIDE (1u << 16)
+#define PB_RPAD_TOUCH (1u << 21)
+#define PB_RPAD_CLICK (1u << 22)
+/* NB: raw byte4 bit 0x80 (mask position 1u<<23) is the trigger bottom-out
+ * click, NOT a pad button — it must be masked out of the button word (a
+ * full RT pull sets it, which used to alias to a right-click). The real
+ * left-pad click arrives via the STATUS byte (offset 5) bit 0x04. */
+#define PB_LPAD_CLICK_STATUS 0x04
+
+static void padQueue(SOskCommand::EType t, int a, int b)
+{
+    SOskCommand c;
+    c.type = t;
+    c.a    = a;
+    c.b    = b;
+    c.pid  = 0; /* trusted hardware input: drain must not apply the shell gate */
+    queueCommand(c);
+}
+
+static void padWake()
+{
+    /* coalesce: at most one PADWAKE in flight; the drain consumes whatever
+     * accumulated since the last one */
+    if (!g_padWakePending.exchange(true))
+        padQueue(SOskCommand::EType::PADWAKE, 0, 0);
+}
+
+static int padOpenStreamer()
+{
+    /* find hidraw nodes for the pad (VID 28de, wired 1302 / puck 1304) and
+     * keep the first interface that actually streams report 0x42 — over the
+     * puck only the paired/awake channel talks, the rest stay silent */
+    for (int i = 0; i < 32; i++) {
+        char node[64], uevent[128];
+        snprintf(node, sizeof node, "/dev/hidraw%d", i);
+        snprintf(uevent, sizeof uevent, "/sys/class/hidraw/hidraw%d/device/uevent", i);
+        std::ifstream f(uevent);
+        if (!f.good())
+            continue;
+        std::string txt((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (txt.find("28DE") == std::string::npos && txt.find("28de") == std::string::npos)
+            continue;
+        if (txt.find("1304") == std::string::npos && txt.find("1302") == std::string::npos)
+            continue;
+        int fd = open(node, O_RDONLY | O_NONBLOCK);
+        if (fd < 0)
+            continue;
+        struct pollfd pfd{fd, POLLIN, 0};
+        bool streams = false;
+        if (poll(&pfd, 1, 300) > 0 && (pfd.revents & POLLIN)) {
+            unsigned char probe[64];
+            ssize_t n = read(fd, probe, sizeof probe);
+            if (n >= 2 && probe[0] == 0x42)
+                streams = true;
+            /* drain any backlog from the probe window */
+            while (n > 0) {
+                n = read(fd, probe, sizeof probe);
+            }
+        }
+        if (streams)
+            return fd;
+        close(fd);
+    }
+    return -1;
+}
+
+static void padGrabPhantoms(int *held, int *nheld)
+{
+    /* EVIOCGRAB the kernel hid-generic phantom mouse/keyboard nodes so
+     * lizard-mode events don't double with the synthetic ones. Best effort:
+     * held fds keep the grab alive; released on thread exit. */
+    *nheld = 0;
+    for (int i = 0; i < 64 && *nheld < 16; i++) {
+        char node[64];
+        snprintf(node, sizeof node, "/dev/input/event%d", i);
+        int fd = open(node, O_RDWR | O_NONBLOCK);
+        if (fd < 0)
+            continue;
+        char name[256] = {0};
+        if (ioctl(fd, EVIOCGNAME_256, name) < 0) {
+            close(fd);
+            continue;
+        }
+        if (!strstr(name, "Puck") && !strstr(name, "Steam Controller")) {
+            close(fd);
+            continue;
+        }
+        if (ioctl(fd, EVIOCGRAB, (void *)1) == 0)
+            held[(*nheld)++] = fd;
+        else
+            close(fd);
+    }
+}
+
+static bool padSteamRunning()
+{
+    /* hidraw is non-exclusive: a running Steam client consumes the same
+     * reports and acts on its own parse in parallel. Warn once. */
+    for (int pid = 1; pid < 1 << 22; pid++) {
+        char link[64], exe[256];
+        snprintf(link, sizeof link, "/proc/%d/exe", pid);
+        ssize_t n = readlink(link, exe, sizeof exe - 1);
+        if (n <= 0) {
+            if (pid > 60000)
+                break;
+            continue;
+        }
+        exe[n] = 0;
+        const char *base = strrchr(exe, '/');
+        base             = base ? base + 1 : exe;
+        if (!strcmp(base, "steam") || !strcmp(base, ".steam-wrapped"))
+            return true;
+        if (pid > 200000)
+            break;
+    }
+    return false;
+}
+
+static int16_t padI16(const unsigned char *r, int off)
+{
+    return (int16_t)((uint16_t)r[off] | ((uint16_t)r[off + 1] << 8));
+}
+
+static uint16_t padU16(const unsigned char *r, int off)
+{
+    return (uint16_t)r[off] | ((uint16_t)r[off + 1] << 8);
+}
+
+static void padThreadFn()
+{
+    if (padSteamRunning())
+        traceGeom("gamepad: steam running, hidraw reports shared with the client");
+    int grabbed[16], ngrabbed = 0;
+    unsigned char report[128];
+    while (g_padRunning) {
+        int fd = padOpenStreamer();
+        if (fd < 0) {
+            /* nothing streaming: sleep until woken (exit) or 1 s (rescan) */
+            struct pollfd pfd{g_padPipe[0], POLLIN, 0};
+            poll(&pfd, 1, 1000);
+            /* drain the pipe */
+            char b;
+            while (read(g_padPipe[0], &b, 1) > 0) {}
+            continue;
+        }
+        g_padActive = true;
+        padGrabPhantoms(grabbed, &ngrabbed);
+        traceGeom("gamepad: streaming hidraw open, phantoms grabbed=" + std::to_string(ngrabbed));
+        /* sticks don't rest at exactly 0 (observed ~±500 on this unit):
+         * average the first 30 reports as the rest center so a centered
+         * stick never drifts the cursor */
+        double restLX = 0, restLY = 0, restRX = 0, restRY = 0;
+        {
+            long accLX = 0, accLY = 0, accRX = 0, accRY = 0;
+            int got = 0;
+            unsigned char calm[128];
+            struct pollfd cpfd{fd, POLLIN, 0};
+            while (got < 30 && g_padRunning) {
+                if (poll(&cpfd, 1, 500) <= 0 || !(cpfd.revents & POLLIN))
+                    break;
+                ssize_t cn = read(fd, calm, sizeof calm);
+                if (cn < PAD_LEN_MIN || calm[0] != 0x42)
+                    continue;
+                accLX += padI16(calm, PAD_LSTICK_X);
+                accLY += padI16(calm, PAD_LSTICK_Y);
+                accRX += padI16(calm, PAD_RSTICK_X);
+                accRY += padI16(calm, PAD_RSTICK_Y);
+                got++;
+            }
+            if (got > 0) {
+                restLX = (double)accLX / got;
+                restLY = (double)accLY / got;
+                restRX = (double)accRX / got;
+                restRY = (double)accRY / got;
+            }
+        }
+        uint32_t lastBtn   = 0;
+        bool     lastRT    = false, lastLT = false, lastLpadClick = false;
+        bool     lastNavMode = false;
+        int      lastNavDirs = 0; /* bit0=up bit1=down bit2=left bit3=right */
+        int16_t  lastPX = 0, lastPY = 0;
+        bool     padWasTouched = false;
+        struct pollfd pfds[2]{{fd, POLLIN, 0}, {g_padPipe[0], POLLIN, 0}};
+        bool alive = true;
+        while (alive && g_padRunning) {
+            int pr = poll(pfds, 2, 1000);
+            if (!g_padRunning)
+                break;
+            if (pr > 0 && (pfds[1].revents & POLLIN))
+                break; /* exit wake */
+            if (pr <= 0 || !(pfds[0].revents & POLLIN)) {
+                if (pr < 0 && errno != EINTR)
+                    alive = false;
+                continue;
+            }
+            ssize_t n;
+            while ((n = read(fd, report, sizeof report)) > 0) {
+                if (n < PAD_LEN_MIN || report[0] != 0x42)
+                    continue; /* 0x79/0x7b telemetry etc. */
+                uint32_t btn = (uint32_t)report[PAD_B0] | ((uint32_t)report[PAD_B0 + 1] << 8) |
+                               ((uint32_t)(report[PAD_B0 + 2] & 0x7F) << 16); /* mask trigger click */
+                g_padButtons.store(btn, std::memory_order_relaxed);
+                uint32_t edges = btn ^ lastBtn;
+                /* Steam-like typing: while the panel is visible, D-pad and
+                 * face buttons navigate/commit the OSK grid (QML owns the
+                 * highlight) instead of acting as desktop keys. QML ignores
+                 * nav lines while closed, so the race on hide is harmless. */
+                bool navMode = g_panelVisible.load(std::memory_order_relaxed);
+                if (edges) {
+                    /* face buttons + dpad + back: rising press, falling release.
+                     * nav >= 0: PADNAV action index when the panel is visible. */
+                    static const struct {
+                        uint32_t bit;
+                        unsigned evdev;
+                        int      nav;
+                    } keys[] = {
+                        {PB_A, KEY_ENTER, 4},     {PB_B, KEY_ESC, 7},
+                        {PB_X, KEY_BACKSPACE, 5}, {PB_Y, KEY_SPACE, 6},
+                        {PB_DPAD_UP, KEY_UP, 0},  {PB_DPAD_DOWN, KEY_DOWN, 1},
+                        {PB_DPAD_LEFT, KEY_LEFT, 2}, {PB_DPAD_RIGHT, KEY_RIGHT, 3},
+                        {PB_BACK, KEY_TAB, -1},
+                    };
+                    for (auto const &k : keys) {
+                        if (!(edges & k.bit))
+                            continue;
+                        int press = (btn & k.bit) ? 1 : 0;
+                        if (navMode && k.nav >= 0)
+                            padQueue(SOskCommand::EType::PADNAV, k.nav, press);
+                        else
+                            padQueue(SOskCommand::EType::PADKEY, (int)k.evdev, press);
+                    }
+                    /* right-pad click → left button (edges give press+release).
+                     * Left-pad click arrives via the STATUS byte, below. */
+                    if (edges & PB_RPAD_CLICK)
+                        padQueue(SOskCommand::EType::PADPTR, BTN_LEFT, (btn & PB_RPAD_CLICK) ? 1 : 0);
+                    /* chords fire on press only */
+                    if ((edges & btn & PB_GUIDE) != 0)
+                        padQueue(SOskCommand::EType::PADCHORD, 0, 0); /* OSK toggle */
+                    if ((edges & btn & PB_START) != 0)
+                        padQueue(SOskCommand::EType::PADCHORD, 1, 0); /* Omarchy menu */
+                    lastBtn = btn;
+                }
+                /* left-pad click via STATUS bit (never the raw button word) */
+                {
+                    bool lpc = (report[PAD_STATUS] & PB_LPAD_CLICK_STATUS) != 0;
+                    if (lpc != lastLpadClick) {
+                        padQueue(SOskCommand::EType::PADPTR, BTN_RIGHT, lpc ? 1 : 0);
+                        lastLpadClick = lpc;
+                    }
+                }
+                /* triggers with hysteresis: RT = left, LT = right.
+                 * Hair-trigger thresholds (~1/3 pull); the bottom-out click
+                 * bit is deliberately ignored — analog covers full pulls. */
+                bool rt = padU16(report, PAD_RTRIG) > 12000 || (lastRT && padU16(report, PAD_RTRIG) > 8000);
+                if (rt != lastRT) {
+                    padQueue(SOskCommand::EType::PADPTR, BTN_LEFT, rt ? 1 : 0);
+                    lastRT = rt;
+                }
+                bool lt = padU16(report, PAD_LTRIG) > 12000 || (lastLT && padU16(report, PAD_LTRIG) > 8000);
+                if (lt != lastLT) {
+                    padQueue(SOskCommand::EType::PADPTR, BTN_RIGHT, lt ? 1 : 0);
+                    lastLT = lt;
+                }
+                /* right pad: absolute positions, (0,0) untouched — accumulate deltas.
+                 * Per-report ADC noise (~±100 units @270 Hz) would random-walk
+                 * the cursor at a flat gain, so: vector deadband, teleport
+                 * guard, and a flick-accelerated gain (slow = precise). */
+                int16_t px = padI16(report, PAD_RPAD_X), py = padI16(report, PAD_RPAD_Y);
+                bool touched = (px != 0 || py != 0 || (btn & (PB_RPAD_TOUCH | PB_RPAD_CLICK)) != 0);
+                if (touched && padWasTouched) {
+                    double dx = (double)(px - lastPX), dy = (double)(py - lastPY);
+                    double mag = std::hypot(dx, dy);
+                    if (mag >= 150.0 && mag < 8000.0) {
+                        double k = 0.03 * (1.0 + std::min(mag / 4000.0, 2.0));
+                        g_padDX.fetch_add(dx * k);
+                        g_padDY.fetch_add(-dy * k); /* sign TBD live; flip if inverted */
+                        padWake();
+                    }
+                }
+                lastPX = px;
+                lastPY = py;
+                padWasTouched = touched;
+                /* left stick: deflection from calibrated rest. Visible panel =
+                 * OSK-grid nav direction edges (bit0=up bit1=down bit2=left
+                 * bit3=right, hysteresis); hidden = scroll velocity. */
+                double ldx = (double)padI16(report, PAD_LSTICK_X) - restLX;
+                double ldy = (double)padI16(report, PAD_LSTICK_Y) - restLY;
+                const double sdz = 1500.0;
+                if (navMode) {
+                    int dirs = 0;
+                    /* stick Y sign TBD live (assumed y-up positive, like the pad) */
+                    if (ldy > 16000.0 || ((lastNavDirs & 1) && ldy > 10000.0))
+                        dirs |= 1; /* up */
+                    if (ldy < -16000.0 || ((lastNavDirs & 2) && ldy < -10000.0))
+                        dirs |= 2; /* down */
+                    if (ldx < -16000.0 || ((lastNavDirs & 4) && ldx < -10000.0))
+                        dirs |= 4; /* left */
+                    if (ldx > 16000.0 || ((lastNavDirs & 8) && ldx > 10000.0))
+                        dirs |= 8; /* right */
+                    int changed = dirs ^ lastNavDirs;
+                    if (changed) {
+                        static const int dirAction[4] = {0, 1, 2, 3}; /* up down left right */
+                        for (int i = 0; i < 4; i++) {
+                            if (changed & (1 << i))
+                                padQueue(SOskCommand::EType::PADNAV, dirAction[i], (dirs & (1 << i)) ? 1 : 0);
+                        }
+                        lastNavDirs = dirs;
+                    }
+                } else {
+                    if (lastNavMode) {
+                        /* panel just hid with stick dirs held: release them */
+                        for (int i = 0; i < 4; i++) {
+                            if (lastNavDirs & (1 << i))
+                                padQueue(SOskCommand::EType::PADNAV, i, 0);
+                        }
+                        lastNavDirs = 0;
+                    }
+                    double ox = std::hypot(ldx, ldy) > sdz ? ldx / 32767.0 : 0.0;
+                    double oy = std::hypot(ldx, ldy) > sdz ? ldy / 32767.0 : 0.0;
+                    if (ox != 0.0 || oy != 0.0) {
+                        g_padSX.fetch_add(ox * 3.0);
+                        g_padSY.fetch_add(-oy * 3.0); /* sign TBD live */
+                        padWake();
+                    }
+                }
+                lastNavMode = navMode;
+                /* right stick: deflection from calibrated rest → pointer motion.
+                 * Full deflection ≈ 12 px/report at ~270 Hz ≈ 3200 px/s. */
+                double rdx = (double)padI16(report, PAD_RSTICK_X) - restRX;
+                double rdy = (double)padI16(report, PAD_RSTICK_Y) - restRY;
+                if (std::hypot(rdx, rdy) > sdz) {
+                    g_padDX.fetch_add(rdx / 32767.0 * 12.0);
+                    g_padDY.fetch_add(-rdy / 32767.0 * 12.0); /* sign TBD live */
+                    padWake();
+                }
+            }
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                alive = false; /* unplugged: rescan */
+            if (n == 0)
+                alive = false;
+        }
+        for (int i = 0; i < ngrabbed; i++) {
+            ioctl(grabbed[i], EVIOCGRAB, (void *)0);
+            close(grabbed[i]);
+        }
+        ngrabbed = 0;
+        close(fd);
+        g_padActive = false;
+        g_padButtons.store(0, std::memory_order_relaxed);
+    }
+    if (g_padPipe[0] >= 0)
+        close(g_padPipe[0]);
+    if (g_padPipe[1] >= 0)
+        close(g_padPipe[1]);
+    g_padPipe[0] = g_padPipe[1] = -1;
+}
+
+static void padTapChord(std::initializer_list<unsigned> keys)
+{
+    for (unsigned k : keys)
+        execKey(k, 1);
+    /* release in reverse so the chord reads as one gesture */
+    unsigned buf[4];
+    size_t   n = 0;
+    for (unsigned k : keys)
+        buf[n++] = k;
+    while (n > 0)
+        execKey(buf[--n], 0);
+}
+
 /* ---------------- queue drain (main thread) ---------------- */
 static SP<CEventLoopTimer> g_drainTimer;
 static bool                g_drainPollFallback = false;
@@ -2264,9 +2746,64 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 panel_nh = c.panel[3];
                 panel_rect_valid = (panel_nw > 0 && panel_nh > 0 && layerAllowsInject(c.pid));
                 g_panelVisible.store(panel_rect_valid, std::memory_order_release);
+                traceGeom("panel rect valid=" + std::to_string((int)panel_rect_valid));
                 DBG("panel rect (norm): " + std::to_string(panel_nx) + " " + std::to_string(panel_ny) +
                     " " + std::to_string(panel_nw) + " " + std::to_string(panel_nh) +
                     " inject=" + std::to_string((int)panel_rect_valid));
+                break;
+            case SOskCommand::EType::PADKEY:
+                /* trusted hardware input: no shell/visibility gate (like touch) */
+                traceGeom("pad key evdev=" + std::to_string(c.a) + (c.b ? " down" : " up"));
+                execKey((unsigned)c.a, c.b);
+                break;
+            case SOskCommand::EType::PADPTR: {
+                uint32_t t = nowMs();
+                traceGeom("pad ptr btn=" + std::to_string(c.a) + (c.b ? " down" : " up"));
+                g_pSeatManager->sendPointerButton(t, (uint32_t)c.a,
+                                                 c.b ? WL_POINTER_BUTTON_STATE_PRESSED
+                                                     : WL_POINTER_BUTTON_STATE_RELEASED);
+                g_pSeatManager->sendPointerFrame();
+                break;
+            }
+            case SOskCommand::EType::PADCHORD:
+                if (c.a == 0)
+                    padTapChord({KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_K}); /* OSK toggle bind */
+                else
+                    padTapChord({KEY_LEFTMETA, KEY_SPACE}); /* Omarchy menu bind */
+                break;
+            case SOskCommand::EType::PADNAV: {
+                /* trusted hardware input, unsolicited push (like grid) */
+                static const char *padNavNames[] = {"up",   "down",  "left", "right",
+                                                    "commit", "back", "space", "close"};
+                if (c.a >= 0 && c.a < 8) {
+                    traceGeom(std::string("pad nav ") + padNavNames[c.a] + (c.b ? " 1" : " 0"));
+                    sendToClient(std::string("nav ") + padNavNames[c.a] + (c.b ? " 1" : " 0"));
+                }
+                break;
+            }
+            case SOskCommand::EType::PADWAKE: {
+                g_padWakePending.store(false);
+                double dx = g_padDX.exchange(0.0), dy = g_padDY.exchange(0.0);
+                if (dx != 0.0 || dy != 0.0) {
+                    /* full device-motion path, like a touchpad: relative move
+                     * through the pointer manager + unify. warpTo alone never
+                     * clears hide_on_key_press, so the cursor stayed invisible
+                     * after any pad button press until a real device moved. */
+                    IPointer::SMotionEvent ev;
+                    ev.timeMs  = nowMs();
+                    ev.delta   = Vector2D{dx * g_padGain, dy * g_padGain};
+                    ev.unaccel = ev.delta;
+                    ev.mouse   = false;
+                    ev.device  = nullptr;
+                    g_pInputManager->onMouseMoved(ev);
+                }
+                double sx = g_padSX.exchange(0.0), sy = g_padSY.exchange(0.0);
+                if (sx != 0.0 || sy != 0.0)
+                    emitScroll(sx * g_padGain, sy * g_padGain);
+                break;
+            }
+            case SOskCommand::EType::MONREFRESH:
+                pushMon(); /* touch frame wins; else the pointer's monitor */
                 break;
             }
             g_ringMutex.lock();
@@ -2388,6 +2925,24 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     traceGeom(std::string("plugin init, swallow=") + (touch_swallow ? "on" : "off"));
     refreshIntendedShell();
     g_socketThread = std::thread(socket_thread_fn, socketPath());
+    /* gamepad prototype: reader thread only with HYPR_OSK_GAMEPAD=1 */
+    if (getenv("HYPR_OSK_GAMEPAD") && !strcmp(getenv("HYPR_OSK_GAMEPAD"), "1")) {
+        if (const char *g = getenv("HYPR_OSK_PAD_GAIN")) {
+            char *endp   = nullptr;
+            double v     = strtod(g, &endp);
+            if (endp != g && v >= 0.1 && v <= 5.0)
+                g_padGain = v;
+        }
+        if (pipe(g_padPipe) != 0)
+            g_padPipe[0] = g_padPipe[1] = -1;
+        else {
+            fcntl(g_padPipe[0], F_SETFL, O_NONBLOCK);
+            fcntl(g_padPipe[1], F_SETFL, O_NONBLOCK);
+        }
+        g_padRunning = true;
+        g_padThread  = std::thread(padThreadFn);
+        Log::logger->log(Log::INFO, "[hypr-osk] gamepad prototype enabled");
+    }
     bindTouchHooks();
 
     Log::logger->log(Log::INFO, "[hypr-osk] plugin initialized, socket at " + socketPath());
@@ -2396,6 +2951,24 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
 APICALL EXPORT void PLUGIN_EXIT() {
     unbindTouchHooks();
+    /* stop the gamepad reader first: same constraint as the socket thread
+     * (its code lives in this .so); it releases EVIOCGRABs before returning */
+    if (g_padThread.joinable()) {
+        g_padRunning = false;
+        if (g_padPipe[1] >= 0) {
+            char b = 1;
+            ssize_t r;
+            do {
+                r = write(g_padPipe[1], &b, 1);
+            } while (r < 0 && errno == EINTR);
+        }
+        g_padThread.join();
+    }
+    if (g_padPipe[0] >= 0)
+        close(g_padPipe[0]);
+    if (g_padPipe[1] >= 0)
+        close(g_padPipe[1]);
+    g_padPipe[0] = g_padPipe[1] = -1;
     /* stop the socket thread and join it BEFORE the .so is unmapped: the
      * thread's code lives in this library */
     g_socketRunning = false;
