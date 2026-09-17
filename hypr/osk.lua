@@ -10,7 +10,7 @@
 -- (read once at plugin load). Quit Steam while testing: it reads the same
 -- hidraw reports in parallel. Tune motion with HYPR_OSK_PAD_GAIN.
 hl.env("HYPR_OSK_GAMEPAD", "1")
--- hl.env("HYPR_OSK_PAD_GAIN", "1.0")
+hl.env("HYPR_OSK_PAD_GAIN", "0.6")
 hl.env("HYPR_OSK_TRACE", "1")
 
 -- Load the compositor plugin if built and not already loaded. Candidates:

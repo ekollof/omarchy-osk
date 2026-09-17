@@ -61,7 +61,7 @@ Bumpers, paddles and the "dots" button are unmapped (free for later).
 ```lua
 -- hypr/osk.lua (deployed to ~/.config/hypr/osk.lua)
 hl.env("HYPR_OSK_GAMEPAD", "1")
--- hl.env("HYPR_OSK_PAD_GAIN", "1.0")  -- pointer sensitivity, 0.1–5
+-- hl.env("HYPR_OSK_PAD_GAIN", "0.6")  -- pointer sensitivity, 0.1–5
 -- hl.env("HYPR_OSK_TRACE", "1")       -- /tmp/hypr-osk-geom.log tracing
 ```
 
