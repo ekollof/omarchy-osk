@@ -50,6 +50,8 @@ Item {
   property bool touchSwallow: true    // on: virtual pointer device; off: native touchscreen
   property var grid: null             // letter grid from the plugin (ROWS)
   property string touchMonitor: ""    // monitor with the touch surface (plugin MON reply)
+  property bool gamepad: true         // want: pad reader enabled (persisted, reconciled)
+  property bool padActive: false      // have: plugin holds a streaming pad (push)
 
   // Gamepad grid navigation (Steam-like typing): the plugin routes pad
   // buttons to `nav <action> <1|0>` lines while the panel is visible.
@@ -176,10 +178,12 @@ Item {
     root.scrollGain = clampInt(cfg.scrollGain, 50, 200, 100)
     root.scrollAxisPx = cfg.scrollAxisPx !== undefined ? !!cfg.scrollAxisPx : false
     root.touchSwallow = cfg.touchSwallow !== undefined ? !!cfg.touchSwallow : true
+    root.gamepad = cfg.gamepad !== undefined ? !!cfg.gamepad : true
     root.cfgLoaded = true
     // persist on first run so the applet sees the LANG-derived default too
     if (!raw || !cfg.layout || cfg.repeat === undefined || cfg.flingDecay === undefined ||
         cfg.flingCap === undefined || cfg.touchSwallow === undefined ||
+        cfg.gamepad === undefined ||
         cfg.dragSlop === undefined || cfg.longPress === undefined ||
         cfg.scrollGain === undefined || cfg.scrollAxisPx === undefined ||
         cfg.repeatDelay !== root.repeatDelay || cfg.repeatInterval !== root.repeatInterval)
@@ -203,7 +207,8 @@ Item {
       longPress: root.longPress,
       scrollGain: root.scrollGain,
       scrollAxisPx: root.scrollAxisPx,
-      touchSwallow: root.touchSwallow
+      touchSwallow: root.touchSwallow,
+      gamepad: root.gamepad
     })
     cfgSave.command = ["/usr/bin/python3", helper, "save", root.cfgPath(), body]
     cfgSave.running = false
@@ -225,6 +230,8 @@ Item {
       scrollGain: root.scrollGain,
       scrollAxisPx: root.scrollAxisPx,
       touchSwallow: root.touchSwallow,
+      gamepad: root.gamepad,
+      padActive: root.padActive,
       gridLoaded: !!root.grid,
       opened: root.opened
     })
@@ -316,6 +323,19 @@ Item {
     return "ok"
   }
 
+  function setGamepad(arg) {
+    const v = String(arg || "").trim().toLowerCase()
+    if (v !== "on" && v !== "off" && v !== "toggle" && v !== "true" && v !== "false" && v !== "1" && v !== "0")
+      return "err need on|off|toggle"
+    if (v === "toggle")
+      root.gamepad = !root.gamepad
+    else
+      root.gamepad = (v === "on" || v === "true" || v === "1")
+    persistConfig()
+    send("GAMEPAD " + (root.gamepad ? "on" : "off"))
+    return root.gamepad ? "on" : "off"
+  }
+
   // ---- IPC: the bar applet (and scripts) drive settings through here -----
   // `omarchy-shell ekollof.osk <method> [args…]`. The shell target's generic
   // `call` verb is currently broken for panel plugins, so the applet routes
@@ -355,6 +375,10 @@ Item {
 
     function setTouchSwallow(on: string): string {
       return root.setTouchSwallow(on)
+    }
+
+    function setGamepad(on: string): string {
+      return root.setGamepad(on)
     }
 
     function toggle(): string {
@@ -401,6 +425,7 @@ Item {
     send("POINTER " + root.dragSlop + " " + root.longPress)
     send("SCROLL " + root.scrollGain + " " + (root.scrollAxisPx ? "1" : "0"))
     send("SWALLOW " + (root.touchSwallow ? "1" : "0"))
+    send("GAMEPAD " + (root.gamepad ? "on" : "off"))
     if (root.opened)
       Qt.callLater(root.syncPanel)
   }
@@ -416,6 +441,10 @@ Item {
     } else if (line.indexOf("nav ") === 0) {
       const p = line.split(/\s+/)
       root.navEvent(p[1] || "", p[2] === "1")
+    } else if (line.indexOf("pad ") === 0) {
+      const p = line.split(/\s+/)
+      root.gamepad = p[1] === "1"
+      root.padActive = p[2] === "1"
     } else if (line.indexOf("mon ") === 0) {
       // "mon <name> x y w h" — the monitor whose frame touch ev.pos is
       // normalized against; dock the keyboard there
@@ -845,7 +874,7 @@ Item {
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
   Component.onCompleted: {
-    console.log("[ekollof.osk] loaded rev19 layout=" + root.layout + " cfg=" + root.cfgPath())
+    console.log("[ekollof.osk] loaded rev20 layout=" + root.layout + " cfg=" + root.cfgPath())
     const helper = root.jsonHelper()
     if (!helper) {
       root.applyConfig("")

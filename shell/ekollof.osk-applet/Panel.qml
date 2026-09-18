@@ -17,9 +17,12 @@ Panel {
   ipcTarget: "ekollof.osk-applet"
 
   readonly property string oskPluginId: "ekollof.osk"
+  readonly property string padGlyph: "\uf11b" // U+F11B gamepad, ASCII escape
   readonly property string kbGlyph: ""
 
   property bool oskEnabled: false
+  property bool gamepad: true
+  property bool padActive: false
   property string layout: "us"
   property bool repeatEnabled: true
   property int repeatDelay: 400
@@ -33,8 +36,20 @@ Panel {
   property bool touchSwallow: true
   property var layouts: []
 
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  implicitWidth: buttonsRow.implicitWidth
+  implicitHeight: buttonsRow.implicitHeight
+
+  function padTooltip() {
+    if (!root.gamepad)
+      return "Gamepad control off (click to enable)"
+    return root.padActive ? "Gamepad active (click to disable)" : "Gamepad on, no controller (click to disable)"
+  }
+
+  function toggleGamepad() {
+    root.gamepad = !root.gamepad
+    root.callOsk("setGamepad", root.gamepad ? "on" : "off")
+    Qt.callLater(root.refreshState)
+  }
 
   function shellObj() {
     return root.bar && root.bar.shell ? root.bar.shell : null
@@ -105,6 +120,10 @@ Panel {
       root.scrollAxisPx = !!cfg.scrollAxisPx
     if (cfg.touchSwallow !== undefined)
       root.touchSwallow = !!cfg.touchSwallow
+    if (cfg.gamepad !== undefined)
+      root.gamepad = !!cfg.gamepad
+    if (cfg.padActive !== undefined)
+      root.padActive = !!cfg.padActive
   }
 
   function setLayouts(raw) {
@@ -114,6 +133,15 @@ Panel {
 
   Component.onCompleted: refreshState()
 
+  // The bar icon reflects live pad presence (connect/disconnect), which can
+  // change without any panel interaction — re-poll getState periodically.
+  Timer {
+    interval: 10000
+    running: true
+    repeat: true
+    onTriggered: root.refreshState()
+  }
+
   onOpenedChanged: {
     if (opened) {
       refreshState()
@@ -122,23 +150,38 @@ Panel {
     }
   }
 
-  BarIconButton {
-    id: button
-    anchors.fill: parent
-    bar: root.bar
-    text: root.kbGlyph
-    tooltipText: "On-screen keyboard"
-    onPressed: function(b) {
-      if (b === Qt.RightButton)
-        root.toggleOsk()
-      else
-        root.toggle()
+  Row {
+    id: buttonsRow
+    spacing: 0
+
+    BarIconButton {
+      id: kbButton
+      bar: root.bar
+      text: root.kbGlyph
+      tooltipText: "On-screen keyboard"
+      onPressed: function(b) {
+        if (b === Qt.RightButton)
+          root.toggleOsk()
+        else
+          root.toggle()
+      }
+    }
+
+    BarIconButton {
+      id: padButton
+      bar: root.bar
+      text: root.padGlyph
+      opacity: root.padActive ? 1.0 : 0.35
+      tooltipText: root.padTooltip()
+      onPressed: function(b) {
+        root.toggleGamepad()
+      }
     }
   }
 
   KeyboardPanel {
     id: panel
-    anchorItem: button
+    anchorItem: kbButton
     owner: root
     bar: root.bar
     open: root.opened
@@ -194,7 +237,7 @@ Panel {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
             font.bold: true
-            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev6")
+            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev7")
           }
 
           Text {
@@ -240,6 +283,40 @@ Panel {
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         enabled: root.oskEnabled
         onClicked: root.toggleOsk()
+      }
+
+      PanelSeparator {
+        width: parent.width
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+      }
+
+      // ---------- gamepad ----------
+      PanelSectionHeader {
+        width: parent.width
+        text: "Gamepad (Steam Controller)"
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+      }
+
+      Toggle {
+        width: parent.width
+        label: "Gamepad control"
+        description: !root.gamepad ? "Off: the pad reader holds no device"
+                     : root.padActive ? "On: controller connected — stick/pad move the pointer, GUIDE summons the OSK"
+                     : "On: waiting for the controller (wake it with any button)"
+        checked: root.gamepad
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        onClicked: root.toggleGamepad()
+      }
+
+      Text {
+        width: parent.width
+        wrapMode: Text.WordWrap
+        text: "Quit Steam while testing: it reads the same controller reports in parallel."
+        color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Color.foreground, 1.4)
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.caption
       }
 
       PanelSeparator {

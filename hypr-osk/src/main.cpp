@@ -45,6 +45,11 @@
  *   SWALLOW <0|1>                consume touchscreen input (virtual pointer
  *                                + gestures) or pass it to Hyprland's native
  *                                touchscreen support
+ *   GAMEPAD <on|off|toggle|query> runtime enable for the pad reader
+ *                                (shell-gated; query answers "pad <e> <a>"
+ *                                inline, sets are "ok" + an async push).
+ *   Unsolicited pushes (never replies): `grid <json>`, `mon <…>`,
+ *   `nav <action> <1|0>`, `pad <enabled01> <active01>`.
  *
  * Access control: the socket can type into the focused session. A well-known
  * path plus "this pid is packaged quickshell and mapped ekollof-osk" is not
@@ -195,7 +200,7 @@ static int    debug   = 1;
  * bounded to 95 bytes. */
 struct SOskCommand {
     enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, POINTER, SCROLL, SWALLOW, PANEL,
-                                 PADKEY, PADPTR, PADCHORD, PADWAKE, PADNAV, MONREFRESH } type;
+                                 PADKEY, PADPTR, PADCHORD, PADWAKE, PADNAV, MONREFRESH, GAMEPAD } type;
     int   a = 0, b = 0;
     pid_t pid           = 0; /* SO_PEERCRED pid stamped at queue time */
     float panel[4]      = {0, 0, 0, 0}; /* PANEL nx ny nw nh */
@@ -220,8 +225,11 @@ static wl_event_source  *g_drainEventSource = nullptr;
  * here because publishStats/STATS read them) */
 static std::atomic<bool> g_padActive{false};
 static std::atomic<uint32_t> g_padButtons{0};
+static std::atomic<bool> g_padEnabled{false};
 
 static void wakeDrain();
+
+static void ensurePadThread(); /* defined at the gamepad section; drain calls it */
 
 static void queueCommand(SOskCommand cmd)
 {
@@ -797,6 +805,7 @@ struct SStatsSnap {
     int      fingers = 0, pressed = 0, ignore = 0, scroll = 0, down = 0, up = 0;
     int      contact = 0, panel_valid = 0, inject = 0, anypeer = 0, swallow = 0, indrain = 0;
     int      pad = 0;
+    int      paden = 0;
     uint32_t padbtn = 0;
     unsigned fires     = 0;
     size_t   ring      = 0;
@@ -823,6 +832,7 @@ static void publishStats()
     s.swallow     = (int)touch_swallow;
     s.indrain     = (int)g_inDrain;
     s.pad         = (int)g_padActive.load(std::memory_order_relaxed);
+    s.paden       = (int)g_padEnabled.load(std::memory_order_relaxed);
     s.padbtn      = g_padButtons.load(std::memory_order_relaxed);
     s.fires       = g_drain_fires;
     s.panel_ny    = panel_ny;
@@ -1967,6 +1977,25 @@ static bool handle_line(int cfd, char *line)
         mc.pid  = 0;
         queueCommand(mc);
         reply = "ok";
+    } else if (!strncmp(line, "GAMEPAD", 7)) {
+        /* GAMEPAD on|off|toggle|query — runtime enable for the pad reader.
+         * query answers synchronously from atomics; sets queue + reply ok,
+         * state follows as an unsolicited `pad <enabled> <active>` push. */
+        const char *arg = line + 7;
+        while (*arg == ' ')
+            arg++;
+        if (!strcmp(arg, "query") || !*arg) {
+            char buf[32];
+            snprintf(buf, sizeof buf, "pad %d %d", (int)g_padEnabled.load(std::memory_order_relaxed),
+                     (int)g_padActive.load(std::memory_order_relaxed));
+            reply = buf;
+        } else if (!strcmp(arg, "on") || !strcmp(arg, "off") || !strcmp(arg, "toggle")) {
+            cmd.type = SOskCommand::EType::GAMEPAD;
+            cmd.a    = !strcmp(arg, "toggle") ? 2 : (!strcmp(arg, "on") ? 1 : 0);
+            queueFromPeer(cfd, std::move(cmd));
+            reply = "ok";
+        } else
+            reply = "err bad args";
     } else if (!strcmp(line, "STATS")) {
         SStatsSnap s;
         {
@@ -1978,11 +2007,11 @@ static bool handle_line(int cfd, char *line)
                  "state fingers=%d pressed=%d ignore=%d scroll=%d down=%d up=%d contact_osk=%d "
                  "panel_valid=%d inject=%d anypeer=%d panel_ny=%.3f panel_nh=%.3f last=%.3f,%.3f "
                  "fires=%u ring=%zu indrain=%d layout=%s textmap=%zu fling=%.0fms/%.0fpx swallow=%d "
-                 "pad=%d padbtn=%06x",
+                 "pad=%d padbtn=%06x paden=%d",
                   s.fingers, s.pressed, s.ignore, s.scroll, s.down, s.up, s.contact, s.panel_valid,
                   s.inject, s.anypeer, s.panel_ny, s.panel_nh, s.lastx, s.lasty, s.fires,
                   s.ring, s.indrain, s.layout, s.textmap, s.fling_tau_ms, s.fling_cap, s.swallow,
-                  s.pad, s.padbtn);
+                  s.pad, s.padbtn, s.paden);
         reply = buf;
     } else if (!strncmp(line, "CALIB", 5)) {
         reply = "ok"; /* accepted for protocol compatibility; the frame comes from the compositor */
@@ -2357,6 +2386,27 @@ static uint16_t padU16(const unsigned char *r, int off)
     return (uint16_t)r[off] | ((uint16_t)r[off + 1] << 8);
 }
 
+static void padPushState()
+{
+    /* main thread only (drain): enabled + active snapshot to the client */
+    char buf[32];
+    snprintf(buf, sizeof buf, "pad %d %d", (int)g_padEnabled.load(std::memory_order_relaxed),
+             (int)g_padActive.load(std::memory_order_relaxed));
+    sendToClient(buf);
+}
+
+static void padWakeThread()
+{
+    /* wake the reader's blocking polls (rescan sleep / exit) */
+    if (g_padPipe[1] >= 0) {
+        char b = 1;
+        ssize_t r;
+        do {
+            r = write(g_padPipe[1], &b, 1);
+        } while (r < 0 && errno == EINTR);
+    }
+}
+
 static void padThreadFn()
 {
     if (padSteamRunning())
@@ -2364,6 +2414,17 @@ static void padThreadFn()
     int grabbed[16], ngrabbed = 0;
     unsigned char report[128];
     while (g_padRunning) {
+        if (!g_padEnabled.load(std::memory_order_relaxed)) {
+            /* runtime-disabled: hold no device, no grabs, no input.
+             * Sleep on the pipe (GAMEPAD wakes it) — no polling wakeups. */
+            g_padActive.store(false, std::memory_order_relaxed);
+            g_padButtons.store(0, std::memory_order_relaxed);
+            struct pollfd pfd{g_padPipe[0], POLLIN, 0};
+            poll(&pfd, 1, 1000);
+            char b;
+            while (read(g_padPipe[0], &b, 1) > 0) {}
+            continue;
+        }
         int fd = padOpenStreamer();
         if (fd < 0) {
             /* nothing streaming: sleep until woken (exit) or 1 s (rescan) */
@@ -2375,6 +2436,7 @@ static void padThreadFn()
             continue;
         }
         g_padActive = true;
+        padPushState();
         padGrabPhantoms(grabbed, &ngrabbed);
         traceGeom("gamepad: streaming hidraw open, phantoms grabbed=" + std::to_string(ngrabbed));
         /* sticks don't rest at exactly 0 (observed ~±500 on this unit):
@@ -2604,6 +2666,7 @@ static void padThreadFn()
         close(fd);
         g_padActive = false;
         g_padButtons.store(0, std::memory_order_relaxed);
+        padPushState();
     }
     if (g_padPipe[0] >= 0)
         close(g_padPipe[0]);
@@ -2831,6 +2894,22 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
             case SOskCommand::EType::MONREFRESH:
                 pushMon(); /* touch frame wins; else the pointer's monitor */
                 break;
+            case SOskCommand::EType::GAMEPAD: {
+                if (!fromShell)
+                    break;
+                bool en = g_padEnabled.load(std::memory_order_relaxed);
+                if (c.a == 2)
+                    en = !en; /* toggle */
+                else
+                    en = c.a != 0;
+                g_padEnabled.store(en, std::memory_order_relaxed);
+                if (en)
+                    ensurePadThread(); /* lazy start when the env is unset */
+                padWakeThread();       /* rescan sleep notices promptly */
+                padPushState();
+                traceGeom(std::string("gamepad ") + (en ? "enabled" : "disabled"));
+                break;
+            }
             }
             g_ringMutex.lock();
         }
@@ -2849,6 +2928,21 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
 }
 
 /* ---------------- plugin init ---------------- */
+/* main thread only: start the pad reader once (idempotent). The QML-owned
+ * osk.json default enables the pad, so a session without HYPR_OSK_GAMEPAD
+ * still starts it on the first GAMEPAD-on reconcile. */
+static void ensurePadThread()
+{
+    if (g_padThread.joinable())
+        return;
+    if (g_padPipe[0] < 0 && pipe(g_padPipe) == 0) {
+        fcntl(g_padPipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(g_padPipe[1], F_SETFL, O_NONBLOCK);
+    }
+    g_padRunning = true;
+    g_padThread  = std::thread(padThreadFn);
+    Log::logger->log(Log::INFO, "[hypr-osk] gamepad reader started");
+}
 static std::string socketPath()
 {
     const char *rtd = getenv("XDG_RUNTIME_DIR");
@@ -2951,23 +3045,17 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     traceGeom(std::string("plugin init, swallow=") + (touch_swallow ? "on" : "off"));
     refreshIntendedShell();
     g_socketThread = std::thread(socket_thread_fn, socketPath());
-    /* gamepad prototype: reader thread only with HYPR_OSK_GAMEPAD=1 */
+    /* gamepad reader: env default; the QML reconciles osk.json over it via
+     * GAMEPAD on first handshake (lazy start if the env is unset) */
+    if (const char *g = getenv("HYPR_OSK_PAD_GAIN")) {
+        char *endp = nullptr;
+        double v   = strtod(g, &endp);
+        if (endp != g && v >= 0.1 && v <= 5.0)
+            g_padGain = v;
+    }
     if (getenv("HYPR_OSK_GAMEPAD") && !strcmp(getenv("HYPR_OSK_GAMEPAD"), "1")) {
-        if (const char *g = getenv("HYPR_OSK_PAD_GAIN")) {
-            char *endp   = nullptr;
-            double v     = strtod(g, &endp);
-            if (endp != g && v >= 0.1 && v <= 5.0)
-                g_padGain = v;
-        }
-        if (pipe(g_padPipe) != 0)
-            g_padPipe[0] = g_padPipe[1] = -1;
-        else {
-            fcntl(g_padPipe[0], F_SETFL, O_NONBLOCK);
-            fcntl(g_padPipe[1], F_SETFL, O_NONBLOCK);
-        }
-        g_padRunning = true;
-        g_padThread  = std::thread(padThreadFn);
-        Log::logger->log(Log::INFO, "[hypr-osk] gamepad prototype enabled");
+        g_padEnabled.store(true, std::memory_order_relaxed);
+        ensurePadThread();
     }
     bindTouchHooks();
 
