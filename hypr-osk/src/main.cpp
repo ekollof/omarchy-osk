@@ -79,6 +79,9 @@
  * is allowlisted PADMAP/PADBTN from the pinned shell (osk.json gamepadMap).
  * Socket GAMEPAD is never an injection path: it only arms or parks the
  * hidraw reader. GAMEPAD off from the pinned shell is the kill switch.
+ * While a focused window is gamescope, or exclusive-fullscreen and not a
+ * browser/media player, injection yields so the game owns the pad.
+ * Fullscreen YouTube keeps the pad. The OSK layer taking focus resumes it.
  * A reader thread then opens the pad's hidraw node (VID 28de, PID 1302/1304
  * parsed from HID_ID=, not a uevent substring), parses report 0x42 (wire
  * layout from s3govesus/steam-controller-x crates/sc-protocol/src/report.rs)
@@ -139,11 +142,15 @@
 #include <hyprland/src/desktop/state/LayerState.hpp>
 #include <hyprland/src/desktop/state/ViewState.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
+#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <set>
 #include <hyprland/src/event/EventBus.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -238,6 +245,7 @@ static wl_event_source  *g_drainEventSource = nullptr;
 static std::atomic<bool> g_padActive{false};
 static std::atomic<uint32_t> g_padButtons{0};
 static std::atomic<bool> g_padEnabled{true}; /* auto: inject once a matching pad streams */
+static std::atomic<bool> g_padYielded{false}; /* fullscreen / gamescope owns the pad */
 struct PadMap {
     uint8_t pointer = 2 | 4; /* PAN_RS|PAN_RPAD; values match the gamepad section */
     uint8_t scroll  = 1;     /* PAN_LS */
@@ -600,6 +608,11 @@ static void pushGrid()
 static Hyprutils::Signal::CHyprSignalListener g_touchDownHook;
 static Hyprutils::Signal::CHyprSignalListener g_touchUpHook;
 static Hyprutils::Signal::CHyprSignalListener g_touchMoveHook;
+static Hyprutils::Signal::CHyprSignalListener g_padWinActive;
+static Hyprutils::Signal::CHyprSignalListener g_padWinFs;
+static Hyprutils::Signal::CHyprSignalListener g_padWinClass;
+static Hyprutils::Signal::CHyprSignalListener g_padWinTitle;
+static Hyprutils::Signal::CHyprSignalListener g_padWinClose;
 static std::thread                            g_socketThread;
 
 /* ---------------- main-thread executors ---------------- */
@@ -2621,8 +2634,87 @@ static void padEmitKey(PadApplyState &st, unsigned evdev, int press)
         st.padKeys.erase(evdev);
 }
 
+static bool padIcontains(const std::string &hay, const char *needle)
+{
+    if (!needle || !*needle || hay.empty())
+        return false;
+    auto pred = [](char a, char b) {
+        return std::tolower((unsigned char)a) == std::tolower((unsigned char)b);
+    };
+    const char *end = needle + strlen(needle);
+    return std::search(hay.begin(), hay.end(), needle, end, pred) != hay.end();
+}
+
+static bool padWindowIsGamescope(const PHLWINDOW &w)
+{
+    if (!w)
+        return false;
+    return padIcontains(w->m_class, "gamescope") || padIcontains(w->m_initialClass, "gamescope") ||
+           padIcontains(w->m_title, "gamescope") || padIcontains(w->m_initialTitle, "gamescope");
+}
+
+/* Fullscreen YouTube in a browser (or mpv/VLC) still wants the pad as a
+ * mouse. Gamescope and unknown exclusive-fullscreen clients do not. */
+static bool padWindowKeepsPad(const PHLWINDOW &w)
+{
+    if (!w)
+        return false;
+    static const char *keep[] = {
+        "firefox", "librewolf", "floorp", "waterfox", "zen", "navigator",
+        "chromium", "chrome", "brave", "vivaldi", "thorium", "edge", "opera",
+        "qutebrowser", "epiphany", "freetube", "mpv", "vlc", "celluloid", "totem",
+    };
+    for (const char *k : keep) {
+        if (padIcontains(w->m_class, k) || padIcontains(w->m_initialClass, k))
+            return true;
+    }
+    return false;
+}
+
+static bool padWindowTakesPad(const PHLWINDOW &w)
+{
+    if (!w)
+        return false;
+    if (padWindowIsGamescope(w))
+        return true;
+    if (padWindowKeepsPad(w))
+        return false;
+    auto &ctl = Fullscreen::controller();
+    if (!ctl)
+        return false;
+    return ctl->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN);
+}
+
+/* Main thread: Steam/gamescope/fullscreen own the pad; the OSK layer does not. */
+static void padRefreshYield()
+{
+    PHLWINDOW w;
+    if (auto fs = Desktop::focusState())
+        w = fs->window();
+    bool yield = padWindowTakesPad(w);
+    bool was   = g_padYielded.exchange(yield, std::memory_order_relaxed);
+    if (was != yield)
+        traceGeom(std::string("gamepad: ") + (yield ? "yield (game/gamescope)" : "resume (desktop)"));
+}
+
+static bool padInjectAllowed()
+{
+    if (!g_padEnabled.load(std::memory_order_relaxed))
+        return false;
+    if (g_panelVisible.load(std::memory_order_relaxed))
+        return true;
+    return !g_padYielded.load(std::memory_order_relaxed);
+}
+
+static void padRelease(PadApplyState &st);
+
 static void padApply(const PadView &v, PadApplyState &st)
 {
+    if (!padInjectAllowed()) {
+        if (st.lastBtn || st.lastLclick || st.lastRclick || st.lastNavDirs || !st.padKeys.empty())
+            padRelease(st);
+        return;
+    }
     PadMap map;
     {
         std::lock_guard<std::mutex> lg(g_padMapMutex);
@@ -3368,6 +3460,7 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 panel_nh = c.panel[3];
                 panel_rect_valid = (panel_nw > 0 && panel_nh > 0 && layerAllowsInject(c.pid));
                 g_panelVisible.store(panel_rect_valid, std::memory_order_release);
+                padRefreshYield();
                 traceGeom("panel rect valid=" + std::to_string((int)panel_rect_valid));
                 DBG("panel rect (norm): " + std::to_string(panel_nx) + " " + std::to_string(panel_ny) +
                     " " + std::to_string(panel_nw) + " " + std::to_string(panel_nh) +
@@ -3375,14 +3468,14 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 break;
             case SOskCommand::EType::PADKEY:
                 /* hidraw path (pid=0): allowlisted keys, like a USB keyboard.
-                 * Downs only while the reader is enabled; releases always. */
-                if (!g_padEnabled.load(std::memory_order_relaxed) && c.b)
+                 * Downs only while the reader is enabled and not yielded; releases always. */
+                if (!padInjectAllowed() && c.b)
                     break;
                 traceGeom("pad key evdev=" + std::to_string(c.a) + (c.b ? " down" : " up"));
                 execKey((unsigned)c.a, c.b);
                 break;
             case SOskCommand::EType::PADPTR: {
-                if (!g_padEnabled.load(std::memory_order_relaxed) && c.b)
+                if (!padInjectAllowed() && c.b)
                     break;
                 uint32_t t = nowMs();
                 traceGeom("pad ptr btn=" + std::to_string(c.a) + (c.b ? " down" : " up"));
@@ -3393,7 +3486,7 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 break;
             }
             case SOskCommand::EType::PADCHORD:
-                if (!g_padEnabled.load(std::memory_order_relaxed))
+                if (!padInjectAllowed())
                     break;
                 if (c.a == 0)
                     padTapChord({KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_K}); /* OSK toggle bind */
@@ -3405,7 +3498,7 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                  * so a disable mid-hold cannot leave QML repeating. */
                 static const char *padNavNames[] = {"up",   "down",  "left", "right",
                                                     "commit", "back", "space", "close"};
-                if (!g_padEnabled.load(std::memory_order_relaxed) && c.b)
+                if (!padInjectAllowed() && c.b)
                     break;
                 if (c.a >= 0 && c.a < 8) {
                     traceGeom(std::string("pad nav ") + padNavNames[c.a] + (c.b ? " 1" : " 0"));
@@ -3426,7 +3519,7 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 break;
             case SOskCommand::EType::PADWAKE: {
                 g_padWakePending.store(false);
-                if (!g_padEnabled.load(std::memory_order_relaxed)) {
+                if (!padInjectAllowed()) {
                     g_padDX.store(0.0);
                     g_padDY.store(0.0);
                     g_padSX.store(0.0);
@@ -3530,6 +3623,29 @@ static void unbindTouchHooks()
     drop(t.motion, g_touchMoveHook);
 }
 
+static void unbindPadYieldHooks()
+{
+    g_padWinActive.reset();
+    g_padWinFs.reset();
+    g_padWinClass.reset();
+    g_padWinTitle.reset();
+    g_padWinClose.reset();
+}
+
+static void bindPadYieldHooks()
+{
+    unbindPadYieldHooks();
+    if (!Event::bus())
+        return;
+    auto &w = Event::bus()->m_events.window;
+    g_padWinActive = w.active.listen([] { padRefreshYield(); });
+    g_padWinFs     = w.fullscreen.listen([] { padRefreshYield(); });
+    g_padWinClass  = w.class_.listen([] { padRefreshYield(); });
+    g_padWinTitle  = w.title.listen([] { padRefreshYield(); });
+    g_padWinClose  = w.close.listen([] { padRefreshYield(); });
+    padRefreshYield();
+}
+
 static void bindTouchHooks()
 {
     /* listenStatic runs after every regular listener. hyprgrass uses listen()
@@ -3622,12 +3738,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (g_padEnabled.load(std::memory_order_relaxed))
         ensurePadThread();
     bindTouchHooks();
+    bindPadYieldHooks();
 
     Log::logger->log(Log::INFO, "[hypr-osk] plugin initialized, socket at " + socketPath());
     return {"hypr-osk", "On-screen keyboard: touch->pointer + keyboard synthesis", "ekollof", "0.1.0"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    unbindPadYieldHooks();
     unbindTouchHooks();
     /* stop the gamepad reader first: same constraint as the socket thread
      * (its code lives in this .so); it releases EVIOCGRABs before returning */

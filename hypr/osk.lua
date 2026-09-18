@@ -5,14 +5,55 @@
 -- this file.
 
 -- Gamepad: auto-enabled when a Steam Controller or standard evdev pad is
--- detected. Mapping lives in osk.json (gamepadMap).
--- The compositor plugin starts the hidraw reader at load; injection happens
--- only while a matching controller streams. Disable from the bar applet
--- (persisted in osk.json) or set HYPR_OSK_GAMEPAD=0. Quit Steam while
--- testing: it reads the same hidraw reports in parallel.
+-- detected. The compositor plugin starts the reader at load; injection
+-- happens only while a matching controller streams. gamescope and
+-- exclusive-fullscreen games get the pad; fullscreen YouTube in a
+-- browser does not. The OSK overlay takes it back. Disable from the bar
+-- applet (persisted in osk.json) or set HYPR_OSK_GAMEPAD=0. Quit Steam
+-- while testing the Puck: it reads the same hidraw reports in parallel.
 -- hl.env("HYPR_OSK_GAMEPAD", "0")      -- kill switch at compositor load
 -- hl.env("HYPR_OSK_PAD_GAIN", "0.6")   -- pointer sensitivity, 0.1–5
 -- hl.env("HYPR_OSK_TRACE", "1")        -- $XDG_RUNTIME_DIR/hypr-osk-geom.log
+--
+-- Button/stick remap is NOT Hypr env. Edit ~/.config/omarchy/osk.json
+-- (or the bar applet / `omarchy-shell ekollof.osk setGamepadMap '…'`).
+-- Analog: none | leftStick | rightStick | rightPad (comma-OR for pointer).
+-- Buttons: a b x y dpadUp dpadDown dpadLeft dpadRight lb rb lt rt
+--          select start guide lsClick rsClick leftPadClick rightPadClick
+-- Actions: none enter escape backspace space tab up down left right
+--          menu toggleOsk commit close navUp navDown navLeft navRight
+--          leftClick rightClick
+-- desktop = OSK hidden; osk = OSK visible. Scroll stick becomes nav
+-- while the keyboard is open. Unset keys keep the defaults below.
+--
+-- Default (copy into osk.json and edit):
+--   "gamepadMap": {
+--     "pointer": "rightStick,rightPad",
+--     "scroll": "leftStick",
+--     "desktop": {
+--       "a": "enter", "b": "escape", "x": "backspace", "y": "space",
+--       "dpadUp": "up", "dpadDown": "down", "dpadLeft": "left", "dpadRight": "right",
+--       "select": "tab", "start": "menu", "guide": "toggleOsk",
+--       "rt": "leftClick", "lt": "rightClick",
+--       "rightPadClick": "leftClick", "leftPadClick": "rightClick"
+--     },
+--     "osk": {
+--       "a": "commit", "b": "close", "x": "backspace", "y": "space",
+--       "dpadUp": "navUp", "dpadDown": "navDown", "dpadLeft": "navLeft", "dpadRight": "navRight",
+--       "select": "tab", "start": "menu", "guide": "toggleOsk",
+--       "rt": "leftClick", "lt": "rightClick"
+--     }
+--   }
+--
+-- Nintendo-style face buttons (A/B and X/Y swapped vs Xbox):
+--   "desktop": { "a": "escape", "b": "enter", "x": "space", "y": "backspace" },
+--   "osk":     { "a": "close",  "b": "commit", "x": "space", "y": "backspace" }
+--
+-- Left stick as pointer, right stick scrolls:
+--   "pointer": "leftStick", "scroll": "rightStick"
+--
+-- Triggers only click while the OSK is hidden (bumpers unused):
+--   "desktop": { "rt": "leftClick", "lt": "rightClick", "rb": "none", "lb": "none" }
 
 -- Load the compositor plugin if built and not already loaded. Candidates:
 -- install.sh's flat deploy first, then hyprpm's store (hyprpm.toml route;
