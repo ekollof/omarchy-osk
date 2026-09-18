@@ -40,13 +40,13 @@ Panel {
   implicitHeight: buttonsRow.implicitHeight
 
   function padTooltip() {
-    if (!root.gamepad)
-      return "Gamepad control off (click to enable)"
-    return root.padActive ? "Gamepad active (click to disable)" : "Gamepad on, no controller (click to disable)"
+    return "Gamepad active (click to disable)"
   }
 
   function toggleGamepad() {
     root.gamepad = !root.gamepad
+    if (!root.gamepad)
+      root.padActive = false // icon hides at once; the poll reconciles
     root.callOsk("setGamepad", root.gamepad ? "on" : "off")
     Qt.callLater(root.refreshState)
   }
@@ -136,7 +136,7 @@ Panel {
   // The bar icon reflects live pad presence (connect/disconnect), which can
   // change without any panel interaction — re-poll getState periodically.
   Timer {
-    interval: 10000
+    interval: 5000
     running: true
     repeat: true
     onTriggered: root.refreshState()
@@ -169,9 +169,9 @@ Panel {
 
     BarIconButton {
       id: padButton
+      visible: root.padActive // no controller attached: no icon (re-enable from the panel below)
       bar: root.bar
       text: root.padGlyph
-      opacity: root.padActive ? 1.0 : 0.35
       tooltipText: root.padTooltip()
       onPressed: function(b) {
         root.toggleGamepad()
@@ -237,7 +237,7 @@ Panel {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
             font.bold: true
-            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev7")
+            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev8")
           }
 
           Text {

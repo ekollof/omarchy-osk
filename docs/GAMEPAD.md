@@ -58,11 +58,11 @@ Bumpers, paddles and the "dots" button are unmapped (free for later).
 
 ## Bar icon + toggle
 
-The OSK bar applet shows a gamepad icon next to the keyboard icon: full
-brightness while a controller streams, dim when off or absent (tooltip
-tells which). Click it to toggle the reader; the panel has a Gamepad
-section with the same toggle plus connection status. State persists in
-`osk.json` (`gamepad`) and reconciles on every handshake.
+The OSK bar applet shows a gamepad icon next to the keyboard icon only
+while a controller streams (it hides when none is attached; re-enable from
+the panel's Gamepad section). Click the icon to toggle the reader; the
+panel has a Gamepad section with the same toggle plus connection status.
+State persists in `osk.json` (`gamepad`) and reconciles on every handshake.
 
 Socket: `GAMEPAD on|off|toggle` (shell-gated, replies `ok`) and
 `GAMEPAD query` (replies `pad <enabled01> <active01>` inline). Changes
