@@ -50,7 +50,7 @@ Item {
   property bool touchSwallow: true    // on: virtual pointer device; off: native touchscreen
   property var grid: null             // letter grid from the plugin (ROWS)
   property string touchMonitor: ""    // monitor with the touch surface (plugin MON reply)
-  property bool gamepad: true         // want: pad reader enabled (persisted, reconciled)
+  property bool gamepad: true         // want: pad reader on (auto when a pad streams)
   property bool padActive: false      // have: plugin holds a streaming pad (push)
 
   // Gamepad grid navigation (Steam-like typing): the plugin routes pad
@@ -874,7 +874,7 @@ Item {
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
   Component.onCompleted: {
-    console.log("[ekollof.osk] loaded rev20 layout=" + root.layout + " cfg=" + root.cfgPath())
+    console.log("[ekollof.osk] loaded rev21 layout=" + root.layout + " cfg=" + root.cfgPath())
     const helper = root.jsonHelper()
     if (!helper) {
       root.applyConfig("")

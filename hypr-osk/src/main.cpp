@@ -46,8 +46,11 @@
  *                                + gestures) or pass it to Hyprland's native
  *                                touchscreen support
  *   GAMEPAD <on|off|toggle|query> runtime enable for the pad reader
- *                                (shell-gated; query answers "pad <e> <a>"
- *                                inline, sets are "ok" + an async push).
+ *                                (pinned-shell only; query answers
+ *                                "pad <e> <a>" inline, sets are "ok" + an
+ *                                async push). Default is on: a plugged-in
+ *                                matching controller works immediately;
+ *                                GAMEPAD off is the kill switch.
  *   Unsolicited pushes (never replies): `grid <json>`, `mon <…>`,
  *   `nav <action> <1|0>`, `pad <enabled01> <active01>`.
  *
@@ -66,20 +69,23 @@
  * Commands are queued from the socket thread and executed on the
  * compositor main thread via an EventLoop timer.
  *
- * Gamepad prototype (Steam Controller 2026, "Puck"): off unless
- * HYPR_OSK_GAMEPAD=1 is set in the compositor's environment. A reader
- * thread opens the pad's hidraw node directly (VID 28de, PID 1302/1304),
- * parses report 0x42 (wire layout from s3govesus/steam-controller-x
- * crates/sc-protocol/src/report.rs — the only public decode of this
- * hardware: buttons = bytes 2..4 bitmask, left stick i16le @10/12, right
- * pad i16le @24/26, triggers u16le @6/8) and drives the same
- * in-compositor primitives as touch: right pad → relative cursor motion,
- * right-pad click / right trigger → left button, left pad click / left
- * trigger → right button, left stick → scroll, face buttons/D-pad → keys,
- * GUIDE → SUPER+SHIFT+K chord (OSK toggle), START → SUPER+SPACE chord
- * (Omarchy menu). Chords go through execKey on the synthetic keyboard so
- * real compositor keybinds fire — no new IPC needed. Pad input is trusted
- * local hardware (like touch): no shell/visibility gate.
+ * Gamepad prototype (Steam Controller 2026, "Puck"): on by default so a
+ * plugged-in controller works without a settings round-trip. The reader
+ * starts at plugin load (HYPR_OSK_GAMEPAD=0 disables at load). It holds
+ * no device and injects nothing until a matching hidraw actually streams.
+ * Socket GAMEPAD is never an injection path: it only arms or parks the
+ * hidraw reader. GAMEPAD off from the pinned shell is the kill switch.
+ * A reader thread then opens the pad's hidraw node (VID 28de, PID 1302/1304
+ * parsed from HID_ID=, not a uevent substring), parses report 0x42 (wire
+ * layout from s3govesus/steam-controller-x crates/sc-protocol/src/report.rs)
+ * and drives the same in-compositor primitives as a local USB keyboard /
+ * touchpad: right pad → relative cursor motion, right-pad click / right
+ * trigger → left button, left pad click / left trigger → right button,
+ * left stick → scroll, allowlisted face buttons/D-pad → keys, GUIDE →
+ * SUPER+SHIFT+K, START → SUPER+SPACE. Pad commands are stamped pid=0 so a
+ * socket client cannot forge them; enable/disable still requires the pinned
+ * shell. The reader never calls compositor APIs or writes the client socket
+ * (ring + coalesced PADWAKE/PADSTATE, same discipline as the socket thread).
  * Steam-like typing: while the OSK panel is visible the reader routes
  * D-pad / A / X / Y / B and the left stick to unsolicited `nav <action>
  * <1|0>` socket lines (action = up|down|left|right|commit|back|space|close)
@@ -135,6 +141,7 @@
 #include <hyprland/src/event/EventBus.hpp>
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <climits>
 #include <fstream>
@@ -200,7 +207,7 @@ static int    debug   = 1;
  * bounded to 95 bytes. */
 struct SOskCommand {
     enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, POINTER, SCROLL, SWALLOW, PANEL,
-                                 PADKEY, PADPTR, PADCHORD, PADWAKE, PADNAV, MONREFRESH, GAMEPAD } type;
+                                 PADKEY, PADPTR, PADCHORD, PADWAKE, PADNAV, PADSTATE, MONREFRESH, GAMEPAD } type;
     int   a = 0, b = 0;
     pid_t pid           = 0; /* SO_PEERCRED pid stamped at queue time */
     float panel[4]      = {0, 0, 0, 0}; /* PANEL nx ny nw nh */
@@ -225,7 +232,7 @@ static wl_event_source  *g_drainEventSource = nullptr;
  * here because publishStats/STATS read them) */
 static std::atomic<bool> g_padActive{false};
 static std::atomic<uint32_t> g_padButtons{0};
-static std::atomic<bool> g_padEnabled{false};
+static std::atomic<bool> g_padEnabled{true}; /* auto: inject once a matching pad streams */
 
 static void wakeDrain();
 
@@ -725,13 +732,13 @@ static void execLayout(const std::string &spec)
     DBG("layout applied: " + spec);
 }
 
-static void execPmove(int x, int y)
+[[maybe_unused]] static void execPmove(int x, int y)
 {
     Pointer::pointerController()->warpTo(Vector2D{(double)x, (double)y}, true);
     g_pInputManager->simulateMouseMovement();
 }
 
-static void execPbtn(unsigned code, int press)
+[[maybe_unused]] static void execPbtn(unsigned code, int press)
 {
     g_pSeatManager->sendPointerButton(nowMs(), code,
                                       press ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
@@ -980,7 +987,11 @@ static void traceGeom(const std::string &line)
     }();
     if (!enabled)
         return;
-    std::ofstream f("/tmp/hypr-osk-geom.log", std::ios::app);
+    const char *rtd = getenv("XDG_RUNTIME_DIR");
+    if (!rtd || rtd[0] != '/')
+        return; /* never fall back to shared /tmp */
+    std::string path = std::string(rtd) + "/hypr-osk-geom.log";
+    std::ofstream f(path, std::ios::app);
     f << nowMs() << " " << line << "\n";
 }
 
@@ -1984,7 +1995,7 @@ static bool handle_line(int cfd, char *line)
         const char *arg = line + 7;
         while (*arg == ' ')
             arg++;
-        if (!strcmp(arg, "query") || !*arg) {
+        if (!strcmp(arg, "query")) {
             char buf[32];
             snprintf(buf, sizeof buf, "pad %d %d", (int)g_padEnabled.load(std::memory_order_relaxed),
                      (int)g_padActive.load(std::memory_order_relaxed));
@@ -2275,7 +2286,7 @@ static void padQueue(SOskCommand::EType t, int a, int b)
     c.type = t;
     c.a    = a;
     c.b    = b;
-    c.pid  = 0; /* trusted hardware input: drain must not apply the shell gate */
+    c.pid  = 0; /* hardware path: never a socket peer; drain must not treat this as fromShell */
     queueCommand(c);
 }
 
@@ -2285,6 +2296,21 @@ static void padWake()
      * accumulated since the last one */
     if (!g_padWakePending.exchange(true))
         padQueue(SOskCommand::EType::PADWAKE, 0, 0);
+}
+
+static bool padHidIdMatch(const std::string &txt)
+{
+    /* HID_ID=0003:000028DE:00001304 — vendor/product fields only, not a
+     * substring match anywhere in uevent (HID_NAME, PHYS, UNIQ, …). */
+    const char *p = txt.c_str();
+    while ((p = strstr(p, "HID_ID=")) != nullptr) {
+        p += 7;
+        unsigned bus = 0, vid = 0, pid = 0;
+        if (sscanf(p, "%x:%x:%x", &bus, &vid, &pid) == 3 &&
+            vid == 0x28de && (pid == 0x1304 || pid == 0x1302))
+            return true;
+    }
+    return false;
 }
 
 static int padOpenStreamer()
@@ -2300,9 +2326,7 @@ static int padOpenStreamer()
         if (!f.good())
             continue;
         std::string txt((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        if (txt.find("28DE") == std::string::npos && txt.find("28de") == std::string::npos)
-            continue;
-        if (txt.find("1304") == std::string::npos && txt.find("1302") == std::string::npos)
+        if (!padHidIdMatch(txt))
             continue;
         int fd = open(node, O_RDONLY | O_NONBLOCK);
         if (fd < 0)
@@ -2326,56 +2350,43 @@ static int padOpenStreamer()
     return -1;
 }
 
+static bool padPhantomName(const char *name)
+{
+    /* kernel hid-generic nodes for this hardware: "Puck Mouse"/"Puck Keyboard"
+     * or "Steam Controller …". Require those tokens, not a lone "Puck". */
+    if (strstr(name, "Steam Controller"))
+        return true;
+    return strstr(name, "Puck Mouse") || strstr(name, "Puck Keyboard") ||
+           strstr(name, "Puck Consumer") || strstr(name, "Puck System");
+}
+
 static void padGrabPhantoms(int *held, int *nheld)
 {
     /* EVIOCGRAB the kernel hid-generic phantom mouse/keyboard nodes so
      * lizard-mode events don't double with the synthetic ones. Best effort:
-     * held fds keep the grab alive; released on thread exit. */
+     * name-probe with O_RDONLY, grab only matching nodes; released on
+     * thread exit. */
     *nheld = 0;
     for (int i = 0; i < 64 && *nheld < 16; i++) {
         char node[64];
         snprintf(node, sizeof node, "/dev/input/event%d", i);
-        int fd = open(node, O_RDWR | O_NONBLOCK);
+        int fd = open(node, O_RDONLY | O_NONBLOCK);
         if (fd < 0)
             continue;
         char name[256] = {0};
-        if (ioctl(fd, EVIOCGNAME_256, name) < 0) {
+        if (ioctl(fd, EVIOCGNAME_256, name) < 0 || !padPhantomName(name)) {
             close(fd);
             continue;
         }
-        if (!strstr(name, "Puck") && !strstr(name, "Steam Controller")) {
-            close(fd);
+        int wr = open(node, O_RDWR | O_NONBLOCK);
+        close(fd);
+        if (wr < 0)
             continue;
-        }
-        if (ioctl(fd, EVIOCGRAB, (void *)1) == 0)
-            held[(*nheld)++] = fd;
+        if (ioctl(wr, EVIOCGRAB, (void *)1) == 0)
+            held[(*nheld)++] = wr;
         else
-            close(fd);
+            close(wr);
     }
-}
-
-static bool padSteamRunning()
-{
-    /* hidraw is non-exclusive: a running Steam client consumes the same
-     * reports and acts on its own parse in parallel. Warn once. */
-    for (int pid = 1; pid < 1 << 22; pid++) {
-        char link[64], exe[256];
-        snprintf(link, sizeof link, "/proc/%d/exe", pid);
-        ssize_t n = readlink(link, exe, sizeof exe - 1);
-        if (n <= 0) {
-            if (pid > 60000)
-                break;
-            continue;
-        }
-        exe[n] = 0;
-        const char *base = strrchr(exe, '/');
-        base             = base ? base + 1 : exe;
-        if (!strcmp(base, "steam") || !strcmp(base, ".steam-wrapped"))
-            return true;
-        if (pid > 200000)
-            break;
-    }
-    return false;
 }
 
 static int16_t padI16(const unsigned char *r, int off)
@@ -2390,11 +2401,17 @@ static uint16_t padU16(const unsigned char *r, int off)
 
 static void padPushState()
 {
-    /* main thread only (drain): enabled + active snapshot to the client */
+    /* main thread only (drain): enabled + active snapshot to the client.
+     * The reader queues PADSTATE instead of calling this. */
     char buf[32];
     snprintf(buf, sizeof buf, "pad %d %d", (int)g_padEnabled.load(std::memory_order_relaxed),
              (int)g_padActive.load(std::memory_order_relaxed));
     sendToClient(buf);
+}
+
+static void padQueueState()
+{
+    padQueue(SOskCommand::EType::PADSTATE, 0, 0);
 }
 
 static void padWakeThread()
@@ -2411,8 +2428,6 @@ static void padWakeThread()
 
 static void padThreadFn()
 {
-    if (padSteamRunning())
-        traceGeom("gamepad: steam running, hidraw reports shared with the client");
     int grabbed[16], ngrabbed = 0;
     unsigned char report[128];
     while (g_padRunning) {
@@ -2438,7 +2453,7 @@ static void padThreadFn()
             continue;
         }
         g_padActive = true;
-        padPushState();
+        padQueueState();
         padGrabPhantoms(grabbed, &ngrabbed);
         traceGeom("gamepad: streaming hidraw open, phantoms grabbed=" + std::to_string(ngrabbed));
         /* stick rest calibration: sticks idle near (not at) 0, so the open
@@ -2711,7 +2726,7 @@ static void padThreadFn()
         close(fd);
         g_padActive = false;
         g_padButtons.store(0, std::memory_order_relaxed);
-        padPushState();
+        padQueueState();
     }
     if (g_padPipe[0] >= 0)
         close(g_padPipe[0]);
@@ -2818,8 +2833,10 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 if (fromShell)
                     execLayout(c.text);
                 break;
-            case SOskCommand::EType::PMOVE: execPmove(c.a, c.b); break;
-            case SOskCommand::EType::PBTN: execPbtn((unsigned)c.a, c.b); break;
+            case SOskCommand::EType::PMOVE:
+            case SOskCommand::EType::PBTN:
+                /* socket always replies err pointer disabled; never apply */
+                break;
             case SOskCommand::EType::FLING:
                 if (!fromShell)
                     break;
@@ -2886,11 +2903,16 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                     " inject=" + std::to_string((int)panel_rect_valid));
                 break;
             case SOskCommand::EType::PADKEY:
-                /* trusted hardware input: no shell/visibility gate (like touch) */
+                /* hidraw path (pid=0): allowlisted keys, like a USB keyboard.
+                 * Downs only while the reader is enabled; releases always. */
+                if (!g_padEnabled.load(std::memory_order_relaxed) && c.b)
+                    break;
                 traceGeom("pad key evdev=" + std::to_string(c.a) + (c.b ? " down" : " up"));
                 execKey((unsigned)c.a, c.b);
                 break;
             case SOskCommand::EType::PADPTR: {
+                if (!g_padEnabled.load(std::memory_order_relaxed) && c.b)
+                    break;
                 uint32_t t = nowMs();
                 traceGeom("pad ptr btn=" + std::to_string(c.a) + (c.b ? " down" : " up"));
                 g_pSeatManager->sendPointerButton(t, (uint32_t)c.a,
@@ -2900,23 +2922,38 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 break;
             }
             case SOskCommand::EType::PADCHORD:
+                if (!g_padEnabled.load(std::memory_order_relaxed))
+                    break;
                 if (c.a == 0)
                     padTapChord({KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_K}); /* OSK toggle bind */
                 else
                     padTapChord({KEY_LEFTMETA, KEY_SPACE}); /* Omarchy menu bind */
                 break;
             case SOskCommand::EType::PADNAV: {
-                /* trusted hardware input, unsolicited push (like grid) */
+                /* hidraw path, unsolicited push (like grid). Releases always
+                 * so a disable mid-hold cannot leave QML repeating. */
                 static const char *padNavNames[] = {"up",   "down",  "left", "right",
                                                     "commit", "back", "space", "close"};
+                if (!g_padEnabled.load(std::memory_order_relaxed) && c.b)
+                    break;
                 if (c.a >= 0 && c.a < 8) {
                     traceGeom(std::string("pad nav ") + padNavNames[c.a] + (c.b ? " 1" : " 0"));
                     sendToClient(std::string("nav ") + padNavNames[c.a] + (c.b ? " 1" : " 0"));
                 }
                 break;
             }
+            case SOskCommand::EType::PADSTATE:
+                padPushState();
+                break;
             case SOskCommand::EType::PADWAKE: {
                 g_padWakePending.store(false);
+                if (!g_padEnabled.load(std::memory_order_relaxed)) {
+                    g_padDX.store(0.0);
+                    g_padDY.store(0.0);
+                    g_padSX.store(0.0);
+                    g_padSY.store(0.0);
+                    break;
+                }
                 double dx = g_padDX.exchange(0.0), dy = g_padDY.exchange(0.0);
                 if (dx != 0.0 || dy != 0.0) {
                     /* full device-motion path, like a touchpad: relative move
@@ -2973,9 +3010,9 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
 }
 
 /* ---------------- plugin init ---------------- */
-/* main thread only: start the pad reader once (idempotent). The QML-owned
- * osk.json default enables the pad, so a session without HYPR_OSK_GAMEPAD
- * still starts it on the first GAMEPAD-on reconcile. */
+/* main thread only: start the pad reader once (idempotent). Started at
+ * load so a plugged-in controller is detected immediately; GAMEPAD off
+ * parks it with no device open. */
 static void ensurePadThread()
 {
     if (g_padThread.joinable())
@@ -3090,18 +3127,19 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     traceGeom(std::string("plugin init, swallow=") + (touch_swallow ? "on" : "off"));
     refreshIntendedShell();
     g_socketThread = std::thread(socket_thread_fn, socketPath());
-    /* gamepad reader: env default; the QML reconciles osk.json over it via
-     * GAMEPAD on first handshake (lazy start if the env is unset) */
+    /* gamepad reader: auto-start so a plugged-in pad works before QML
+     * handshakes. HYPR_OSK_GAMEPAD=0 disables at load; osk.json / GAMEPAD
+     * off from the pinned shell parks it later. */
     if (const char *g = getenv("HYPR_OSK_PAD_GAIN")) {
         char *endp = nullptr;
         double v   = strtod(g, &endp);
         if (endp != g && v >= 0.1 && v <= 5.0)
             g_padGain = v;
     }
-    if (getenv("HYPR_OSK_GAMEPAD") && !strcmp(getenv("HYPR_OSK_GAMEPAD"), "1")) {
-        g_padEnabled.store(true, std::memory_order_relaxed);
+    if (const char *ge = getenv("HYPR_OSK_GAMEPAD"); ge && !strcmp(ge, "0"))
+        g_padEnabled.store(false, std::memory_order_relaxed);
+    if (g_padEnabled.load(std::memory_order_relaxed))
         ensurePadThread();
-    }
     bindTouchHooks();
 
     Log::logger->log(Log::INFO, "[hypr-osk] plugin initialized, socket at " + socketPath());

@@ -58,35 +58,40 @@ Bumpers, paddles and the "dots" button are unmapped (free for later).
 
 ## Bar icon + toggle
 
-The OSK bar applet shows a gamepad icon next to the keyboard icon only
-while a controller streams (it hides when none is attached; re-enable from
-the panel's Gamepad section). Click the icon to toggle the reader; the
-panel has a Gamepad section with the same toggle plus connection status.
+The reader starts with the compositor plugin and injects only while a
+matching controller streams (plug in / wake the pad and it works). The
+OSK bar applet shows a gamepad icon next to the keyboard icon only while
+a controller is attached. Click the icon to disable the reader; the
+panel's Gamepad section has the same toggle plus connection status.
 State persists in `osk.json` (`gamepad`) and reconciles on every handshake.
 
-Socket: `GAMEPAD on|off|toggle` (shell-gated, replies `ok`) and
+Socket: `GAMEPAD on|off|toggle` (pinned-shell only, replies `ok`) and
 `GAMEPAD query` (replies `pad <enabled01> <active01>` inline). Changes
 arrive as unsolicited `pad <enabled> <active>` pushes. Disabling closes
 the hidraw fd, releases grabs/held inputs and sleeps without polling.
 
-## Enable
+## Enable / disable
+
+On by default: a matching Steam Controller (VID `28de`, PID `1302`/`1304`)
+works as soon as it streams. No env var required.
 
 ```lua
--- hypr/osk.lua (deployed to ~/.config/hypr/osk.lua)
-hl.env("HYPR_OSK_GAMEPAD", "1")
+-- hypr/osk.lua — optional; the plugin auto-starts the reader
+-- hl.env("HYPR_OSK_GAMEPAD", "0")     -- kill switch at compositor load
 -- hl.env("HYPR_OSK_PAD_GAIN", "0.6")  -- pointer sensitivity, 0.1–5
--- hl.env("HYPR_OSK_TRACE", "1")       -- /tmp/hypr-osk-geom.log tracing
+-- hl.env("HYPR_OSK_TRACE", "1")       -- $XDG_RUNTIME_DIR/hypr-osk-geom.log
 ```
 
-`./install.sh`, then `hyprctl reload` + plugin reload (or relog).
-`STATS` shows `pad=1 padbtn=<hex>` when the reader holds the device.
+Bar applet toggle (or `omarchy-shell ekollof.osk setGamepad off`) parks the
+reader. `STATS` shows `pad=1 padbtn=<hex>` when it holds the device.
 
 ## Constraints (do not re-learn)
 
 - **Quit Steam while testing.** hidraw has no exclusive open: a running
   Steam client consumes the same reports and acts on its own (mis)parse in
   parallel. Its desktop cursor is separately broken on Hyprland (Valve
-  #13185; `lib32-extest` workaround).
+  #13185; `lib32-extest` workaround). The plugin does not scan `/proc` for
+  Steam; this is a usage constraint, not a runtime check.
 - **Phantom lizard-mode nodes are EVIOCGRABbed** while gamepad mode holds
   the device (8 nodes: 4 mouse + 4 keyboard), so kernel events don't double
   the synthetic ones. Released on device loss / plugin unload.
@@ -109,14 +114,17 @@ hl.env("HYPR_OSK_GAMEPAD", "1")
   plugin at `panel_valid=0` (no TEXT/KEY/nav) with no later retry.
 - **MON follows the pointer** when no touch device is bound (touch frame
   wins while bound so taps stay in-frame); the shell docks on that monitor.
-- Reader thread never calls compositor APIs (ring + coalesced PADWAKE,
-  same discipline as the socket thread); teardown joins it before unmap;
-  no event-loop timers of its own.
+- Reader thread never calls compositor APIs or writes the client socket
+  (ring + coalesced PADWAKE/PADSTATE, same discipline as the socket
+  thread); teardown joins it before unmap; no event-loop timers of its own.
+- HID match is `HID_ID=` vendor/product (`28de` + `1302`/`1304`), not a
+  substring anywhere in uevent. Phantom grabs name-probe `O_RDONLY` first.
 
 ## Test checklist
 
 1. Steam quit. `./install.sh`, `hyprctl reload`, plugin reload.
-   Geom log: `gamepad: streaming hidraw open, phantoms grabbed=8`.
+   Geom log (`$XDG_RUNTIME_DIR/hypr-osk-geom.log` when `HYPR_OSK_TRACE=1`):
+   `gamepad: streaming hidraw open, phantoms grabbed=8`.
 2. Right stick / right pad move a *visible* cursor (press A first: the
    cursor hides on keypress and stick motion must re-show it).
 3. RT = left click, LT = right click; full RT pull = exactly one left

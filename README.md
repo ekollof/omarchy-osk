@@ -147,9 +147,22 @@ control are in the header comment). Short map:
 - **Threads**: the socket thread never calls compositor APIs. Commands go
   through a fixed ring buffer; an eventfd wakes the Wayland loop, which
   arms a 0 ms drain timer. Touch handlers likewise only schedule work.
-- **Teardown (`PLUGIN_EXIT`)**: socket stop flag + wake pipe → thread join →
-  drain eventfd source remove + close → bus disconnect → timer removal →
-  key release → device destroy. The `.so` is unmapped after unload.
+  The gamepad reader is the same: hidraw on its own thread, apply on drain
+  (`PADKEY`/`PADPTR`/`PADCHORD`/`PADWAKE`/`PADSTATE`); it never writes the
+  client socket or calls compositor APIs.
+- **Gamepad**: auto-starts at plugin load so a plugged-in Steam Controller
+  (VID `28de`, PID `1302`/`1304` from `HID_ID=`, not a uevent substring)
+  works immediately. Injection is allowlisted keys/buttons/motion from
+  that hidraw only (like a USB keyboard), stamped `pid=0` so a socket
+  client cannot forge it. `GAMEPAD on|off` is pinned-shell only and is
+  not an injection path. `GAMEPAD off` (bar applet / `osk.json`) parks
+  the reader with no device open. `HYPR_OSK_GAMEPAD=0` disables at load.
+  Phantom lizard-mode nodes are `EVIOCGRAB`bed only after an `O_RDONLY`
+  name probe matching `Puck Mouse`/`Puck Keyboard`/`Steam Controller`.
+- **Teardown (`PLUGIN_EXIT`)**: gamepad stop + join (releases grabs) →
+  socket stop flag + wake pipe → thread join → drain eventfd source
+  remove + close → bus disconnect → timer removal → key release →
+  device destroy. The `.so` is unmapped after unload.
 
 ## Security
 
@@ -166,6 +179,9 @@ session, so:
 - `TEXT`/`KEY`/`MOD` also require that pinned instance to own the mapped
   `ekollof-osk` layer (the panel is actually showing)
 - `PMOVE`/`PBTN` are disabled (`err pointer disabled`)
+- gamepad injection is local hidraw of a matching controller, not a
+  socket command; enable/disable is pinned-shell only; default-on means
+  "works when the pad is detected", and `GAMEPAD off` is the kill switch
 
 ## Removal
 

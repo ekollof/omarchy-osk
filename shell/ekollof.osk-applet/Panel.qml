@@ -305,7 +305,7 @@ Panel {
         label: "Gamepad control"
         description: !root.gamepad ? "Off: the pad reader holds no device"
                      : root.padActive ? "On: controller connected — stick/pad move the pointer, GUIDE summons the OSK"
-                     : "On: waiting for the controller (wake it with any button)"
+                     : "On: waiting for a controller (works as soon as one is detected)"
         checked: root.gamepad
         foreground: root.bar ? root.bar.foreground : Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
