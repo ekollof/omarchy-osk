@@ -2226,6 +2226,8 @@ static int               g_padPipe[2] = {-1, -1};
 static std::atomic<double> g_padDX{0}, g_padDY{0}, g_padSX{0}, g_padSY{0};
 static std::atomic<bool> g_padWakePending{false};
 static double            g_padGain = 1.0;
+/* stick rest centers persist across reopens; only still windows adopt */
+static double padRestLX = 0, padRestLY = 0, padRestRX = 0, padRestRY = 0;
 
 #ifndef EVIOCGNAME_256
 #define EVIOCGNAME_256 0x80804506
@@ -2439,34 +2441,17 @@ static void padThreadFn()
         padPushState();
         padGrabPhantoms(grabbed, &ngrabbed);
         traceGeom("gamepad: streaming hidraw open, phantoms grabbed=" + std::to_string(ngrabbed));
-        /* sticks don't rest at exactly 0 (observed ~±500 on this unit):
-         * average the first 30 reports as the rest center so a centered
-         * stick never drifts the cursor */
-        double restLX = 0, restLY = 0, restRX = 0, restRY = 0;
-        {
-            long accLX = 0, accLY = 0, accRX = 0, accRY = 0;
-            int got = 0;
-            unsigned char calm[128];
-            struct pollfd cpfd{fd, POLLIN, 0};
-            while (got < 30 && g_padRunning) {
-                if (poll(&cpfd, 1, 500) <= 0 || !(cpfd.revents & POLLIN))
-                    break;
-                ssize_t cn = read(fd, calm, sizeof calm);
-                if (cn < PAD_LEN_MIN || calm[0] != 0x42)
-                    continue;
-                accLX += padI16(calm, PAD_LSTICK_X);
-                accLY += padI16(calm, PAD_LSTICK_Y);
-                accRX += padI16(calm, PAD_RSTICK_X);
-                accRY += padI16(calm, PAD_RSTICK_Y);
-                got++;
-            }
-            if (got > 0) {
-                restLX = (double)accLX / got;
-                restLY = (double)accLY / got;
-                restRX = (double)accRX / got;
-                restRY = (double)accRY / got;
-            }
-        }
+        /* stick rest calibration: sticks idle near (not at) 0, so the open
+         * path used to average whatever the sticks happened to be doing —
+         * including a held deflection right after toggle-on, which then
+         * drifted the cursor forever. Instead, keep the previous rest and
+         * adopt a new one only from a still window (30 consecutive reports
+         * within ±400 on every axis); input runs on the old rest meanwhile.
+         * First boot rest is 0, inside the 1500 deadzone of typical units. */
+        double restLX = padRestLX, restLY = padRestLY, restRX = padRestRX, restRY = padRestRY;
+        bool   restSettled = false;
+        int16_t calLX[32], calLY[32], calRX[32], calRY[32];
+        int calN = 0;
         uint32_t lastBtn   = 0;
         bool     lastRT    = false, lastLT = false, lastLpadClick = false;
         bool     lastNavMode = false;
@@ -2634,6 +2619,66 @@ static void padThreadFn()
                     g_padDX.fetch_add(rdx / 32767.0 * 12.0);
                     g_padDY.fetch_add(-rdy / 32767.0 * 12.0); /* sign TBD live */
                     padWake();
+                }
+                /* stillness-gated rest adoption: feed this report's raw stick
+                 * sample; a 30-report window with every axis within ±400 of
+                 * its mean becomes the new rest (input above already ran on
+                 * the old rest, so calibration never stalls input). */
+                if (!restSettled) {
+                    int16_t sx = padI16(report, PAD_LSTICK_X), sy = padI16(report, PAD_LSTICK_Y);
+                    int16_t qx = padI16(report, PAD_RSTICK_X), qy = padI16(report, PAD_RSTICK_Y);
+                    if (calN < 32) {
+                        calLX[calN] = sx;
+                        calLY[calN] = sy;
+                        calRX[calN] = qx;
+                        calRY[calN] = qy;
+                        calN++;
+                    } else {
+                        memmove(calLX, calLX + 1, 31 * sizeof(int16_t));
+                        memmove(calLY, calLY + 1, 31 * sizeof(int16_t));
+                        memmove(calRX, calRX + 1, 31 * sizeof(int16_t));
+                        memmove(calRY, calRY + 1, 31 * sizeof(int16_t));
+                        calLX[31] = sx;
+                        calLY[31] = sy;
+                        calRX[31] = qx;
+                        calRY[31] = qy;
+                    }
+                    if (calN >= 30) {
+                        long aLX = 0, aLY = 0, aRX = 0, aRY = 0;
+                        int16_t nLX = 32767, xLX = -32768, nLY = 32767, xLY = -32768;
+                        int16_t nRX = 32767, xRX = -32768, nRY = 32767, xRY = -32768;
+                        for (int i = calN - 30; i < calN; i++) {
+                            aLX += calLX[i];
+                            aLY += calLY[i];
+                            aRX += calRX[i];
+                            aRY += calRY[i];
+                            if (calLX[i] < nLX) nLX = calLX[i];
+                            if (calLX[i] > xLX) xLX = calLX[i];
+                            if (calLY[i] < nLY) nLY = calLY[i];
+                            if (calLY[i] > xLY) xLY = calLY[i];
+                            if (calRX[i] < nRX) nRX = calRX[i];
+                            if (calRX[i] > xRX) xRX = calRX[i];
+                            if (calRY[i] < nRY) nRY = calRY[i];
+                            if (calRY[i] > xRY) xRY = calRY[i];
+                        }
+                        if (xLX - nLX < 800 && xLY - nLY < 800 && xRX - nRX < 800 && xRY - nRY < 800) {
+                            double mLX = (double)aLX / 30, mLY = (double)aLY / 30;
+                            double mRX = (double)aRX / 30, mRY = (double)aRY / 30;
+                            /* stillness is not centeredness: a steadily held
+                             * deflection is still too. Reject windows far from
+                             * the current rest (a real rest sits within ±6000
+                             * of it; first boot rest is 0). */
+                            if (std::hypot(mLX - restLX, mLY - restLY) < 6000.0 &&
+                                std::hypot(mRX - restRX, mRY - restRY) < 6000.0) {
+                                restLX = padRestLX = mLX;
+                                restLY = padRestLY = mLY;
+                                restRX = padRestRX = mRX;
+                                restRY = padRestRY = mRY;
+                                restSettled = true;
+                                traceGeom("gamepad: stick rest settled");
+                            }
+                        }
+                    }
                 }
             }
             if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
