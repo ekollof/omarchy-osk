@@ -1,6 +1,7 @@
 #!/usr/bin/bash
 # Toggle the on-screen keyboard (ekollof.osk Quickshell plugin in omarchy-shell).
-# Used by the hyprgrass swipe-up-from-bottom-edge gesture and SUPER+SHIFT+K.
+# Used ONLY by the hyprgrass swipe-up-from-bottom-edge gesture (SUPER+SHIFT+K
+# summons directly: keybinds fire once per press and need no debounce).
 # The plugin's open() toggles visibility. Debounced: hyprgrass can fire the
 # edge gesture twice per swipe; without a lock the double toggle opens+closes.
 

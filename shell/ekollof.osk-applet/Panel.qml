@@ -75,12 +75,14 @@ Panel {
     root.oskEnabled = on
   }
 
+  // Toggle through the OSK's own IPC target: root.opened is the single
+  // source of truth. shell.toggle() consults openPanelIds, which goes stale
+  // (summon closes via open() without clearing it), so every other click
+  // landed on a phantom "open" state and did nothing visible.
   function toggleOsk() {
-    const shell = root.shellObj()
-    if (shell && typeof shell.toggle === "function")
-      shell.toggle(root.oskPluginId, "{}")
-    else if (root.bar)
-      root.bar.run("omarchy-shell shell toggle " + root.oskPluginId + " '{}'")
+    if (!root.bar)
+      return
+    root.bar.run("omarchy-shell ekollof.osk toggle")
   }
 
   function shellQuote(s) {
@@ -237,7 +239,7 @@ Panel {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
             font.bold: true
-            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev8")
+            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev11")
           }
 
           Text {
@@ -627,8 +629,10 @@ Panel {
       }
     }
     onExited: function() {
-      if (!stateProc.gotState)
+      if (!stateProc.gotState) {
+        console.log("[ekollof.osk-applet] stateProc failed, oskEnabled=false")
         root.oskEnabled = false
+      }
       stateProc.gotState = false
     }
   }

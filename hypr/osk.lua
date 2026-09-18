@@ -43,6 +43,10 @@ if hl.plugin and hl.plugin.hyprgrass then
   }
 end
 
--- Physical-keyboard fallback for the same toggle.
+-- Physical-keyboard toggle: direct summon, NO debounce. Compositor keybinds
+-- fire once per press, so every press toggles. (The swipe path below keeps
+-- the debounced script: hyprgrass fires the edge gesture twice per swipe,
+-- and sharing the 1500 ms lock made fast double-taps of this combo eat
+-- their own second press.)
 o.bind("SUPER + SHIFT + K", "Toggle on-screen keyboard",
-  os.getenv("HOME") .. "/.config/hypr/scripts/osk-toggle.sh")
+  "omarchy-shell shell summon ekollof.osk '{}'")
