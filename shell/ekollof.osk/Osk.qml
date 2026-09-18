@@ -52,6 +52,7 @@ Item {
   property string touchMonitor: ""    // monitor with the touch surface (plugin MON reply)
   property bool gamepad: true         // want: pad reader on (auto when a pad streams)
   property bool padActive: false      // have: plugin holds a streaming pad (push)
+  property var gamepadMap: ({})       // allowlisted button/stick map (osk.json)
 
   // Gamepad grid navigation (Steam-like typing): the plugin routes pad
   // buttons to `nav <action> <1|0>` lines while the panel is visible.
@@ -179,11 +180,12 @@ Item {
     root.scrollAxisPx = cfg.scrollAxisPx !== undefined ? !!cfg.scrollAxisPx : false
     root.touchSwallow = cfg.touchSwallow !== undefined ? !!cfg.touchSwallow : true
     root.gamepad = cfg.gamepad !== undefined ? !!cfg.gamepad : true
+    root.gamepadMap = root.sanitizeGamepadMap(cfg.gamepadMap)
     root.cfgLoaded = true
     // persist on first run so the applet sees the LANG-derived default too
     if (!raw || !cfg.layout || cfg.repeat === undefined || cfg.flingDecay === undefined ||
         cfg.flingCap === undefined || cfg.touchSwallow === undefined ||
-        cfg.gamepad === undefined ||
+        cfg.gamepad === undefined || cfg.gamepadMap === undefined ||
         cfg.dragSlop === undefined || cfg.longPress === undefined ||
         cfg.scrollGain === undefined || cfg.scrollAxisPx === undefined ||
         cfg.repeatDelay !== root.repeatDelay || cfg.repeatInterval !== root.repeatInterval)
@@ -208,7 +210,8 @@ Item {
       scrollGain: root.scrollGain,
       scrollAxisPx: root.scrollAxisPx,
       touchSwallow: root.touchSwallow,
-      gamepad: root.gamepad
+      gamepad: root.gamepad,
+      gamepadMap: root.gamepadMap
     })
     cfgSave.command = ["/usr/bin/python3", helper, "save", root.cfgPath(), body]
     cfgSave.running = false
@@ -231,6 +234,7 @@ Item {
       scrollAxisPx: root.scrollAxisPx,
       touchSwallow: root.touchSwallow,
       gamepad: root.gamepad,
+      gamepadMap: root.gamepadMap,
       padActive: root.padActive,
       gridLoaded: !!root.grid,
       opened: root.opened
@@ -336,6 +340,92 @@ Item {
     return root.gamepad ? "on" : "off"
   }
 
+  readonly property var padActNames: [
+    "none", "enter", "escape", "backspace", "space", "tab",
+    "up", "down", "left", "right", "menu", "toggleOsk",
+    "commit", "close", "navUp", "navDown", "navLeft", "navRight",
+    "leftClick", "rightClick"
+  ]
+  readonly property var padCtrlNames: [
+    "a", "b", "x", "y", "dpadUp", "dpadDown", "dpadLeft", "dpadRight",
+    "lb", "rb", "lt", "rt", "select", "start", "guide", "lsClick", "rsClick",
+    "leftPadClick", "rightPadClick"
+  ]
+
+  function defaultGamepadMap() {
+    return {
+      pointer: "rightStick,rightPad",
+      scroll: "leftStick",
+      desktop: {
+        a: "enter", b: "escape", x: "backspace", y: "space",
+        dpadUp: "up", dpadDown: "down", dpadLeft: "left", dpadRight: "right",
+        select: "tab", start: "menu", guide: "toggleOsk",
+        rt: "leftClick", lt: "rightClick",
+        rightPadClick: "leftClick", leftPadClick: "rightClick"
+      },
+      osk: {
+        a: "commit", b: "close", x: "backspace", y: "space",
+        dpadUp: "navUp", dpadDown: "navDown", dpadLeft: "navLeft", dpadRight: "navRight",
+        select: "tab", start: "menu", guide: "toggleOsk",
+        rt: "leftClick", lt: "rightClick",
+        rightPadClick: "leftClick", leftPadClick: "rightClick"
+      }
+    }
+  }
+
+  function sanitizeGamepadMap(raw) {
+    const d = root.defaultGamepadMap()
+    const src = (raw && typeof raw === "object") ? raw : {}
+    const analogOk = /^(none|leftStick|rightStick|rightPad)(,(leftStick|rightStick|rightPad))*$/
+    let pointer = String(src.pointer || d.pointer)
+    let scroll = String(src.scroll || d.scroll)
+    if (!analogOk.test(pointer))
+      pointer = d.pointer
+    if (!analogOk.test(scroll))
+      scroll = d.scroll
+    function table(v, fallback) {
+      const out = {}
+      const srcT = (v && typeof v === "object") ? v : {}
+      for (let i = 0; i < root.padCtrlNames.length; i++) {
+        const k = root.padCtrlNames[i]
+        const a = String(srcT[k] !== undefined ? srcT[k] : (fallback[k] || "none"))
+        out[k] = root.padActNames.indexOf(a) >= 0 ? a : (fallback[k] || "none")
+      }
+      return out
+    }
+    return { pointer: pointer, scroll: scroll, desktop: table(src.desktop, d.desktop), osk: table(src.osk, d.osk) }
+  }
+
+  function padBtnCsv(table) {
+    const t = table || {}
+    const parts = []
+    for (let i = 0; i < root.padCtrlNames.length; i++) {
+      const k = root.padCtrlNames[i]
+      if (t[k] && t[k] !== "none")
+        parts.push(k + "=" + t[k])
+    }
+    return parts.join(",")
+  }
+
+  function sendGamepadMap() {
+    const m = root.sanitizeGamepadMap(root.gamepadMap)
+    root.gamepadMap = m
+    send("PADMAP pointer=" + m.pointer + " scroll=" + m.scroll)
+    send("PADBTN d " + root.padBtnCsv(m.desktop))
+    send("PADBTN o " + root.padBtnCsv(m.osk))
+  }
+
+  function setGamepadMap(arg) {
+    let raw = arg
+    if (typeof arg === "string") {
+      try { raw = JSON.parse(arg) } catch (e) { return "err bad json" }
+    }
+    root.gamepadMap = root.sanitizeGamepadMap(raw)
+    persistConfig()
+    root.sendGamepadMap()
+    return "ok"
+  }
+
   // ---- IPC: the bar applet (and scripts) drive settings through here -----
   // `omarchy-shell ekollof.osk <method> [args…]`. The shell target's generic
   // `call` verb is currently broken for panel plugins, so the applet routes
@@ -379,6 +469,10 @@ Item {
 
     function setGamepad(on: string): string {
       return root.setGamepad(on)
+    }
+
+    function setGamepadMap(json: string): string {
+      return root.setGamepadMap(json)
     }
 
     function toggle(): string {
@@ -426,6 +520,7 @@ Item {
     send("SCROLL " + root.scrollGain + " " + (root.scrollAxisPx ? "1" : "0"))
     send("SWALLOW " + (root.touchSwallow ? "1" : "0"))
     send("GAMEPAD " + (root.gamepad ? "on" : "off"))
+    root.sendGamepadMap()
     if (root.opened)
       Qt.callLater(root.syncPanel)
   }
@@ -874,7 +969,7 @@ Item {
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
   Component.onCompleted: {
-    console.log("[ekollof.osk] loaded rev21 layout=" + root.layout + " cfg=" + root.cfgPath())
+    console.log("[ekollof.osk] loaded rev22 layout=" + root.layout + " cfg=" + root.cfgPath())
     const helper = root.jsonHelper()
     if (!helper) {
       root.applyConfig("")

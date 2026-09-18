@@ -1,8 +1,17 @@
-# Gamepad control (Steam Controller 2026 prototype)
+# Gamepad control
 
-Drive Omarchy with the 2026 Steam Controller ("Puck", USB 28de:1304/1302):
-spawn the OSK from the couch, type on the grid without pointing, and use
-the stick/pads as a mouse. Implemented on branch `feat/gamepad-control`.
+Drive Omarchy from a controller: spawn the OSK, type on the grid, and use
+a stick as a mouse. Two backends:
+
+1. **Steam Controller 2026** (Puck) — hidraw VID `28de`, PID `1302`/`1304`,
+   report `0x42` (USB or Bluetooth if that report still streams).
+2. **Standard Linux gamepads** — evdev nodes with `BTN_GAMEPAD` / `BTN_SOUTH`
+   (Bluetooth DualSense, Xbox, 8BitDo, Switch Pro, …). No grab on that
+   node, so games still see the pad.
+
+Valve hidraw wins when both are present. Mapping is `gamepadMap` in
+`~/.config/omarchy/osk.json` (allowlisted tokens; the bar applet edits
+the common bindings).
 
 There is no Hyprland gamepad plugin (upstream closed it as "use userspace
 tools", and the Puck exposes no kernel gamepad device at all — only
@@ -72,8 +81,34 @@ the hidraw fd, releases grabs/held inputs and sleeps without polling.
 
 ## Enable / disable
 
-On by default: a matching Steam Controller (VID `28de`, PID `1302`/`1304`)
-works as soon as it streams. No env var required.
+On by default: a matching Steam Controller **or** a standard evdev
+gamepad works as soon as it streams. No env var required.
+
+## Mapping (`osk.json` `gamepadMap`)
+
+Allowlisted only — unknown tokens are dropped. Analog sources: `none`,
+`leftStick`, `rightStick`, `rightPad` (comma-OR for pointer). Buttons:
+`a` `b` `x` `y` `dpadUp` `dpadDown` `dpadLeft` `dpadRight` `lb` `rb` `lt`
+`rt` `select` `start` `guide` `lsClick` `rsClick` `leftPadClick`
+`rightPadClick`. Actions: `none` `enter` `escape` `backspace` `space`
+`tab` `up` `down` `left` `right` `menu` `toggleOsk` `commit` `close`
+`navUp` `navDown` `navLeft` `navRight` `leftClick` `rightClick`.
+
+`desktop` is keyboard-hidden; `osk` is keyboard-visible. The scroll stick
+becomes D-pad nav while the OSK is open. `rightPad` / pad-clicks only
+produce data on the Steam hidraw path.
+
+```json
+"gamepadMap": {
+  "pointer": "rightStick,rightPad",
+  "scroll": "leftStick",
+  "desktop": { "a": "enter", "guide": "toggleOsk", "rt": "leftClick" },
+  "osk": { "a": "commit", "b": "close" }
+}
+```
+
+`omarchy-shell ekollof.osk setGamepadMap '{"pointer":"leftStick",...}'` or
+the bar applet dropdowns. Unset keys keep the compiled defaults.
 
 ```lua
 -- hypr/osk.lua — optional; the plugin auto-starts the reader

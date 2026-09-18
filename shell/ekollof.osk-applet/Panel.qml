@@ -35,6 +35,14 @@ Panel {
   property bool scrollAxisPx: false
   property bool touchSwallow: true
   property var layouts: []
+  property var gamepadMap: ({})
+  readonly property var padAnalogOptions: ["rightStick,rightPad", "rightStick", "leftStick", "rightPad", "none"]
+  readonly property var padActOptions: [
+    "none", "enter", "escape", "backspace", "space", "tab",
+    "up", "down", "left", "right", "menu", "toggleOsk",
+    "commit", "close", "navUp", "navDown", "navLeft", "navRight",
+    "leftClick", "rightClick"
+  ]
 
   implicitWidth: buttonsRow.implicitWidth
   implicitHeight: buttonsRow.implicitHeight
@@ -126,6 +134,36 @@ Panel {
       root.gamepad = !!cfg.gamepad
     if (cfg.padActive !== undefined)
       root.padActive = !!cfg.padActive
+    if (cfg.gamepadMap && typeof cfg.gamepadMap === "object")
+      root.gamepadMap = cfg.gamepadMap
+  }
+
+  function callOskQuoted(method, arg) {
+    if (!root.bar)
+      return
+    root.bar.run("omarchy-shell ekollof.osk " + method + " " + root.shellQuote(arg))
+  }
+
+  function setMapAnalog(field, value) {
+    const m = JSON.parse(JSON.stringify(root.gamepadMap || {}))
+    m[field] = value
+    root.gamepadMap = m
+    root.callOskQuoted("setGamepadMap", JSON.stringify(m))
+  }
+
+  function setMapBtn(table, key, value, both) {
+    const m = JSON.parse(JSON.stringify(root.gamepadMap || {}))
+    if (!m[table] || typeof m[table] !== "object")
+      m[table] = {}
+    m[table][key] = value
+    if (both) {
+      const other = table === "desktop" ? "osk" : "desktop"
+      if (!m[other] || typeof m[other] !== "object")
+        m[other] = {}
+      m[other][key] = value
+    }
+    root.gamepadMap = m
+    root.callOskQuoted("setGamepadMap", JSON.stringify(m))
   }
 
   function setLayouts(raw) {
@@ -239,7 +277,7 @@ Panel {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
             font.bold: true
-            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev11")
+            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev12")
           }
 
           Text {
@@ -295,7 +333,7 @@ Panel {
       // ---------- gamepad ----------
       PanelSectionHeader {
         width: parent.width
-        text: "Gamepad (Steam Controller)"
+        text: "Gamepad"
         foreground: root.bar ? root.bar.foreground : Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
       }
@@ -315,7 +353,66 @@ Panel {
       Text {
         width: parent.width
         wrapMode: Text.WordWrap
-        text: "Quit Steam while testing: it reads the same controller reports in parallel."
+        text: "Steam Controller (Puck) and standard Bluetooth/USB gamepads (DualSense, Xbox, 8BitDo, …). Valve hidraw is preferred when both are present. Steam client will fight hidraw — quit it while using the Puck."
+        color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Color.foreground, 1.4)
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Dropdown {
+        width: parent.width
+        label: "Pointer"
+        value: (root.gamepadMap && root.gamepadMap.pointer) ? root.gamepadMap.pointer : "rightStick,rightPad"
+        options: root.padAnalogOptions
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        onChanged: function(v) { root.setMapAnalog("pointer", v) }
+      }
+
+      Dropdown {
+        width: parent.width
+        label: "Scroll (nav when keyboard is open)"
+        value: (root.gamepadMap && root.gamepadMap.scroll) ? root.gamepadMap.scroll : "leftStick"
+        options: root.padAnalogOptions
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        onChanged: function(v) { root.setMapAnalog("scroll", v) }
+      }
+
+      Repeater {
+        model: [
+          { table: "desktop", key: "a", label: "A (keyboard hidden)" },
+          { table: "osk", key: "a", label: "A (keyboard open)" },
+          { table: "desktop", key: "b", label: "B (keyboard hidden)" },
+          { table: "osk", key: "b", label: "B (keyboard open)" },
+          { table: "desktop", key: "x", label: "X (keyboard hidden)" },
+          { table: "osk", key: "x", label: "X (keyboard open)" },
+          { table: "desktop", key: "y", label: "Y (keyboard hidden)" },
+          { table: "osk", key: "y", label: "Y (keyboard open)" },
+          { table: "desktop", key: "guide", label: "Guide / Home", both: true },
+          { table: "desktop", key: "start", label: "Start / Menu", both: true },
+          { table: "desktop", key: "rt", label: "Right trigger", both: true },
+          { table: "desktop", key: "lt", label: "Left trigger", both: true }
+        ]
+        delegate: Dropdown {
+          required property var modelData
+          width: parent.width
+          label: modelData.label
+          value: {
+            const t = root.gamepadMap && root.gamepadMap[modelData.table]
+            return (t && t[modelData.key]) ? t[modelData.key] : "none"
+          }
+          options: root.padActOptions
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+          fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+          onChanged: function(v) { root.setMapBtn(modelData.table, modelData.key, v, !!modelData.both) }
+        }
+      }
+
+      Text {
+        width: parent.width
+        wrapMode: Text.WordWrap
+        text: "Full map (dpad, bumpers, pad clicks, …) is in ~/.config/omarchy/osk.json under gamepadMap."
         color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Color.foreground, 1.4)
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption

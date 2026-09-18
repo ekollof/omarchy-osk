@@ -4,7 +4,8 @@
 -- bar applet. Installed by ~/src/omarchy-osk/install.sh; edit the bundle, not
 -- this file.
 
--- Gamepad (Steam Controller 2026): auto-enabled when the pad is detected.
+-- Gamepad: auto-enabled when a Steam Controller or standard evdev pad is
+-- detected. Mapping lives in osk.json (gamepadMap).
 -- The compositor plugin starts the hidraw reader at load; injection happens
 -- only while a matching controller streams. Disable from the bar applet
 -- (persisted in osk.json) or set HYPR_OSK_GAMEPAD=0. Quit Steam while

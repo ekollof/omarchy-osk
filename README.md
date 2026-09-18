@@ -150,15 +150,14 @@ control are in the header comment). Short map:
   The gamepad reader is the same: hidraw on its own thread, apply on drain
   (`PADKEY`/`PADPTR`/`PADCHORD`/`PADWAKE`/`PADSTATE`); it never writes the
   client socket or calls compositor APIs.
-- **Gamepad**: auto-starts at plugin load so a plugged-in Steam Controller
-  (VID `28de`, PID `1302`/`1304` from `HID_ID=`, not a uevent substring)
-  works immediately. Injection is allowlisted keys/buttons/motion from
-  that hidraw only (like a USB keyboard), stamped `pid=0` so a socket
-  client cannot forge it. `GAMEPAD on|off` is pinned-shell only and is
-  not an injection path. `GAMEPAD off` (bar applet / `osk.json`) parks
-  the reader with no device open. `HYPR_OSK_GAMEPAD=0` disables at load.
-  Phantom lizard-mode nodes are `EVIOCGRAB`bed only after an `O_RDONLY`
-  name probe matching `Puck Mouse`/`Puck Keyboard`/`Steam Controller`.
+- **Gamepad**: auto-starts at plugin load. Prefers Steam Controller hidraw
+  (`HID_ID=` VID `28de`, PID `1302`/`1304`, report `0x42`); otherwise the
+  first evdev node with `BTN_SOUTH` (Bluetooth DualSense/Xbox/8BitDo, not
+  grabbed so games still see it). Allowlisted `PADMAP`/`PADBTN` from the
+  pinned shell (`osk.json` `gamepadMap`). Injection is stamped `pid=0` so
+  a socket client cannot forge pad events. `GAMEPAD off` parks the reader.
+  Lizard-mode grabs are `Puck Mouse`/`Puck Keyboard` (and Steam Controller
+  mouse/keyboard names) only.
 - **Teardown (`PLUGIN_EXIT`)**: gamepad stop + join (releases grabs) →
   socket stop flag + wake pipe → thread join → drain eventfd source
   remove + close → bus disconnect → timer removal → key release →

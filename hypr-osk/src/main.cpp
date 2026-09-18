@@ -51,6 +51,8 @@
  *                                async push). Default is on: a plugged-in
  *                                matching controller works immediately;
  *                                GAMEPAD off is the kill switch.
+ *   PADMAP pointer=… scroll=…     analog sources (allowlisted tokens)
+ *   PADBTN <d|o> a=enter,…        desktop/osk button map (allowlisted)
  *   Unsolicited pushes (never replies): `grid <json>`, `mon <…>`,
  *   `nav <action> <1|0>`, `pad <enabled01> <active01>`.
  *
@@ -69,10 +71,12 @@
  * Commands are queued from the socket thread and executed on the
  * compositor main thread via an EventLoop timer.
  *
- * Gamepad prototype (Steam Controller 2026, "Puck"): on by default so a
- * plugged-in controller works without a settings round-trip. The reader
- * starts at plugin load (HYPR_OSK_GAMEPAD=0 disables at load). It holds
- * no device and injects nothing until a matching hidraw actually streams.
+ * Gamepad: on by default so a plugged-in controller works without a
+ * settings round-trip. The reader starts at plugin load (HYPR_OSK_GAMEPAD=0
+ * disables at load). Valve 2026 Steam Controller hidraw (VID 28de, PID
+ * 1302/1304, report 0x42) is preferred; otherwise a standard evdev gamepad
+ * (BTN_GAMEPAD, including Bluetooth DualSense/Xbox/8BitDo) is used. Mapping
+ * is allowlisted PADMAP/PADBTN from the pinned shell (osk.json gamepadMap).
  * Socket GAMEPAD is never an injection path: it only arms or parks the
  * hidraw reader. GAMEPAD off from the pinned shell is the kill switch.
  * A reader thread then opens the pad's hidraw node (VID 28de, PID 1302/1304
@@ -185,6 +189,7 @@ static int oskPidfdSendSignal(int fd, int sig)
     return (int)syscall(SYS_pidfd_send_signal, fd, sig, (void *)nullptr, 0u);
 }
 #include <linux/limits.h>
+#include <linux/input.h>
 #include <linux/input-event-codes.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -207,7 +212,7 @@ static int    debug   = 1;
  * bounded to 95 bytes. */
 struct SOskCommand {
     enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, POINTER, SCROLL, SWALLOW, PANEL,
-                                 PADKEY, PADPTR, PADCHORD, PADWAKE, PADNAV, PADSTATE, MONREFRESH, GAMEPAD } type;
+                                 PADKEY, PADPTR, PADCHORD, PADWAKE, PADNAV, PADSTATE, PADMAP, MONREFRESH, GAMEPAD } type;
     int   a = 0, b = 0;
     pid_t pid           = 0; /* SO_PEERCRED pid stamped at queue time */
     float panel[4]      = {0, 0, 0, 0}; /* PANEL nx ny nw nh */
@@ -233,6 +238,17 @@ static wl_event_source  *g_drainEventSource = nullptr;
 static std::atomic<bool> g_padActive{false};
 static std::atomic<uint32_t> g_padButtons{0};
 static std::atomic<bool> g_padEnabled{true}; /* auto: inject once a matching pad streams */
+struct PadMap {
+    uint8_t pointer = 2 | 4; /* PAN_RS|PAN_RPAD; values match the gamepad section */
+    uint8_t scroll  = 1;     /* PAN_LS */
+    uint8_t desktop[19]{};
+    uint8_t osk[19]{};
+};
+static std::mutex g_padMapMutex;
+static PadMap     g_padMapLive;
+static PadMap     g_padMapIncoming;
+static bool padParseMapLine(const char *line, PadMap *m);
+static bool padParseBtnLine(const char *line, PadMap *m);
 
 static void wakeDrain();
 
@@ -2007,6 +2023,32 @@ static bool handle_line(int cfd, char *line)
             reply = "ok";
         } else
             reply = "err bad args";
+    } else if (!strncmp(line, "PADMAP ", 7)) {
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lg(g_padMapMutex);
+            ok = padParseMapLine(line + 7, &g_padMapIncoming);
+        }
+        if (!ok)
+            reply = "err bad map";
+        else {
+            cmd.type = SOskCommand::EType::PADMAP;
+            queueFromPeer(cfd, std::move(cmd));
+            reply = "ok";
+        }
+    } else if (!strncmp(line, "PADBTN ", 7)) {
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lg(g_padMapMutex);
+            ok = padParseBtnLine(line + 7, &g_padMapIncoming);
+        }
+        if (!ok)
+            reply = "err bad map";
+        else {
+            cmd.type = SOskCommand::EType::PADMAP;
+            queueFromPeer(cfd, std::move(cmd));
+            reply = "ok";
+        }
     } else if (!strcmp(line, "STATS")) {
         SStatsSnap s;
         {
@@ -2352,12 +2394,11 @@ static int padOpenStreamer()
 
 static bool padPhantomName(const char *name)
 {
-    /* kernel hid-generic nodes for this hardware: "Puck Mouse"/"Puck Keyboard"
-     * or "Steam Controller …". Require those tokens, not a lone "Puck". */
-    if (strstr(name, "Steam Controller"))
-        return true;
+    /* Lizard-mode mouse/keyboard nodes only — not the hid-steam gamepad
+     * node named "Steam Controller", which we may read as evdev. */
     return strstr(name, "Puck Mouse") || strstr(name, "Puck Keyboard") ||
-           strstr(name, "Puck Consumer") || strstr(name, "Puck System");
+           strstr(name, "Puck Consumer") || strstr(name, "Puck System") ||
+           strstr(name, "Steam Controller Mouse") || strstr(name, "Steam Controller Keyboard");
 }
 
 static void padGrabPhantoms(int *held, int *nheld)
@@ -2397,6 +2438,521 @@ static int16_t padI16(const unsigned char *r, int off)
 static uint16_t padU16(const unsigned char *r, int off)
 {
     return (uint16_t)r[off] | ((uint16_t)r[off + 1] << 8);
+}
+
+/* ---- logical controls / allowlisted map (PADMAP + PADBTN) ---- */
+enum {
+    PC_A = 0, PC_B, PC_X, PC_Y,
+    PC_DUP, PC_DDN, PC_DLT, PC_DRT,
+    PC_LB, PC_RB, PC_LT, PC_RT,
+    PC_SELECT, PC_START, PC_GUIDE,
+    PC_LSCLICK, PC_RSCLICK,
+    PC_LPCLICK, PC_RPCLICK,
+    PC_COUNT
+};
+enum {
+    PA_NONE = 0,
+    PA_ENTER, PA_ESC, PA_BACK, PA_SPACE, PA_TAB,
+    PA_UP, PA_DOWN, PA_LEFT, PA_RIGHT,
+    PA_MENU, PA_TOGGLE,
+    PA_COMMIT, PA_CLOSE,
+    PA_NAVUP, PA_NAVDN, PA_NAVLT, PA_NAVRT,
+    PA_LCLICK, PA_RCLICK
+};
+enum { PAN_LS = 1, PAN_RS = 2, PAN_RPAD = 4 };
+
+struct PadView {
+    uint32_t btn = 0;
+    double   lx = 0, ly = 0, rx = 0, ry = 0;
+    double   lt = -1, rt = -1; /* 0..1, <0 = absent */
+    double   rpadDx = 0, rpadDy = 0;
+};
+struct PadApplyState {
+    uint32_t lastBtn     = 0;
+    bool     lastLT      = false, lastRT = false;
+    bool     lastLclick  = false, lastRclick = false;
+    bool     lastNavMode = false;
+    int      lastNavDirs = 0;
+    uint32_t lastMs      = 0;
+    std::set<unsigned> padKeys;
+};
+
+static void padMapDefault(PadMap *m)
+{
+    *m = PadMap{};
+    auto D = m->desktop, O = m->osk;
+    D[PC_A] = PA_ENTER;     O[PC_A] = PA_COMMIT;
+    D[PC_B] = PA_ESC;       O[PC_B] = PA_CLOSE;
+    D[PC_X] = PA_BACK;      O[PC_X] = PA_BACK;
+    D[PC_Y] = PA_SPACE;     O[PC_Y] = PA_SPACE;
+    D[PC_DUP] = PA_UP;      O[PC_DUP] = PA_NAVUP;
+    D[PC_DDN] = PA_DOWN;    O[PC_DDN] = PA_NAVDN;
+    D[PC_DLT] = PA_LEFT;    O[PC_DLT] = PA_NAVLT;
+    D[PC_DRT] = PA_RIGHT;   O[PC_DRT] = PA_NAVRT;
+    D[PC_SELECT] = PA_TAB;  O[PC_SELECT] = PA_TAB;
+    D[PC_START] = PA_MENU;  O[PC_START] = PA_MENU;
+    D[PC_GUIDE] = PA_TOGGLE; O[PC_GUIDE] = PA_TOGGLE;
+    D[PC_RT] = PA_LCLICK;   O[PC_RT] = PA_LCLICK;
+    D[PC_LT] = PA_RCLICK;   O[PC_LT] = PA_RCLICK;
+    D[PC_RPCLICK] = PA_LCLICK; O[PC_RPCLICK] = PA_LCLICK;
+    D[PC_LPCLICK] = PA_RCLICK; O[PC_LPCLICK] = PA_RCLICK;
+}
+
+static int padParseCtrl(const char *s)
+{
+    static const char *n[] = {"a","b","x","y","dpadUp","dpadDown","dpadLeft","dpadRight",
+                              "lb","rb","lt","rt","select","start","guide","lsClick","rsClick",
+                              "leftPadClick","rightPadClick"};
+    for (int i = 0; i < PC_COUNT; i++)
+        if (!strcmp(s, n[i]))
+            return i;
+    return -1;
+}
+static int padParseAct(const char *s)
+{
+    static const struct { const char *n; int v; } t[] = {
+        {"none", PA_NONE}, {"enter", PA_ENTER}, {"escape", PA_ESC}, {"backspace", PA_BACK},
+        {"space", PA_SPACE}, {"tab", PA_TAB}, {"up", PA_UP}, {"down", PA_DOWN},
+        {"left", PA_LEFT}, {"right", PA_RIGHT}, {"menu", PA_MENU}, {"toggleOsk", PA_TOGGLE},
+        {"commit", PA_COMMIT}, {"close", PA_CLOSE}, {"navUp", PA_NAVUP}, {"navDown", PA_NAVDN},
+        {"navLeft", PA_NAVLT}, {"navRight", PA_NAVRT}, {"leftClick", PA_LCLICK},
+        {"rightClick", PA_RCLICK},
+    };
+    for (auto &e : t)
+        if (!strcmp(s, e.n))
+            return e.v;
+    return -1;
+}
+static int padParseAnalogBits(const char *csv)
+{
+    int bits = 0;
+    const char *p = csv ? csv : "";
+    while (*p) {
+        while (*p == ' ' || *p == ',')
+            p++;
+        if (!*p)
+            break;
+        const char *e = p;
+        while (*e && *e != ',')
+            e++;
+        char tok[32];
+        size_t n = (size_t)(e - p);
+        if (n >= sizeof tok)
+            return -1;
+        memcpy(tok, p, n);
+        tok[n] = 0;
+        while (n && tok[n - 1] == ' ')
+            tok[--n] = 0;
+        if (strcmp(tok, "none") && *tok) {
+            if (!strcmp(tok, "leftStick"))
+                bits |= PAN_LS;
+            else if (!strcmp(tok, "rightStick"))
+                bits |= PAN_RS;
+            else if (!strcmp(tok, "rightPad"))
+                bits |= PAN_RPAD;
+            else
+                return -1;
+        }
+        p = e;
+    }
+    return bits;
+}
+
+static bool padParseMapLine(const char *line, PadMap *m)
+{
+    /* PADMAP pointer=rightStick,rightPad scroll=leftStick */
+    char buf[MAX_LINE];
+    snprintf(buf, sizeof buf, "%s", line);
+    for (char *tok = strtok(buf, " "); tok; tok = strtok(nullptr, " ")) {
+        char *eq = strchr(tok, '=');
+        if (!eq)
+            return false;
+        *eq = 0;
+        int bits = padParseAnalogBits(eq + 1);
+        if (bits < 0)
+            return false;
+        if (!strcmp(tok, "pointer"))
+            m->pointer = (uint8_t)bits;
+        else if (!strcmp(tok, "scroll"))
+            m->scroll = (uint8_t)bits;
+        else
+            return false;
+    }
+    return true;
+}
+
+static bool padParseBtnLine(const char *line, PadMap *m)
+{
+    /* PADBTN d a=enter,b=escape,...   or  PADBTN o ... */
+    char buf[MAX_LINE];
+    snprintf(buf, sizeof buf, "%s", line);
+    char *sp = strchr(buf, ' ');
+    if (!sp)
+        return false;
+    *sp = 0;
+    uint8_t *dst = nullptr;
+    if (!strcmp(buf, "d") || !strcmp(buf, "desktop"))
+        dst = m->desktop;
+    else if (!strcmp(buf, "o") || !strcmp(buf, "osk"))
+        dst = m->osk;
+    else
+        return false;
+    for (char *tok = strtok(sp + 1, ","); tok; tok = strtok(nullptr, ",")) {
+        while (*tok == ' ')
+            tok++;
+        char *eq = strchr(tok, '=');
+        if (!eq)
+            return false;
+        *eq = 0;
+        int c = padParseCtrl(tok), a = padParseAct(eq + 1);
+        if (c < 0 || a < 0)
+            return false;
+        dst[c] = (uint8_t)a;
+    }
+    return true;
+}
+
+static void padEmitKey(PadApplyState &st, unsigned evdev, int press)
+{
+    padQueue(SOskCommand::EType::PADKEY, (int)evdev, press);
+    if (press)
+        st.padKeys.insert(evdev);
+    else
+        st.padKeys.erase(evdev);
+}
+
+static void padApply(const PadView &v, PadApplyState &st)
+{
+    PadMap map;
+    {
+        std::lock_guard<std::mutex> lg(g_padMapMutex);
+        map = g_padMapLive;
+    }
+    bool navMode = g_panelVisible.load(std::memory_order_relaxed);
+    uint32_t btn = v.btn;
+    auto trig = [](double x, bool last) -> bool {
+        if (x < 0.0)
+            return last;
+        return last ? (x > 0.25) : (x > 0.37);
+    };
+    st.lastLT = trig(v.lt, st.lastLT);
+    st.lastRT = trig(v.rt, st.lastRT);
+    if (st.lastLT)
+        btn |= (1u << PC_LT);
+    if (st.lastRT)
+        btn |= (1u << PC_RT);
+    g_padButtons.store(btn, std::memory_order_relaxed);
+    const uint8_t *acts = navMode ? map.osk : map.desktop;
+
+    bool wantL = false, wantR = false;
+    for (int c = 0; c < PC_COUNT; c++) {
+        if (!(btn & (1u << c)))
+            continue;
+        if (acts[c] == PA_LCLICK)
+            wantL = true;
+        if (acts[c] == PA_RCLICK)
+            wantR = true;
+    }
+    if (wantL != st.lastLclick)
+        padQueue(SOskCommand::EType::PADPTR, BTN_LEFT, wantL ? 1 : 0);
+    if (wantR != st.lastRclick)
+        padQueue(SOskCommand::EType::PADPTR, BTN_RIGHT, wantR ? 1 : 0);
+    st.lastLclick = wantL;
+    st.lastRclick = wantR;
+
+    uint32_t edges = btn ^ st.lastBtn;
+    if (edges) {
+        for (int c = 0; c < PC_COUNT; c++) {
+            if (!(edges & (1u << c)))
+                continue;
+            int press = (btn & (1u << c)) ? 1 : 0;
+            switch (acts[c]) {
+            case PA_ENTER: padEmitKey(st, KEY_ENTER, press); break;
+            case PA_ESC: padEmitKey(st, KEY_ESC, press); break;
+            case PA_BACK: padEmitKey(st, KEY_BACKSPACE, press); break;
+            case PA_SPACE: padEmitKey(st, KEY_SPACE, press); break;
+            case PA_TAB: padEmitKey(st, KEY_TAB, press); break;
+            case PA_UP: padEmitKey(st, KEY_UP, press); break;
+            case PA_DOWN: padEmitKey(st, KEY_DOWN, press); break;
+            case PA_LEFT: padEmitKey(st, KEY_LEFT, press); break;
+            case PA_RIGHT: padEmitKey(st, KEY_RIGHT, press); break;
+            case PA_MENU:
+                if (press)
+                    padQueue(SOskCommand::EType::PADCHORD, 1, 0);
+                break;
+            case PA_TOGGLE:
+                if (press)
+                    padQueue(SOskCommand::EType::PADCHORD, 0, 0);
+                break;
+            case PA_COMMIT: padQueue(SOskCommand::EType::PADNAV, 4, press); break;
+            case PA_CLOSE: padQueue(SOskCommand::EType::PADNAV, 7, press); break;
+            case PA_NAVUP: padQueue(SOskCommand::EType::PADNAV, 0, press); break;
+            case PA_NAVDN: padQueue(SOskCommand::EType::PADNAV, 1, press); break;
+            case PA_NAVLT: padQueue(SOskCommand::EType::PADNAV, 2, press); break;
+            case PA_NAVRT: padQueue(SOskCommand::EType::PADNAV, 3, press); break;
+            default: break;
+            }
+        }
+        st.lastBtn = btn;
+    }
+
+    uint32_t now = nowMs();
+    double dt = st.lastMs ? std::min(0.05, (now - st.lastMs) / 1000.0) : (1.0 / 270.0);
+    st.lastMs = now;
+    double px = 0, py = 0;
+    /* PadView stick Y is up-positive; compositor pointer Y is down-positive. */
+    if (map.pointer & PAN_LS) {
+        px += v.lx * 3240.0 * dt;
+        py += -v.ly * 3240.0 * dt;
+    }
+    if (map.pointer & PAN_RS) {
+        px += v.rx * 3240.0 * dt;
+        py += -v.ry * 3240.0 * dt;
+    }
+    if (map.pointer & PAN_RPAD) {
+        px += v.rpadDx;
+        py += v.rpadDy;
+    }
+    if (px != 0.0 || py != 0.0) {
+        g_padDX.fetch_add(px);
+        g_padDY.fetch_add(py);
+        padWake();
+    }
+
+    double sx = 0, sy = 0;
+    if (map.scroll & PAN_LS) {
+        sx = v.lx;
+        sy = v.ly;
+    } else if (map.scroll & PAN_RS) {
+        sx = v.rx;
+        sy = v.ry;
+    }
+    if (navMode) {
+        int dirs = 0;
+        if (sy > 0.5 || ((st.lastNavDirs & 1) && sy > 0.3))
+            dirs |= 1;
+        if (sy < -0.5 || ((st.lastNavDirs & 2) && sy < -0.3))
+            dirs |= 2;
+        if (sx < -0.5 || ((st.lastNavDirs & 4) && sx < -0.3))
+            dirs |= 4;
+        if (sx > 0.5 || ((st.lastNavDirs & 8) && sx > 0.3))
+            dirs |= 8;
+        int changed = dirs ^ st.lastNavDirs;
+        if (changed) {
+            for (int i = 0; i < 4; i++) {
+                if (changed & (1 << i))
+                    padQueue(SOskCommand::EType::PADNAV, i, (dirs & (1 << i)) ? 1 : 0);
+            }
+            st.lastNavDirs = dirs;
+        }
+    } else {
+        if (st.lastNavMode) {
+            for (int i = 0; i < 4; i++) {
+                if (st.lastNavDirs & (1 << i))
+                    padQueue(SOskCommand::EType::PADNAV, i, 0);
+            }
+            st.lastNavDirs = 0;
+        }
+        if (std::hypot(sx, sy) > 0.05) {
+            g_padSX.fetch_add(sx * 810.0 * dt);
+            g_padSY.fetch_add(-sy * 810.0 * dt);
+            padWake();
+        }
+    }
+    st.lastNavMode = navMode;
+}
+
+static void padRelease(PadApplyState &st)
+{
+    for (unsigned k : st.padKeys)
+        padQueue(SOskCommand::EType::PADKEY, (int)k, 0);
+    st.padKeys.clear();
+    if (st.lastLclick)
+        padQueue(SOskCommand::EType::PADPTR, BTN_LEFT, 0);
+    if (st.lastRclick)
+        padQueue(SOskCommand::EType::PADPTR, BTN_RIGHT, 0);
+    for (int i = 0; i < 4; i++) {
+        if (st.lastNavDirs & (1 << i))
+            padQueue(SOskCommand::EType::PADNAV, i, 0);
+    }
+    st.lastBtn = 0;
+    st.lastLclick = st.lastRclick = false;
+    st.lastNavDirs = 0;
+}
+
+#define PAD_NBITS(x) ((((x) - 1) / 8) + 1)
+#define PAD_TEST(bit, arr) (((arr)[(bit) / 8] >> ((bit) % 8)) & 1)
+
+static int padOpenEvdev()
+{
+    for (int i = 0; i < 64; i++) {
+        char node[64];
+        snprintf(node, sizeof node, "/dev/input/event%d", i);
+        int fd = open(node, O_RDONLY | O_NONBLOCK);
+        if (fd < 0)
+            continue;
+        char name[256] = {0};
+        if (ioctl(fd, EVIOCGNAME_256, name) < 0 || padPhantomName(name)) {
+            close(fd);
+            continue;
+        }
+        unsigned char evb[PAD_NBITS(EV_MAX)] = {0};
+        unsigned char key[PAD_NBITS(KEY_MAX)] = {0};
+        if (ioctl(fd, EVIOCGBIT(0, sizeof evb), evb) < 0 || !PAD_TEST(EV_KEY, evb) ||
+            ioctl(fd, EVIOCGBIT(EV_KEY, sizeof key), key) < 0 || !PAD_TEST(BTN_SOUTH, key)) {
+            close(fd);
+            continue;
+        }
+        return fd;
+    }
+    return -1;
+}
+
+static double padNormAbs(const input_absinfo &inf, int v, bool trigger)
+{
+    if (trigger) {
+        int span = inf.maximum - inf.minimum;
+        if (span <= 0)
+            return 0;
+        double n = (v - inf.minimum) / (double)span;
+        if (n < 0)
+            n = 0;
+        if (n > 1)
+            n = 1;
+        return n;
+    }
+    int mid = (inf.minimum + inf.maximum) / 2;
+    int span = inf.maximum - mid;
+    if (span <= 0)
+        return 0;
+    double n = (v - mid) / (double)span;
+    if (inf.flat > 0 && std::abs(v - mid) <= inf.flat)
+        n = 0;
+    if (n < -1)
+        n = -1;
+    if (n > 1)
+        n = 1;
+    return n;
+}
+
+static bool padReadEvdev(int fd, PadApplyState &st)
+{
+    unsigned char absb[PAD_NBITS(ABS_MAX)] = {0};
+    ioctl(fd, EVIOCGBIT(EV_ABS, sizeof absb), absb);
+    input_absinfo ax{}, ay{}, arx{}, ary{}, az{}, arz{}, hatx{}, haty{};
+    bool hasX = PAD_TEST(ABS_X, absb) && ioctl(fd, EVIOCGABS(ABS_X), &ax) == 0;
+    bool hasY = PAD_TEST(ABS_Y, absb) && ioctl(fd, EVIOCGABS(ABS_Y), &ay) == 0;
+    bool hasRX = PAD_TEST(ABS_RX, absb) && ioctl(fd, EVIOCGABS(ABS_RX), &arx) == 0;
+    bool hasRY = PAD_TEST(ABS_RY, absb) && ioctl(fd, EVIOCGABS(ABS_RY), &ary) == 0;
+    bool hasZ = PAD_TEST(ABS_Z, absb) && ioctl(fd, EVIOCGABS(ABS_Z), &az) == 0;
+    bool hasRZ = PAD_TEST(ABS_RZ, absb) && ioctl(fd, EVIOCGABS(ABS_RZ), &arz) == 0;
+    bool hasHX = PAD_TEST(ABS_HAT0X, absb) && ioctl(fd, EVIOCGABS(ABS_HAT0X), &hatx) == 0;
+    bool hasHY = PAD_TEST(ABS_HAT0Y, absb) && ioctl(fd, EVIOCGABS(ABS_HAT0Y), &haty) == 0;
+    bool zIsTrig = hasRX; /* Xbox-style: RX present => Z/RZ are triggers */
+    int vx = 0, vy = 0, vrx = 0, vry = 0, vz = 0, vrz = 0, vhx = 0, vhy = 0;
+    uint32_t btn = 0;
+    auto setb = [&](int pc, bool on) {
+        if (on)
+            btn |= (1u << pc);
+        else
+            btn &= ~(1u << pc);
+    };
+    struct pollfd pfds[2]{{fd, POLLIN, 0}, {g_padPipe[0], POLLIN, 0}};
+    while (g_padRunning && g_padEnabled.load(std::memory_order_relaxed)) {
+        int pr = poll(pfds, 2, 1000);
+        if (!g_padRunning || (pr > 0 && (pfds[1].revents & POLLIN)))
+            return true; /* wake: disable/exit, keep scanning */
+        if (pr <= 0 || !(pfds[0].revents & POLLIN)) {
+            if (pr < 0 && errno != EINTR)
+                return false;
+            if (pr > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)))
+                return false;
+            continue;
+        }
+        input_event ev[32];
+        ssize_t n;
+        while ((n = read(fd, ev, sizeof ev)) > 0) {
+            int cnt = n / (int)sizeof(input_event);
+            for (int i = 0; i < cnt; i++) {
+                if (ev[i].type == EV_KEY) {
+                    bool on = ev[i].value != 0;
+                    switch (ev[i].code) {
+                    case BTN_SOUTH: setb(PC_A, on); break;
+                    case BTN_EAST: setb(PC_B, on); break;
+                    case BTN_NORTH: setb(PC_X, on); break;
+                    case BTN_WEST: setb(PC_Y, on); break;
+                    case BTN_TL: setb(PC_LB, on); break;
+                    case BTN_TR: setb(PC_RB, on); break;
+                    case BTN_TL2: if (!zIsTrig || !hasZ) setb(PC_LT, on); break;
+                    case BTN_TR2: if (!zIsTrig || !hasRZ) setb(PC_RT, on); break;
+                    case BTN_SELECT: setb(PC_SELECT, on); break;
+                    case BTN_START: setb(PC_START, on); break;
+                    case BTN_MODE: setb(PC_GUIDE, on); break;
+                    case BTN_THUMBL: setb(PC_LSCLICK, on); break;
+                    case BTN_THUMBR: setb(PC_RSCLICK, on); break;
+                    case BTN_DPAD_UP: setb(PC_DUP, on); break;
+                    case BTN_DPAD_DOWN: setb(PC_DDN, on); break;
+                    case BTN_DPAD_LEFT: setb(PC_DLT, on); break;
+                    case BTN_DPAD_RIGHT: setb(PC_DRT, on); break;
+                    default: break;
+                    }
+                } else if (ev[i].type == EV_ABS) {
+                    switch (ev[i].code) {
+                    case ABS_X: vx = ev[i].value; break;
+                    case ABS_Y: vy = ev[i].value; break;
+                    case ABS_RX: vrx = ev[i].value; break;
+                    case ABS_RY: vry = ev[i].value; break;
+                    case ABS_Z: vz = ev[i].value; break;
+                    case ABS_RZ: vrz = ev[i].value; break;
+                    case ABS_HAT0X: vhx = ev[i].value; break;
+                    case ABS_HAT0Y: vhy = ev[i].value; break;
+                    default: break;
+                    }
+                } else if (ev[i].type == EV_SYN && ev[i].code == SYN_REPORT) {
+                    PadView view;
+                    view.btn = btn;
+                    if (hasHX) {
+                        setb(PC_DLT, vhx < 0);
+                        setb(PC_DRT, vhx > 0);
+                        view.btn = btn;
+                    }
+                    if (hasHY) {
+                        setb(PC_DUP, vhy < 0);
+                        setb(PC_DDN, vhy > 0);
+                        view.btn = btn;
+                    }
+                    double nx = hasX ? padNormAbs(ax, vx, false) : 0;
+                    double ny = hasY ? -padNormAbs(ay, vy, false) : 0; /* up-positive */
+                    double nrx = 0, nry = 0;
+                    if (hasRX) {
+                        nrx = padNormAbs(arx, vrx, false);
+                        nry = hasRY ? -padNormAbs(ary, vry, false) : 0;
+                    } else if (!zIsTrig && hasZ) {
+                        nrx = padNormAbs(az, vz, false);
+                        nry = hasRZ ? -padNormAbs(arz, vrz, false) : 0;
+                    }
+                    if (std::hypot(nx, ny) < 0.15)
+                        nx = ny = 0;
+                    if (std::hypot(nrx, nry) < 0.15)
+                        nrx = nry = 0;
+                    view.lx = nx;
+                    view.ly = ny;
+                    view.rx = nrx;
+                    view.ry = nry;
+                    if (zIsTrig && hasZ)
+                        view.lt = padNormAbs(az, vz, true);
+                    if (zIsTrig && hasRZ)
+                        view.rt = padNormAbs(arz, vrz, true);
+                    padApply(view, st);
+                }
+            }
+        }
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            return false;
+        if (n == 0)
+            return false;
+    }
+    return true;
 }
 
 static void padPushState()
@@ -2442,7 +2998,12 @@ static void padThreadFn()
             while (read(g_padPipe[0], &b, 1) > 0) {}
             continue;
         }
+        int kind = 1; /* 1 = steam hidraw 0x42, 2 = evdev gamepad */
         int fd = padOpenStreamer();
+        if (fd < 0) {
+            fd = padOpenEvdev();
+            kind = 2;
+        }
         if (fd < 0) {
             /* nothing streaming: sleep until woken (exit) or 1 s (rescan) */
             struct pollfd pfd{g_padPipe[0], POLLIN, 0};
@@ -2455,7 +3016,13 @@ static void padThreadFn()
         g_padActive = true;
         padQueueState();
         padGrabPhantoms(grabbed, &ngrabbed);
-        traceGeom("gamepad: streaming hidraw open, phantoms grabbed=" + std::to_string(ngrabbed));
+        traceGeom(std::string("gamepad: ") + (kind == 2 ? "evdev" : "hidraw 0x42") +
+                  " open, phantoms grabbed=" + std::to_string(ngrabbed));
+        PadApplyState st;
+        if (kind == 2) {
+            padReadEvdev(fd, st);
+            padRelease(st);
+        } else {
         /* stick rest calibration: sticks idle near (not at) 0, so the open
          * path used to average whatever the sticks happened to be doing —
          * including a held deflection right after toggle-on, which then
@@ -2467,16 +3034,11 @@ static void padThreadFn()
         bool   restSettled = false;
         int16_t calLX[32], calLY[32], calRX[32], calRY[32];
         int calN = 0;
-        uint32_t lastBtn   = 0;
-        bool     lastRT    = false, lastLT = false, lastLpadClick = false;
-        bool     lastNavMode = false;
-        int      lastNavDirs = 0; /* bit0=up bit1=down bit2=left bit3=right */
-        std::set<unsigned> padKeys; /* evdev codes the pad currently holds */
         int16_t  lastPX = 0, lastPY = 0;
         bool     padWasTouched = false;
         struct pollfd pfds[2]{{fd, POLLIN, 0}, {g_padPipe[0], POLLIN, 0}};
         bool alive = true;
-        while (alive && g_padRunning) {
+        while (alive && g_padRunning && g_padEnabled.load(std::memory_order_relaxed)) {
             int pr = poll(pfds, 2, 1000);
             if (!g_padRunning)
                 break;
@@ -2494,147 +3056,65 @@ static void padThreadFn()
             while ((n = read(fd, report, sizeof report)) > 0) {
                 if (n < PAD_LEN_MIN || report[0] != 0x42)
                     continue; /* 0x79/0x7b telemetry etc. */
-                uint32_t btn = (uint32_t)report[PAD_B0] | ((uint32_t)report[PAD_B0 + 1] << 8) |
-                               ((uint32_t)(report[PAD_B0 + 2] & 0x7F) << 16); /* mask trigger click */
-                g_padButtons.store(btn, std::memory_order_relaxed);
-                uint32_t edges = btn ^ lastBtn;
-                /* Steam-like typing: while the panel is visible, D-pad and
-                 * face buttons navigate/commit the OSK grid (QML owns the
-                 * highlight) instead of acting as desktop keys. QML ignores
-                 * nav lines while closed, so the race on hide is harmless. */
-                bool navMode = g_panelVisible.load(std::memory_order_relaxed);
-                if (edges) {
-                    /* face buttons + dpad + back: rising press, falling release.
-                     * nav >= 0: PADNAV action index when the panel is visible. */
-                    static const struct {
-                        uint32_t bit;
-                        unsigned evdev;
-                        int      nav;
-                    } keys[] = {
-                        {PB_A, KEY_ENTER, 4},     {PB_B, KEY_ESC, 7},
-                        {PB_X, KEY_BACKSPACE, 5}, {PB_Y, KEY_SPACE, 6},
-                        {PB_DPAD_UP, KEY_UP, 0},  {PB_DPAD_DOWN, KEY_DOWN, 1},
-                        {PB_DPAD_LEFT, KEY_LEFT, 2}, {PB_DPAD_RIGHT, KEY_RIGHT, 3},
-                        {PB_BACK, KEY_TAB, -1},
-                    };
-                    for (auto const &k : keys) {
-                        if (!(edges & k.bit))
-                            continue;
-                        int press = (btn & k.bit) ? 1 : 0;
-                        if (navMode && k.nav >= 0)
-                            padQueue(SOskCommand::EType::PADNAV, k.nav, press);
-                        else {
-                            padQueue(SOskCommand::EType::PADKEY, (int)k.evdev, press);
-                            if (press)
-                                padKeys.insert(k.evdev);
-                            else
-                                padKeys.erase(k.evdev);
-                        }
-                    }
-                    /* right-pad click → left button (edges give press+release).
-                     * Left-pad click arrives via the STATUS byte, below. */
-                    if (edges & PB_RPAD_CLICK)
-                        padQueue(SOskCommand::EType::PADPTR, BTN_LEFT, (btn & PB_RPAD_CLICK) ? 1 : 0);
-                    /* chords fire on press only */
-                    if ((edges & btn & PB_GUIDE) != 0)
-                        padQueue(SOskCommand::EType::PADCHORD, 0, 0); /* OSK toggle */
-                    if ((edges & btn & PB_START) != 0)
-                        padQueue(SOskCommand::EType::PADCHORD, 1, 0); /* Omarchy menu */
-                    lastBtn = btn;
-                }
-                /* left-pad click via STATUS bit (never the raw button word) */
-                {
-                    bool lpc = (report[PAD_STATUS] & PB_LPAD_CLICK_STATUS) != 0;
-                    if (lpc != lastLpadClick) {
-                        padQueue(SOskCommand::EType::PADPTR, BTN_RIGHT, lpc ? 1 : 0);
-                        lastLpadClick = lpc;
-                    }
-                }
-                /* triggers with hysteresis: RT = left, LT = right.
-                 * Hair-trigger thresholds (~1/3 pull); the bottom-out click
-                 * bit is deliberately ignored — analog covers full pulls. */
-                bool rt = padU16(report, PAD_RTRIG) > 12000 || (lastRT && padU16(report, PAD_RTRIG) > 8000);
-                if (rt != lastRT) {
-                    padQueue(SOskCommand::EType::PADPTR, BTN_LEFT, rt ? 1 : 0);
-                    lastRT = rt;
-                }
-                bool lt = padU16(report, PAD_LTRIG) > 12000 || (lastLT && padU16(report, PAD_LTRIG) > 8000);
-                if (lt != lastLT) {
-                    padQueue(SOskCommand::EType::PADPTR, BTN_RIGHT, lt ? 1 : 0);
-                    lastLT = lt;
-                }
-                /* right pad: absolute positions, (0,0) untouched — accumulate deltas.
-                 * Per-report ADC noise (~±100 units @270 Hz) would random-walk
-                 * the cursor at a flat gain, so: vector deadband, teleport
-                 * guard, and a flick-accelerated gain (slow = precise). */
+                uint32_t raw = (uint32_t)report[PAD_B0] | ((uint32_t)report[PAD_B0 + 1] << 8) |
+                               ((uint32_t)(report[PAD_B0 + 2] & 0x7F) << 16);
+                PadView view;
+                if (raw & PB_A)
+                    view.btn |= (1u << PC_A);
+                if (raw & PB_B)
+                    view.btn |= (1u << PC_B);
+                if (raw & PB_X)
+                    view.btn |= (1u << PC_X);
+                if (raw & PB_Y)
+                    view.btn |= (1u << PC_Y);
+                if (raw & PB_DPAD_UP)
+                    view.btn |= (1u << PC_DUP);
+                if (raw & PB_DPAD_DOWN)
+                    view.btn |= (1u << PC_DDN);
+                if (raw & PB_DPAD_LEFT)
+                    view.btn |= (1u << PC_DLT);
+                if (raw & PB_DPAD_RIGHT)
+                    view.btn |= (1u << PC_DRT);
+                if (raw & PB_BACK)
+                    view.btn |= (1u << PC_SELECT);
+                if (raw & PB_START)
+                    view.btn |= (1u << PC_START);
+                if (raw & PB_GUIDE)
+                    view.btn |= (1u << PC_GUIDE);
+                if (raw & PB_RPAD_CLICK)
+                    view.btn |= (1u << PC_RPCLICK);
+                if (report[PAD_STATUS] & PB_LPAD_CLICK_STATUS)
+                    view.btn |= (1u << PC_LPCLICK);
+                view.lt = padU16(report, PAD_LTRIG) / 32767.0;
+                view.rt = padU16(report, PAD_RTRIG) / 32767.0;
                 int16_t px = padI16(report, PAD_RPAD_X), py = padI16(report, PAD_RPAD_Y);
-                bool touched = (px != 0 || py != 0 || (btn & (PB_RPAD_TOUCH | PB_RPAD_CLICK)) != 0);
+                bool touched = (px != 0 || py != 0 || (raw & (PB_RPAD_TOUCH | PB_RPAD_CLICK)) != 0);
                 if (touched && padWasTouched) {
                     double dx = (double)(px - lastPX), dy = (double)(py - lastPY);
                     double mag = std::hypot(dx, dy);
                     if (mag >= 150.0 && mag < 8000.0) {
                         double k = 0.03 * (1.0 + std::min(mag / 4000.0, 2.0));
-                        g_padDX.fetch_add(dx * k);
-                        g_padDY.fetch_add(-dy * k); /* sign TBD live; flip if inverted */
-                        padWake();
+                        view.rpadDx = dx * k;
+                        view.rpadDy = -dy * k;
                     }
                 }
                 lastPX = px;
                 lastPY = py;
                 padWasTouched = touched;
-                /* left stick: deflection from calibrated rest. Visible panel =
-                 * OSK-grid nav direction edges (bit0=up bit1=down bit2=left
-                 * bit3=right, hysteresis); hidden = scroll velocity. */
+                const double sdz = 1500.0;
                 double ldx = (double)padI16(report, PAD_LSTICK_X) - restLX;
                 double ldy = (double)padI16(report, PAD_LSTICK_Y) - restLY;
-                const double sdz = 1500.0;
-                if (navMode) {
-                    int dirs = 0;
-                    /* stick Y sign TBD live (assumed y-up positive, like the pad) */
-                    if (ldy > 16000.0 || ((lastNavDirs & 1) && ldy > 10000.0))
-                        dirs |= 1; /* up */
-                    if (ldy < -16000.0 || ((lastNavDirs & 2) && ldy < -10000.0))
-                        dirs |= 2; /* down */
-                    if (ldx < -16000.0 || ((lastNavDirs & 4) && ldx < -10000.0))
-                        dirs |= 4; /* left */
-                    if (ldx > 16000.0 || ((lastNavDirs & 8) && ldx > 10000.0))
-                        dirs |= 8; /* right */
-                    int changed = dirs ^ lastNavDirs;
-                    if (changed) {
-                        static const int dirAction[4] = {0, 1, 2, 3}; /* up down left right */
-                        for (int i = 0; i < 4; i++) {
-                            if (changed & (1 << i))
-                                padQueue(SOskCommand::EType::PADNAV, dirAction[i], (dirs & (1 << i)) ? 1 : 0);
-                        }
-                        lastNavDirs = dirs;
-                    }
-                } else {
-                    if (lastNavMode) {
-                        /* panel just hid with stick dirs held: release them */
-                        for (int i = 0; i < 4; i++) {
-                            if (lastNavDirs & (1 << i))
-                                padQueue(SOskCommand::EType::PADNAV, i, 0);
-                        }
-                        lastNavDirs = 0;
-                    }
-                    double ox = std::hypot(ldx, ldy) > sdz ? ldx / 32767.0 : 0.0;
-                    double oy = std::hypot(ldx, ldy) > sdz ? ldy / 32767.0 : 0.0;
-                    if (ox != 0.0 || oy != 0.0) {
-                        g_padSX.fetch_add(ox * 3.0);
-                        g_padSY.fetch_add(-oy * 3.0); /* sign TBD live */
-                        padWake();
-                    }
-                }
-                lastNavMode = navMode;
-                /* right stick: deflection from calibrated rest → pointer motion.
-                 * Full deflection ≈ 12 px/report at ~270 Hz ≈ 3200 px/s. */
                 double rdx = (double)padI16(report, PAD_RSTICK_X) - restRX;
                 double rdy = (double)padI16(report, PAD_RSTICK_Y) - restRY;
-                if (std::hypot(rdx, rdy) > sdz) {
-                    g_padDX.fetch_add(rdx / 32767.0 * 12.0);
-                    g_padDY.fetch_add(-rdy / 32767.0 * 12.0); /* sign TBD live */
-                    padWake();
+                if (std::hypot(ldx, ldy) > sdz) {
+                    view.lx = ldx / 32767.0;
+                    view.ly = ldy / 32767.0;
                 }
+                if (std::hypot(rdx, rdy) > sdz) {
+                    view.rx = rdx / 32767.0;
+                    view.ry = rdy / 32767.0;
+                }
+                padApply(view, st);
                 /* stillness-gated rest adoption: feed this report's raw stick
                  * sample; a 30-report window with every axis within ±400 of
                  * its mean becomes the new rest (input above already ran on
@@ -2707,16 +3187,7 @@ static void padThreadFn()
          * releases after a clean lift are harmless. */
         if (!alive)
             traceGeom("gamepad: device lost, rescanning");
-        for (unsigned k : padKeys)
-            padQueue(SOskCommand::EType::PADKEY, (int)k, 0);
-        padKeys.clear();
-        if (lastRT)
-            padQueue(SOskCommand::EType::PADPTR, BTN_LEFT, 0);
-        if (lastLT || lastLpadClick)
-            padQueue(SOskCommand::EType::PADPTR, BTN_RIGHT, 0);
-        for (int i = 0; i < 4; i++) {
-            if (lastNavDirs & (1 << i))
-                padQueue(SOskCommand::EType::PADNAV, i, 0);
+        padRelease(st);
         }
         for (int i = 0; i < ngrabbed; i++) {
             ioctl(grabbed[i], EVIOCGRAB, (void *)0);
@@ -2945,6 +3416,14 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
             case SOskCommand::EType::PADSTATE:
                 padPushState();
                 break;
+            case SOskCommand::EType::PADMAP:
+                if (!fromShell)
+                    break;
+                {
+                    std::lock_guard<std::mutex> lg(g_padMapMutex);
+                    g_padMapLive = g_padMapIncoming;
+                }
+                break;
             case SOskCommand::EType::PADWAKE: {
                 g_padWakePending.store(false);
                 if (!g_padEnabled.load(std::memory_order_relaxed)) {
@@ -3127,6 +3606,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     traceGeom(std::string("plugin init, swallow=") + (touch_swallow ? "on" : "off"));
     refreshIntendedShell();
     g_socketThread = std::thread(socket_thread_fn, socketPath());
+    padMapDefault(&g_padMapLive);
+    padMapDefault(&g_padMapIncoming);
     /* gamepad reader: auto-start so a plugged-in pad works before QML
      * handshakes. HYPR_OSK_GAMEPAD=0 disables at load; osk.json / GAMEPAD
      * off from the pinned shell parks it later. */
