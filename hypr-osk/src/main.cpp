@@ -54,7 +54,7 @@
  *   PADMAP pointer=… scroll=…     analog sources (allowlisted tokens)
  *   PADBTN <d|o> a=enter,…        desktop/osk button map (allowlisted)
  *   Unsolicited pushes (never replies): `grid <json>`, `mon <…>`,
- *   `nav <action> <1|0>`, `pad <enabled01> <active01>`.
+ *   `nav <action> <1|0>`, `pad <enabled01> <active01>`, `toggle`.
  *
  * Access control: the socket can type into the focused session. A well-known
  * path plus "this pid is packaged quickshell and mapped ekollof-osk" is not
@@ -667,6 +667,23 @@ static void execKey(unsigned evdev, int press)
         g_pressedKeys.insert(evdev);
     else
         g_pressedKeys.erase(evdev);
+}
+
+static void releasePinchCtrl();
+
+/* Drop leftover Super/Shift/Ctrl/Alt on the virtual keyboard. GUIDE used
+ * to inject SUPER+SHIFT+K to toggle the OSK and those mods could stick,
+ * so later typing looked like a held logo/ctrl key. */
+static void releaseInjectedMods()
+{
+    static const unsigned mods[] = {KEY_LEFTSHIFT, KEY_LEFTCTRL, KEY_LEFTALT, KEY_LEFTMETA, KEY_RIGHTALT};
+    for (unsigned k : mods) {
+        if (g_pressedKeys.count(k))
+            execKey(k, 0);
+    }
+    held_mods = 0;
+    sent_mods = 0;
+    releasePinchCtrl();
 }
 
 static void execText(const std::string &text)
@@ -3460,6 +3477,8 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 panel_nh = c.panel[3];
                 panel_rect_valid = (panel_nw > 0 && panel_nh > 0 && layerAllowsInject(c.pid));
                 g_panelVisible.store(panel_rect_valid, std::memory_order_release);
+                if (panel_rect_valid)
+                    releaseInjectedMods();
                 padRefreshYield();
                 traceGeom("panel rect valid=" + std::to_string((int)panel_rect_valid));
                 DBG("panel rect (norm): " + std::to_string(panel_nx) + " " + std::to_string(panel_ny) +
@@ -3489,9 +3508,11 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 if (!padInjectAllowed())
                     break;
                 if (c.a == 0)
-                    padTapChord({KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_K}); /* OSK toggle bind */
-                else
+                    sendToClient("toggle"); /* QML toggles; do not inject Super+Shift+K */
+                else {
                     padTapChord({KEY_LEFTMETA, KEY_SPACE}); /* Omarchy menu bind */
+                    releaseInjectedMods();
+                }
                 break;
             case SOskCommand::EType::PADNAV: {
                 /* hidraw path, unsolicited push (like grid). Releases always

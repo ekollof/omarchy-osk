@@ -526,6 +526,10 @@ Item {
   }
 
   function handleReply(line) {
+    if (line === "toggle") {
+      root.open("{}")
+      return
+    }
     if (line.indexOf("grid ") === 0) {
       try {
         root.grid = JSON.parse(line.substring(5))
@@ -969,7 +973,7 @@ Item {
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
   Component.onCompleted: {
-    console.log("[ekollof.osk] loaded rev22 layout=" + root.layout + " cfg=" + root.cfgPath())
+    console.log("[ekollof.osk] loaded rev23 layout=" + root.layout + " cfg=" + root.cfgPath())
     const helper = root.jsonHelper()
     if (!helper) {
       root.applyConfig("")
