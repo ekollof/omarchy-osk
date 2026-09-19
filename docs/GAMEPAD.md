@@ -84,12 +84,13 @@ the hidraw fd, releases grabs/held inputs and sleeps without polling.
 On by default: a matching Steam Controller **or** a standard evdev
 gamepad works as soon as it streams. No env var required.
 
-The reader **yields** (stops injecting, keeps the device open) when the
-focused window is `gamescope` (class/title) or exclusive-fullscreen
-**except** browsers and media players (Firefox, Chromium, Brave, mpv,
-VLC, …). Fullscreen YouTube keeps the pad as a mouse. A Steam/gamescope
-game gets the pad. Showing the OSK overlay resumes injection. Maximized
-(not fullscreen) windows never yield.
+The reader **yields** (closes hidraw/evdev, no grabs) when the focused
+window is `gamescope` (class/title) or exclusive-fullscreen **except**
+browsers and media players (Firefox, Chromium, Brave, mpv, VLC, …).
+Sharing the node with gamescope added controller lag; the game then has
+the pad alone. Fullscreen YouTube keeps the pad as a mouse. Showing the
+OSK overlay reopens the device. Maximized (not fullscreen) windows never
+yield.
 
 ## Mapping (`osk.json` `gamepadMap`)
 

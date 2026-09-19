@@ -177,7 +177,7 @@ Panel {
   // change without any panel interaction — re-poll getState periodically.
   Timer {
     interval: 5000
-    running: true
+    running: root.gamepad
     repeat: true
     onTriggered: root.refreshState()
   }

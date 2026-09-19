@@ -156,8 +156,8 @@ control are in the header comment). Short map:
   grabbed so games still see it). Allowlisted `PADMAP`/`PADBTN` from the
   pinned shell (`osk.json` `gamepadMap`). Injection is stamped `pid=0` so
   a socket client cannot forge pad events. `GAMEPAD off` parks the reader.
-  `gamescope` and exclusive-fullscreen games yield injection; browsers /
-  media players (fullscreen YouTube) keep the pad. The OSK overlay resumes it.
+  `gamescope` and exclusive-fullscreen games get the pad alone (hidraw/evdev
+  closed); browsers / media players keep it. The OSK overlay reopens it.
   Lizard-mode grabs are `Puck Mouse`/`Puck Keyboard` (and Steam Controller
   mouse/keyboard names) only.
 - **Teardown (`PLUGIN_EXIT`)**: gamepad stop + join (releases grabs) →

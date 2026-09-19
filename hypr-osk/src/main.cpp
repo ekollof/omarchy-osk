@@ -80,8 +80,9 @@
  * Socket GAMEPAD is never an injection path: it only arms or parks the
  * hidraw reader. GAMEPAD off from the pinned shell is the kill switch.
  * While a focused window is gamescope, or exclusive-fullscreen and not a
- * browser/media player, injection yields so the game owns the pad.
- * Fullscreen YouTube keeps the pad. The OSK layer taking focus resumes it.
+ * browser/media player, the reader closes hidraw/evdev so the game is
+ * not sharing the node (gamescope lag). Fullscreen YouTube keeps the pad.
+ * The OSK layer taking focus reopens it.
  * A reader thread then opens the pad's hidraw node (VID 28de, PID 1302/1304
  * parsed from HID_ID=, not a uevent substring), parses report 0x42 (wire
  * layout from s3govesus/steam-controller-x crates/sc-protocol/src/report.rs)
@@ -253,6 +254,7 @@ struct PadMap {
 static std::mutex g_padMapMutex;
 static PadMap     g_padMapLive;
 static PadMap     g_padMapIncoming;
+static std::atomic<uint32_t> g_padMapGen{1};
 static bool padParseMapLine(const char *line, PadMap *m);
 static bool padParseBtnLine(const char *line, PadMap *m);
 
@@ -2489,8 +2491,15 @@ struct PadApplyState {
     bool     lastNavMode = false;
     int      lastNavDirs = 0;
     uint32_t lastMs      = 0;
+    uint32_t mapGen      = 0;
+    PadMap   map{};
     std::set<unsigned> padKeys;
 };
+
+static inline double padSq(double x, double y)
+{
+    return x * x + y * y;
+}
 
 static void padMapDefault(PadMap *m)
 {
@@ -2687,7 +2696,30 @@ static bool padWindowTakesPad(const PHLWINDOW &w)
     return ctl->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN);
 }
 
-/* Main thread: Steam/gamescope/fullscreen own the pad; the OSK layer does not. */
+static void padWakeThread();
+
+static bool padInjectAllowed()
+{
+    if (!g_padEnabled.load(std::memory_order_relaxed))
+        return false;
+    if (g_panelVisible.load(std::memory_order_relaxed))
+        return true;
+    return !g_padYielded.load(std::memory_order_relaxed);
+}
+
+/* Close hidraw/evdev while a game owns the pad — sharing the node with
+ * gamescope showed up as controller lag. OSK visible still holds it. */
+static void padKickIfHoldChanged()
+{
+    static std::atomic<bool> lastHold{true};
+    bool want = padInjectAllowed();
+    bool was  = lastHold.exchange(want, std::memory_order_relaxed);
+    if (was != want) {
+        traceGeom(std::string("gamepad: ") + (want ? "hold device" : "release device (game/gamescope)"));
+        padWakeThread();
+    }
+}
+
 static void padRefreshYield()
 {
     PHLWINDOW w;
@@ -2697,15 +2729,7 @@ static void padRefreshYield()
     bool was   = g_padYielded.exchange(yield, std::memory_order_relaxed);
     if (was != yield)
         traceGeom(std::string("gamepad: ") + (yield ? "yield (game/gamescope)" : "resume (desktop)"));
-}
-
-static bool padInjectAllowed()
-{
-    if (!g_padEnabled.load(std::memory_order_relaxed))
-        return false;
-    if (g_panelVisible.load(std::memory_order_relaxed))
-        return true;
-    return !g_padYielded.load(std::memory_order_relaxed);
+    padKickIfHoldChanged();
 }
 
 static void padRelease(PadApplyState &st);
@@ -2717,11 +2741,20 @@ static void padApply(const PadView &v, PadApplyState &st)
             padRelease(st);
         return;
     }
-    PadMap map;
-    {
-        std::lock_guard<std::mutex> lg(g_padMapMutex);
-        map = g_padMapLive;
+    if (v.btn == 0 && v.lx == 0.0 && v.ly == 0.0 && v.rx == 0.0 && v.ry == 0.0 &&
+        v.rpadDx == 0.0 && v.rpadDy == 0.0 && v.lt <= 0.0 && v.rt <= 0.0 &&
+        st.lastBtn == 0 && !st.lastLT && !st.lastRT && !st.lastLclick && !st.lastRclick &&
+        st.lastNavDirs == 0 && st.padKeys.empty()) {
+        st.lastMs = nowMs();
+        return;
     }
+    uint32_t gen = g_padMapGen.load(std::memory_order_relaxed);
+    if (gen != st.mapGen) {
+        std::lock_guard<std::mutex> lg(g_padMapMutex);
+        st.map    = g_padMapLive;
+        st.mapGen = g_padMapGen.load(std::memory_order_relaxed);
+    }
+    const PadMap &map = st.map;
     bool navMode = g_panelVisible.load(std::memory_order_relaxed);
     uint32_t btn = v.btn;
     auto trig = [](double x, bool last) -> bool {
@@ -2810,7 +2843,6 @@ static void padApply(const PadView &v, PadApplyState &st)
     if (px != 0.0 || py != 0.0) {
         g_padDX.fetch_add(px);
         g_padDY.fetch_add(py);
-        padWake();
     }
 
     double sx = 0, sy = 0;
@@ -2847,13 +2879,16 @@ static void padApply(const PadView &v, PadApplyState &st)
             }
             st.lastNavDirs = 0;
         }
-        if (std::hypot(sx, sy) > 0.05) {
+        if (padSq(sx, sy) > 0.0025) {
             g_padSX.fetch_add(sx * 810.0 * dt);
             g_padSY.fetch_add(-sy * 810.0 * dt);
-            padWake();
         }
     }
     st.lastNavMode = navMode;
+    if (px != 0.0 || py != 0.0)
+        padWake();
+    else if (!navMode && padSq(sx, sy) > 0.0025)
+        padWake();
 }
 
 static void padRelease(PadApplyState &st)
@@ -2952,7 +2987,7 @@ static bool padReadEvdev(int fd, PadApplyState &st)
             btn &= ~(1u << pc);
     };
     struct pollfd pfds[2]{{fd, POLLIN, 0}, {g_padPipe[0], POLLIN, 0}};
-    while (g_padRunning && g_padEnabled.load(std::memory_order_relaxed)) {
+    while (g_padRunning && padInjectAllowed()) {
         int pr = poll(pfds, 2, 1000);
         if (!g_padRunning || (pr > 0 && (pfds[1].revents & POLLIN)))
             return true; /* wake: disable/exit, keep scanning */
@@ -3025,9 +3060,9 @@ static bool padReadEvdev(int fd, PadApplyState &st)
                         nrx = padNormAbs(az, vz, false);
                         nry = hasRZ ? -padNormAbs(arz, vrz, false) : 0;
                     }
-                    if (std::hypot(nx, ny) < 0.15)
+                    if (padSq(nx, ny) < 0.0225)
                         nx = ny = 0;
-                    if (std::hypot(nrx, nry) < 0.15)
+                    if (padSq(nrx, nry) < 0.0225)
                         nrx = nry = 0;
                     view.lx = nx;
                     view.ly = ny;
@@ -3081,9 +3116,9 @@ static void padThreadFn()
     int grabbed[16], ngrabbed = 0;
     unsigned char report[128];
     while (g_padRunning) {
-        if (!g_padEnabled.load(std::memory_order_relaxed)) {
-            /* runtime-disabled: hold no device, no grabs, no input.
-             * Sleep on the pipe (GAMEPAD wakes it) — no polling wakeups. */
+        if (!padInjectAllowed()) {
+            /* disabled or yielded to gamescope/fullscreen: hold no device
+             * so the game is not sharing hidraw/evdev with this reader. */
             g_padActive.store(false, std::memory_order_relaxed);
             g_padButtons.store(0, std::memory_order_relaxed);
             struct pollfd pfd{g_padPipe[0], POLLIN, 0};
@@ -3132,7 +3167,7 @@ static void padThreadFn()
         bool     padWasTouched = false;
         struct pollfd pfds[2]{{fd, POLLIN, 0}, {g_padPipe[0], POLLIN, 0}};
         bool alive = true;
-        while (alive && g_padRunning && g_padEnabled.load(std::memory_order_relaxed)) {
+        while (alive && g_padRunning && padInjectAllowed()) {
             int pr = poll(pfds, 2, 1000);
             if (!g_padRunning)
                 break;
@@ -3185,8 +3220,9 @@ static void padThreadFn()
                 bool touched = (px != 0 || py != 0 || (raw & (PB_RPAD_TOUCH | PB_RPAD_CLICK)) != 0);
                 if (touched && padWasTouched) {
                     double dx = (double)(px - lastPX), dy = (double)(py - lastPY);
-                    double mag = std::hypot(dx, dy);
-                    if (mag >= 150.0 && mag < 8000.0) {
+                    double mag2 = padSq(dx, dy);
+                    if (mag2 >= 22500.0 && mag2 < 64000000.0) {
+                        double mag = std::sqrt(mag2);
                         double k = 0.03 * (1.0 + std::min(mag / 4000.0, 2.0));
                         view.rpadDx = dx * k;
                         view.rpadDy = -dy * k;
@@ -3195,16 +3231,16 @@ static void padThreadFn()
                 lastPX = px;
                 lastPY = py;
                 padWasTouched = touched;
-                const double sdz = 1500.0;
-                double ldx = (double)padI16(report, PAD_LSTICK_X) - restLX;
-                double ldy = (double)padI16(report, PAD_LSTICK_Y) - restLY;
-                double rdx = (double)padI16(report, PAD_RSTICK_X) - restRX;
-                double rdy = (double)padI16(report, PAD_RSTICK_Y) - restRY;
-                if (std::hypot(ldx, ldy) > sdz) {
+                const double sdz2 = 1500.0 * 1500.0;
+                int16_t sx = padI16(report, PAD_LSTICK_X), sy = padI16(report, PAD_LSTICK_Y);
+                int16_t qx = padI16(report, PAD_RSTICK_X), qy = padI16(report, PAD_RSTICK_Y);
+                double ldx = (double)sx - restLX, ldy = (double)sy - restLY;
+                double rdx = (double)qx - restRX, rdy = (double)qy - restRY;
+                if (padSq(ldx, ldy) > sdz2) {
                     view.lx = ldx / 32767.0;
                     view.ly = ldy / 32767.0;
                 }
-                if (std::hypot(rdx, rdy) > sdz) {
+                if (padSq(rdx, rdy) > sdz2) {
                     view.rx = rdx / 32767.0;
                     view.ry = rdy / 32767.0;
                 }
@@ -3214,8 +3250,6 @@ static void padThreadFn()
                  * its mean becomes the new rest (input above already ran on
                  * the old rest, so calibration never stalls input). */
                 if (!restSettled) {
-                    int16_t sx = padI16(report, PAD_LSTICK_X), sy = padI16(report, PAD_LSTICK_Y);
-                    int16_t qx = padI16(report, PAD_RSTICK_X), qy = padI16(report, PAD_RSTICK_Y);
                     if (calN < 32) {
                         calLX[calN] = sx;
                         calLY[calN] = sy;
@@ -3517,6 +3551,7 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 {
                     std::lock_guard<std::mutex> lg(g_padMapMutex);
                     g_padMapLive = g_padMapIncoming;
+                    g_padMapGen.fetch_add(1, std::memory_order_release);
                 }
                 break;
             case SOskCommand::EType::PADWAKE: {
@@ -3561,7 +3596,8 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 g_padEnabled.store(en, std::memory_order_relaxed);
                 if (en)
                     ensurePadThread(); /* lazy start when the env is unset */
-                padWakeThread();       /* rescan sleep notices promptly */
+                padKickIfHoldChanged();
+                padWakeThread(); /* still wake: enable path may not change lastHold */
                 padPushState();
                 traceGeom(std::string("gamepad ") + (en ? "enabled" : "disabled"));
                 break;
