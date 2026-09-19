@@ -47,7 +47,7 @@ Buttons, OSK hidden (desktop duty):
 | D-pad   | Arrow keys                |
 | Back    | Tab                       |
 | START   | Omarchy menu (SUPER+SPACE)|
-| GUIDE   | OSK toggle (SUPER+SHIFT+K)|
+| GUIDE   | OSK toggle (socket `toggle`, no Super/Shift) |
 
 Buttons, OSK visible (Steam-like grid typing):
 
@@ -59,8 +59,8 @@ Buttons, OSK visible (Steam-like grid typing):
 | B                | Close keyboard                          |
 | START / GUIDE    | Unchanged (menu / toggle)               |
 
-Chords go through the synthetic keyboard so real compositor keybinds fire;
-no new IPC was needed for them. Grid nav arrives as unsolicited
+START still injects SUPER+SPACE (then force-releases those mods). GUIDE
+does not: it pushes `toggle` on the socket. Grid nav arrives as unsolicited
 `nav <up|down|left|right|commit|back|space|close> <1|0>` socket lines; the
 QML owns highlight, repeat and commit via its normal `activate()` path.
 Bumpers, paddles and the "dots" button are unmapped (free for later).

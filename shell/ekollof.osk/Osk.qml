@@ -76,8 +76,6 @@ Item {
     root.hide()
   }
 
-  function ping() { return "ok" }
-
   function show() {
     root.opened = true
     root.navActive = true

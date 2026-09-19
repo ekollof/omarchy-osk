@@ -33,8 +33,8 @@
  *                                main layer, dumped from the active keymap:
  *                                {"rows":[[{"l":"q","s":"Q","c":16},...],...]}
  *                                (raw:1 means send KEY <c> instead of TEXT)
- *   PMOVE / PBTN                 always "err pointer disabled" (no remote
- *                                pointer injection)
+ *   PMOVE / PBTN                 always "err pointer disabled" (rejected
+ *                                at the socket; never queued)
  *   FLING <tau_ms> <cap_px_s>    scroll momentum: decay time constant and
  *                                entry-velocity cap for the post-lift fling
  *   POINTER <slop_px> <long_ms>  drag slop (px before left-down) and
@@ -89,10 +89,11 @@
  * touchpad: right pad → relative cursor motion, right-pad click / right
  * trigger → left button, left pad click / left trigger → right button,
  * left stick → scroll, allowlisted face buttons/D-pad → keys, GUIDE →
- * SUPER+SHIFT+K, START → SUPER+SPACE. Pad commands are stamped pid=0 so a
- * socket client cannot forge them; enable/disable still requires the pinned
- * shell. The reader never calls compositor APIs or writes the client socket
- * (ring + coalesced PADWAKE/PADSTATE, same discipline as the socket thread).
+ * socket `toggle`, START → SUPER+SPACE then force-release mods. Pad
+ * commands are stamped pid=0 so a socket client cannot forge them;
+ * enable/disable still requires the pinned shell. The reader never calls
+ * compositor APIs or writes the client socket (ring + coalesced
+ * PADWAKE/PADSTATE, same discipline as the socket thread).
  * Steam-like typing: while the OSK panel is visible the reader routes
  * D-pad / A / X / Y / B and the left stick to unsolicited `nav <action>
  * <1|0>` socket lines (action = up|down|left|right|commit|back|space|close)
@@ -140,7 +141,6 @@
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/LayerState.hpp>
-#include <hyprland/src/desktop/state/ViewState.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
@@ -154,7 +154,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <climits>
 #include <fstream>
 #include <fcntl.h>
 #include <cerrno>
@@ -165,7 +164,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <vector>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
@@ -218,7 +216,7 @@ static int    debug   = 1;
  * corrupt under event-loop reentrancy (the crash mechanism). TEXT is
  * bounded to 95 bytes. */
 struct SOskCommand {
-    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, PMOVE, PBTN, FLING, POINTER, SCROLL, SWALLOW, PANEL,
+    enum class EType : uint8_t { KEY, MOD, MODS, TEXT, LAYOUT, FLING, POINTER, SCROLL, SWALLOW, PANEL,
                                  PADKEY, PADPTR, PADCHORD, PADWAKE, PADNAV, PADSTATE, PADMAP, MONREFRESH, GAMEPAD } type;
     int   a = 0, b = 0;
     pid_t pid           = 0; /* SO_PEERCRED pid stamped at queue time */
@@ -776,19 +774,6 @@ static void execLayout(const std::string &spec)
     rebuildGrid();
     pushGrid();
     DBG("layout applied: " + spec);
-}
-
-[[maybe_unused]] static void execPmove(int x, int y)
-{
-    Pointer::pointerController()->warpTo(Vector2D{(double)x, (double)y}, true);
-    g_pInputManager->simulateMouseMovement();
-}
-
-[[maybe_unused]] static void execPbtn(unsigned code, int press)
-{
-    g_pSeatManager->sendPointerButton(nowMs(), code,
-                                      press ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
-    g_pSeatManager->sendPointerFrame();
 }
 
 /* ---------------- touch state ----------------
@@ -3412,10 +3397,6 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
             case SOskCommand::EType::LAYOUT:
                 if (fromShell)
                     execLayout(c.text);
-                break;
-            case SOskCommand::EType::PMOVE:
-            case SOskCommand::EType::PBTN:
-                /* socket always replies err pointer disabled; never apply */
                 break;
             case SOskCommand::EType::FLING:
                 if (!fromShell)
