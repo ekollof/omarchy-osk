@@ -323,6 +323,14 @@ if [[ "$OSK_LOCAL_BUILT" == 1 && -x /usr/bin/hyprctl ]]; then
   /usr/bin/hyprctl plugin load "$OSK_SO" >/dev/null 2>&1 || true
 fi
 
+# Copying QML fires omarchy-shell's plugin watcher (hot-reload) in the same
+# second as hypr-osk.so remap. That has crashed quickshell in
+# QQmlObjectCreator::finalize / __dynamic_cast. Restart the shell after the
+# compositor plugin is in place so QML loads once, cleanly.
+if [[ -x /usr/bin/omarchy ]]; then
+  /usr/bin/omarchy restart shell >/dev/null 2>&1 || true
+fi
+
 echo "omarchy-osk installed."
 if [[ -x /usr/bin/hyprctl ]] && /usr/bin/hyprctl plugin list | /usr/bin/grep -q hypr-osk; then
   echo "compositor plugin: loaded"
