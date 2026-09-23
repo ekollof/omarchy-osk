@@ -85,12 +85,15 @@ On by default: a matching Steam Controller **or** a standard evdev
 gamepad works as soon as it streams. No env var required.
 
 The reader **yields** (closes hidraw/evdev, no grabs) when the focused
-window is `gamescope` (class/title) or exclusive-fullscreen **except**
-browsers and media players (Firefox, Chromium, Brave, mpv, VLC, …).
-Sharing the node with gamescope added controller lag; the game then has
-the pad alone. Fullscreen YouTube keeps the pad as a mouse. Showing the
-OSK overlay reopens the device. Maximized (not fullscreen) windows never
-yield.
+window looks like a game (`gamescope`, `steam_app_*`) or is covering /
+maximized / exclusive-fullscreen **except** browsers and media players
+(Firefox, Chromium, Brave, mpv, VLC, …). Borderless fullscreen games
+usually report maximized, not exclusive FS. Sharing the node with the
+game added controller lag; the game then has the pad alone. Fullscreen
+YouTube keeps the pad as a mouse. Showing the OSK overlay reopens hidraw.
+While a game is focused, lizard-mode Puck Mouse/Keyboard nodes stay
+grabbed even if Gamepad control is off — otherwise Hyprland still sees
+those phantoms and the stick lags.
 
 ## Mapping (`osk.json` `gamepadMap`)
 

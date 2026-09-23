@@ -82,7 +82,9 @@
  * While a focused window is gamescope, or exclusive-fullscreen and not a
  * browser/media player, the reader closes hidraw/evdev so the game is
  * not sharing the node (gamescope lag). Fullscreen YouTube keeps the pad.
- * The OSK layer taking focus reopens it.
+ * The OSK layer taking focus reopens hidraw. Lizard-mode mouse/keyboard
+ * nodes stay EVIOCGRABbed while a game is focused (even if GAMEPAD is off)
+ * so Hyprland does not see Puck Mouse events on top of the game.
  * A reader thread then opens the pad's hidraw node (VID 28de, PID 1302/1304
  * parsed from HID_ID=, not a uevent substring), parses report 0x42 (wire
  * layout from s3govesus/steam-controller-x crates/sc-protocol/src/report.rs)
@@ -142,6 +144,7 @@
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/LayerState.hpp>
+#include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
@@ -613,6 +616,8 @@ static Hyprutils::Signal::CHyprSignalListener g_padWinFs;
 static Hyprutils::Signal::CHyprSignalListener g_padWinClass;
 static Hyprutils::Signal::CHyprSignalListener g_padWinTitle;
 static Hyprutils::Signal::CHyprSignalListener g_padWinClose;
+static Hyprutils::Signal::CHyprSignalListener g_padWinOpen;
+static Hyprutils::Signal::CHyprSignalListener g_padWinFloat;
 static std::thread                            g_socketThread;
 
 /* ---------------- main-thread executors ---------------- */
@@ -2447,6 +2452,15 @@ static void padGrabPhantoms(int *held, int *nheld)
     }
 }
 
+static void padUngrabPhantoms(int *held, int *nheld)
+{
+    for (int i = 0; i < *nheld; i++) {
+        ioctl(held[i], EVIOCGRAB, (void *)0);
+        close(held[i]);
+    }
+    *nheld = 0;
+}
+
 static int16_t padI16(const unsigned char *r, int off)
 {
     return (int16_t)((uint16_t)r[off] | ((uint16_t)r[off + 1] << 8));
@@ -2656,16 +2670,28 @@ static bool padIcontains(const std::string &hay, const char *needle)
     return std::search(hay.begin(), hay.end(), needle, end, pred) != hay.end();
 }
 
-static bool padWindowIsGamescope(const PHLWINDOW &w)
+static bool padWindowClassHas(const PHLWINDOW &w, const char *needle)
+{
+    if (!w || !needle)
+        return false;
+    return padIcontains(w->m_class, needle) || padIcontains(w->m_initialClass, needle);
+}
+
+static bool padWindowLooksLikeGame(const PHLWINDOW &w)
 {
     if (!w)
         return false;
-    return padIcontains(w->m_class, "gamescope") || padIcontains(w->m_initialClass, "gamescope") ||
-           padIcontains(w->m_title, "gamescope") || padIcontains(w->m_initialTitle, "gamescope");
+    if (padWindowClassHas(w, "gamescope") || padIcontains(w->m_title, "gamescope") ||
+        padIcontains(w->m_initialTitle, "gamescope"))
+        return true;
+    /* Steam/Proton windows: steam_app_<id>, often borderless-maximized not exclusive FS */
+    if (padWindowClassHas(w, "steam_app"))
+        return true;
+    return false;
 }
 
 /* Fullscreen YouTube in a browser (or mpv/VLC) still wants the pad as a
- * mouse. Gamescope and unknown exclusive-fullscreen clients do not. */
+ * mouse. Gamescope, Steam games, and other covering/maximized clients do not. */
 static bool padWindowKeepsPad(const PHLWINDOW &w)
 {
     if (!w)
@@ -2676,7 +2702,7 @@ static bool padWindowKeepsPad(const PHLWINDOW &w)
         "qutebrowser", "epiphany", "freetube", "mpv", "vlc", "celluloid", "totem",
     };
     for (const char *k : keep) {
-        if (padIcontains(w->m_class, k) || padIcontains(w->m_initialClass, k))
+        if (padWindowClassHas(w, k))
             return true;
     }
     return false;
@@ -2686,14 +2712,50 @@ static bool padWindowTakesPad(const PHLWINDOW &w)
 {
     if (!w)
         return false;
-    if (padWindowIsGamescope(w))
+    if (padWindowLooksLikeGame(w))
         return true;
     if (padWindowKeepsPad(w))
         return false;
     auto &ctl = Fullscreen::controller();
     if (!ctl)
         return false;
-    return ctl->isFullscreen(w, Fullscreen::FSMODE_FULLSCREEN);
+    /* Exclusive FS *or* maximized/borderless — many games never set FSMODE_FULLSCREEN. */
+    auto modes = ctl->getFullscreenModes(w);
+    return modes.internal != Fullscreen::FSMODE_NONE || modes.client != Fullscreen::FSMODE_NONE;
+}
+
+/* True if a game/gamescope is in play on the focused monitor — not only the
+ * focused window. gamescope's class is often the inner game, not "gamescope". */
+static bool padMonitorHasGame()
+{
+    PHLWINDOW focused;
+    PHLMONITOR mon;
+    if (auto fs = Desktop::focusState()) {
+        focused = fs->window();
+        mon     = fs->monitor();
+    }
+    if (padWindowTakesPad(focused))
+        return true;
+    if (focused && !mon)
+        mon = focused->m_monitor.lock();
+    auto &ctl = Fullscreen::controller();
+    if (ctl && mon) {
+        auto fsw = ctl->getFullscreenWindow(mon, true);
+        if (fsw && !padWindowKeepsPad(fsw))
+            return true;
+    }
+    auto &st = Desktop::windowState();
+    if (!st)
+        return false;
+    for (const auto &w : st->windows()) {
+        if (!w || !w->m_isMapped)
+            continue;
+        if (mon && w->m_monitor.lock() != mon)
+            continue;
+        if (padWindowLooksLikeGame(w) || padWindowTakesPad(w))
+            return true;
+    }
+    return false;
 }
 
 static void padWakeThread();
@@ -2707,25 +2769,32 @@ static bool padInjectAllowed()
     return !g_padYielded.load(std::memory_order_relaxed);
 }
 
-/* Close hidraw/evdev while a game owns the pad — sharing the node with
- * gamescope showed up as controller lag. OSK visible still holds it. */
+/* 0 = park, 1 = grab lizard phantoms only (game), 2 = hidraw reader (desktop). */
+static int padThreadMode()
+{
+    if (padInjectAllowed())
+        return 2;
+    if (g_padYielded.load(std::memory_order_relaxed))
+        return 1;
+    return 0;
+}
+
 static void padKickIfHoldChanged()
 {
-    static std::atomic<bool> lastHold{true};
-    bool want = padInjectAllowed();
-    bool was  = lastHold.exchange(want, std::memory_order_relaxed);
-    if (was != want) {
-        traceGeom(std::string("gamepad: ") + (want ? "hold device" : "release device (game/gamescope)"));
+    static std::atomic<int> lastMode{-1};
+    int mode = padThreadMode();
+    int was  = lastMode.exchange(mode, std::memory_order_relaxed);
+    if (was != mode) {
+        traceGeom(std::string("gamepad: mode ") + std::to_string(was) + " -> " + std::to_string(mode));
+        if (mode != 0)
+            ensurePadThread();
         padWakeThread();
     }
 }
 
 static void padRefreshYield()
 {
-    PHLWINDOW w;
-    if (auto fs = Desktop::focusState())
-        w = fs->window();
-    bool yield = padWindowTakesPad(w);
+    bool yield = padMonitorHasGame();
     bool was   = g_padYielded.exchange(yield, std::memory_order_relaxed);
     if (was != yield)
         traceGeom(std::string("gamepad: ") + (yield ? "yield (game/gamescope)" : "resume (desktop)"));
@@ -3116,15 +3185,31 @@ static void padThreadFn()
     int grabbed[16], ngrabbed = 0;
     unsigned char report[128];
     while (g_padRunning) {
-        if (!padInjectAllowed()) {
-            /* disabled or yielded to gamescope/fullscreen: hold no device
-             * so the game is not sharing hidraw/evdev with this reader. */
+        int mode = padThreadMode();
+        if (mode == 0) {
             g_padActive.store(false, std::memory_order_relaxed);
             g_padButtons.store(0, std::memory_order_relaxed);
             struct pollfd pfd{g_padPipe[0], POLLIN, 0};
             poll(&pfd, 1, 1000);
             char b;
             while (read(g_padPipe[0], &b, 1) > 0) {}
+            continue;
+        }
+        if (mode == 1) {
+            /* Game/gamescope owns hidraw. Do not open it (that lagged). Still
+             * EVIOCGRAB lizard-mode mouse/keyboard so Hyprland does not see
+             * them — that lag remained even with GAMEPAD off. */
+            g_padActive.store(false, std::memory_order_relaxed);
+            g_padButtons.store(0, std::memory_order_relaxed);
+            padGrabPhantoms(grabbed, &ngrabbed);
+            traceGeom("gamepad: phantom grab only, n=" + std::to_string(ngrabbed));
+            struct pollfd pfd{g_padPipe[0], POLLIN, 0};
+            while (g_padRunning && padThreadMode() == 1) {
+                poll(&pfd, 1, 1000);
+                char b;
+                while (read(g_padPipe[0], &b, 1) > 0) {}
+            }
+            padUngrabPhantoms(grabbed, &ngrabbed);
             continue;
         }
         int kind = 1; /* 1 = steam hidraw 0x42, 2 = evdev gamepad */
@@ -3317,11 +3402,7 @@ static void padThreadFn()
             traceGeom("gamepad: device lost, rescanning");
         padRelease(st);
         }
-        for (int i = 0; i < ngrabbed; i++) {
-            ioctl(grabbed[i], EVIOCGRAB, (void *)0);
-            close(grabbed[i]);
-        }
-        ngrabbed = 0;
+        padUngrabPhantoms(grabbed, &ngrabbed);
         close(fd);
         g_padActive = false;
         g_padButtons.store(0, std::memory_order_relaxed);
@@ -3668,6 +3749,8 @@ static void unbindPadYieldHooks()
     g_padWinClass.reset();
     g_padWinTitle.reset();
     g_padWinClose.reset();
+    g_padWinOpen.reset();
+    g_padWinFloat.reset();
 }
 
 static void bindPadYieldHooks()
@@ -3681,6 +3764,8 @@ static void bindPadYieldHooks()
     g_padWinClass  = w.class_.listen([] { padRefreshYield(); });
     g_padWinTitle  = w.title.listen([] { padRefreshYield(); });
     g_padWinClose  = w.close.listen([] { padRefreshYield(); });
+    g_padWinOpen   = w.open.listen([] { padRefreshYield(); });
+    g_padWinFloat  = w.floating.listen([] { padRefreshYield(); });
     padRefreshYield();
 }
 

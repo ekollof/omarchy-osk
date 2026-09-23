@@ -36,6 +36,7 @@ Panel {
   property bool touchSwallow: true
   property var layouts: []
   property var gamepadMap: ({})
+  property bool padBindsOpen: false
   readonly property var padAnalogOptions: ["rightStick,rightPad", "rightStick", "leftStick", "rightPad", "none"]
   readonly property var padActOptions: [
     "none", "enter", "escape", "backspace", "space", "tab",
@@ -277,7 +278,7 @@ Panel {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
             font.bold: true
-            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev12")
+            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev13")
           }
 
           Text {
@@ -379,43 +380,60 @@ Panel {
         onChanged: function(v) { root.setMapAnalog("scroll", v) }
       }
 
-      Repeater {
-        model: [
-          { table: "desktop", key: "a", label: "A (keyboard hidden)" },
-          { table: "osk", key: "a", label: "A (keyboard open)" },
-          { table: "desktop", key: "b", label: "B (keyboard hidden)" },
-          { table: "osk", key: "b", label: "B (keyboard open)" },
-          { table: "desktop", key: "x", label: "X (keyboard hidden)" },
-          { table: "osk", key: "x", label: "X (keyboard open)" },
-          { table: "desktop", key: "y", label: "Y (keyboard hidden)" },
-          { table: "osk", key: "y", label: "Y (keyboard open)" },
-          { table: "desktop", key: "guide", label: "Guide / Home", both: true },
-          { table: "desktop", key: "start", label: "Start / Menu", both: true },
-          { table: "desktop", key: "rt", label: "Right trigger", both: true },
-          { table: "desktop", key: "lt", label: "Left trigger", both: true }
-        ]
-        delegate: Dropdown {
-          required property var modelData
-          width: parent.width
-          label: modelData.label
-          value: {
-            const t = root.gamepadMap && root.gamepadMap[modelData.table]
-            return (t && t[modelData.key]) ? t[modelData.key] : "none"
-          }
-          options: root.padActOptions
-          foreground: root.bar ? root.bar.foreground : Color.foreground
-          fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-          onChanged: function(v) { root.setMapBtn(modelData.table, modelData.key, v, !!modelData.both) }
-        }
+      Toggle {
+        width: parent.width
+        label: "Button mapping"
+        description: root.padBindsOpen ? "On: A/B/X/Y, Guide, Start, triggers" : "Off: collapsed — pointer and scroll stay above"
+        checked: root.padBindsOpen
+        foreground: root.bar ? root.bar.foreground : Color.foreground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        onClicked: root.padBindsOpen = !root.padBindsOpen
       }
 
-      Text {
+      Column {
         width: parent.width
-        wrapMode: Text.WordWrap
-        text: "Full map (dpad, bumpers, pad clicks, …) is in ~/.config/omarchy/osk.json under gamepadMap."
-        color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Color.foreground, 1.4)
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-        font.pixelSize: Style.font.caption
+        spacing: Style.space(12)
+        visible: root.padBindsOpen
+        height: visible ? implicitHeight : 0
+
+        Repeater {
+          model: [
+            { table: "desktop", key: "a", label: "A (keyboard hidden)" },
+            { table: "osk", key: "a", label: "A (keyboard open)" },
+            { table: "desktop", key: "b", label: "B (keyboard hidden)" },
+            { table: "osk", key: "b", label: "B (keyboard open)" },
+            { table: "desktop", key: "x", label: "X (keyboard hidden)" },
+            { table: "osk", key: "x", label: "X (keyboard open)" },
+            { table: "desktop", key: "y", label: "Y (keyboard hidden)" },
+            { table: "osk", key: "y", label: "Y (keyboard open)" },
+            { table: "desktop", key: "guide", label: "Guide / Home", both: true },
+            { table: "desktop", key: "start", label: "Start / Menu", both: true },
+            { table: "desktop", key: "rt", label: "Right trigger", both: true },
+            { table: "desktop", key: "lt", label: "Left trigger", both: true }
+          ]
+          delegate: Dropdown {
+            required property var modelData
+            width: parent.width
+            label: modelData.label
+            value: {
+              const t = root.gamepadMap && root.gamepadMap[modelData.table]
+              return (t && t[modelData.key]) ? t[modelData.key] : "none"
+            }
+            options: root.padActOptions
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            onChanged: function(v) { root.setMapBtn(modelData.table, modelData.key, v, !!modelData.both) }
+          }
+        }
+
+        Text {
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: "Full map (dpad, bumpers, pad clicks, …) is in ~/.config/omarchy/osk.json under gamepadMap."
+          color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Color.foreground, 1.4)
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+        }
       }
 
       PanelSeparator {

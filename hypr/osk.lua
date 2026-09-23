@@ -7,8 +7,9 @@
 -- Gamepad: auto-enabled when a Steam Controller or standard evdev pad is
 -- detected. The compositor plugin starts the reader at load; injection
 -- happens only while a matching controller streams. gamescope and
--- exclusive-fullscreen games get the pad (device closed so gamescope is
--- not sharing hidraw/evdev); fullscreen YouTube in a browser does not.
+-- games (gamescope, steam_app, maximized/borderless or exclusive FS)
+-- get the pad (device closed so they are not sharing hidraw/evdev);
+-- fullscreen YouTube in a browser does not.
 -- The OSK overlay takes it back. Disable from the bar
 -- applet (persisted in osk.json) or set HYPR_OSK_GAMEPAD=0. Quit Steam
 -- while testing the Puck: it reads the same hidraw reports in parallel.
