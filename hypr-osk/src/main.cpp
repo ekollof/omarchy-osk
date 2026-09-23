@@ -264,6 +264,7 @@ static bool padParseBtnLine(const char *line, PadMap *m);
 static void wakeDrain();
 
 static void ensurePadThread(); /* defined at the gamepad section; drain calls it */
+static void padPushState();    /* enabled + active snapshot; atomics + sendToClient only */
 
 static void queueCommand(SOskCommand cmd)
 {
@@ -2191,6 +2192,8 @@ static void socket_thread_fn(std::string path)
         }
         DBG("client connected");
         pushGrid(); /* proactively hand the fresh grid to the new client */
+        padPushState(); /* and the pad state: the reader holds the device
+                           across client reconnects with no new transition to push */
 
         struct pollfd cfds[3] = {{.fd = sock_fd, .events = POLLIN},
                                  {.fd = cfd, .events = POLLIN},
@@ -2893,7 +2896,12 @@ static void padApply(const PadView &v, PadApplyState &st)
     }
 
     uint32_t now = nowMs();
-    double dt = st.lastMs ? std::min(0.05, (now - st.lastMs) / 1000.0) : (1.0 / 270.0);
+    /* Cap the gap. Evdev is not a stream: hid-input drops samples inside
+     * fuzz, so a quiet Bluetooth stick can sit silent for tens of ms and
+     * the next report would otherwise jump by the whole gap. The evdev
+     * reader keeps integrating the last deflection on a short tick, so a
+     * late sample must not also dump the missed time. */
+    double dt = st.lastMs ? std::min(0.012, (now - st.lastMs) / 1000.0) : (1.0 / 270.0);
     st.lastMs = now;
     double px = 0, py = 0;
     /* PadView stick Y is up-positive; compositor pointer Y is down-positive. */
@@ -3046,8 +3054,47 @@ static bool padReadEvdev(int fd, PadApplyState &st)
     bool hasRZ = PAD_TEST(ABS_RZ, absb) && ioctl(fd, EVIOCGABS(ABS_RZ), &arz) == 0;
     bool hasHX = PAD_TEST(ABS_HAT0X, absb) && ioctl(fd, EVIOCGABS(ABS_HAT0X), &hatx) == 0;
     bool hasHY = PAD_TEST(ABS_HAT0Y, absb) && ioctl(fd, EVIOCGABS(ABS_HAT0Y), &haty) == 0;
-    bool zIsTrig = hasRX; /* Xbox-style: RX present => Z/RZ are triggers */
-    int vx = 0, vy = 0, vrx = 0, vry = 0, vz = 0, vrz = 0, vhx = 0, vhy = 0;
+    input_absinfo ag{}, ab{};
+    bool hasGas = PAD_TEST(ABS_GAS, absb) && ioctl(fd, EVIOCGABS(ABS_GAS), &ag) == 0;
+    bool hasBrake = PAD_TEST(ABS_BRAKE, absb) && ioctl(fd, EVIOCGABS(ABS_BRAKE), &ab) == 0;
+    /* hid-microsoft's Xbox BLE descriptor puts the right stick on Z/RZ and
+     * the triggers on Brake/Accelerator (ABS_BRAKE = LT, ABS_GAS = RT).
+     * Select/Start/Guide already arrive as BTN_SELECT/BTN_START/BTN_MODE;
+     * do not reshuffle them onto the stick clicks (those have no default
+     * binding, so View and Menu go dead). */
+    /* Z/RZ without RX/RY is ambiguous: analog triggers (rest at minimum)
+     * or the second stick (rest mid-travel). Brake/Gas, when present, are
+     * the triggers, so Z/RZ is the stick. Otherwise sample rest at open.
+     * (Holding a trigger while the device opens misreads until reopen.) */
+    bool restNearMin = false;
+    if (hasZ && hasRZ && !hasGas && !hasBrake) {
+        double spanZ = (double)az.maximum - (double)az.minimum;
+        double spanRZ = (double)arz.maximum - (double)arz.minimum;
+        restNearMin = spanZ > 0 && spanRZ > 0 && (double)az.value - (double)az.minimum < spanZ / 8.0 &&
+                      (double)arz.value - (double)arz.minimum < spanRZ / 8.0;
+    }
+    bool zIsTrig = !hasGas && !hasBrake && (hasRX || restNearMin);
+    /* Seed from the current axis position. evdev emits only axes that
+     * changed, and these sticks are 0..65535 with rest at mid-scale: a
+     * zero here is full deflection, so the first right-stick report used
+     * to scroll (left stick still 0) and peg the unreported stick axis. */
+    int vx = hasX ? ax.value : 0, vy = hasY ? ay.value : 0;
+    int vrx = hasRX ? arx.value : 0, vry = hasRY ? ary.value : 0;
+    int vz = hasZ ? az.value : 0, vrz = hasRZ ? arz.value : 0;
+    int vg = hasGas ? ag.value : 0, vb = hasBrake ? ab.value : 0;
+    int vhx = hasHX ? hatx.value : 0, vhy = hasHY ? haty.value : 0;
+    traceGeom(std::string("gamepad: evdev map zTrig=") + (zIsTrig ? "1" : "0") +
+              " gas=" + (hasGas ? "1" : "0") + " brake=" + (hasBrake ? "1" : "0") +
+              " rx=" + (hasRX ? "1" : "0"));
+    /* While a stick is deflected, integrate on a fixed tick. Bluetooth
+     * Xbox reports are sparse after kernel defuzz (fuzz is ~255 on a
+     * 0..65535 axis), so event-timed steps arrive as visible jumps. */
+    PadView held{};
+    bool coast = false;
+    auto pullAbs = [&](int axis, input_absinfo &inf, int &slot, bool present) {
+        if (present && ioctl(fd, EVIOCGABS(axis), &inf) == 0)
+            slot = inf.value;
+    };
     uint32_t btn = 0;
     auto setb = [&](int pc, bool on) {
         if (on)
@@ -3057,10 +3104,21 @@ static bool padReadEvdev(int fd, PadApplyState &st)
     };
     struct pollfd pfds[2]{{fd, POLLIN, 0}, {g_padPipe[0], POLLIN, 0}};
     while (g_padRunning && padInjectAllowed()) {
-        int pr = poll(pfds, 2, 1000);
-        if (!g_padRunning || (pr > 0 && (pfds[1].revents & POLLIN)))
+        int pr = poll(pfds, 2, coast ? 4 : 1000);
+        if (!g_padRunning || (pr > 0 && (pfds[1].revents & POLLIN))) {
+            /* drain the wake byte: poll stays readable while bytes remain,
+             * and an undrained byte re-exits every reopen instantly — the
+             * reader spins open/close forever and input dies silently */
+            char b;
+            while (read(g_padPipe[0], &b, 1) > 0) {}
             return true; /* wake: disable/exit, keep scanning */
-        if (pr <= 0 || !(pfds[0].revents & POLLIN)) {
+        }
+        if (pr == 0) {
+            if (coast)
+                padApply(held, st); /* same deflection, next slice of time */
+            continue;
+        }
+        if (pr < 0 || !(pfds[0].revents & POLLIN)) {
             if (pr < 0 && errno != EINTR)
                 return false;
             if (pr > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)))
@@ -3102,10 +3160,25 @@ static bool padReadEvdev(int fd, PadApplyState &st)
                     case ABS_RY: vry = ev[i].value; break;
                     case ABS_Z: vz = ev[i].value; break;
                     case ABS_RZ: vrz = ev[i].value; break;
+                    case ABS_GAS: vg = ev[i].value; break;
+                    case ABS_BRAKE: vb = ev[i].value; break;
                     case ABS_HAT0X: vhx = ev[i].value; break;
                     case ABS_HAT0Y: vhy = ev[i].value; break;
                     default: break;
                     }
+                } else if (ev[i].type == EV_SYN && ev[i].code == SYN_DROPPED) {
+                    /* state was lost; the next SYN would otherwise coast
+                     * on a stale deflection until a later change */
+                    pullAbs(ABS_X, ax, vx, hasX);
+                    pullAbs(ABS_Y, ay, vy, hasY);
+                    pullAbs(ABS_RX, arx, vrx, hasRX);
+                    pullAbs(ABS_RY, ary, vry, hasRY);
+                    pullAbs(ABS_Z, az, vz, hasZ);
+                    pullAbs(ABS_RZ, arz, vrz, hasRZ);
+                    pullAbs(ABS_GAS, ag, vg, hasGas);
+                    pullAbs(ABS_BRAKE, ab, vb, hasBrake);
+                    pullAbs(ABS_HAT0X, hatx, vhx, hasHX);
+                    pullAbs(ABS_HAT0Y, haty, vhy, hasHY);
                 } else if (ev[i].type == EV_SYN && ev[i].code == SYN_REPORT) {
                     PadView view;
                     view.btn = btn;
@@ -3129,18 +3202,36 @@ static bool padReadEvdev(int fd, PadApplyState &st)
                         nrx = padNormAbs(az, vz, false);
                         nry = hasRZ ? -padNormAbs(arz, vrz, false) : 0;
                     }
-                    if (padSq(nx, ny) < 0.0225)
-                        nx = ny = 0;
-                    if (padSq(nrx, nry) < 0.0225)
-                        nrx = nry = 0;
+                    /* Rescale past the deadzone so motion starts at rest
+                     * instead of stepping to the 15% floor. */
+                    auto soften = [](double &x, double &y) {
+                        const double dz = 0.15;
+                        double m2 = padSq(x, y);
+                        if (m2 <= dz * dz) {
+                            x = y = 0;
+                            return;
+                        }
+                        double m = std::sqrt(m2);
+                        double s = (m - dz) / ((1.0 - dz) * m);
+                        x *= s;
+                        y *= s;
+                    };
+                    soften(nx, ny);
+                    soften(nrx, nry);
                     view.lx = nx;
                     view.ly = ny;
                     view.rx = nrx;
                     view.ry = nry;
-                    if (zIsTrig && hasZ)
+                    if (hasBrake)
+                        view.lt = padNormAbs(ab, vb, true);
+                    else if (zIsTrig && hasZ)
                         view.lt = padNormAbs(az, vz, true);
-                    if (zIsTrig && hasRZ)
+                    if (hasGas)
+                        view.rt = padNormAbs(ag, vg, true);
+                    else if (zIsTrig && hasRZ)
                         view.rt = padNormAbs(arz, vrz, true);
+                    held = view;
+                    coast = padSq(view.lx, view.ly) > 0.0 || padSq(view.rx, view.ry) > 0.0;
                     padApply(view, st);
                 }
             }
@@ -3155,8 +3246,10 @@ static bool padReadEvdev(int fd, PadApplyState &st)
 
 static void padPushState()
 {
-    /* main thread only (drain): enabled + active snapshot to the client.
-     * The reader queues PADSTATE instead of calling this. */
+    /* enabled + active snapshot to the client. Atomics + mutex-protected
+     * non-blocking send only, so the socket thread (client connect) and the
+     * drain (PADSTATE) may call it. The reader thread never calls compositor
+     * APIs or the client socket — it queues PADSTATE instead. */
     char buf[32];
     snprintf(buf, sizeof buf, "pad %d %d", (int)g_padEnabled.load(std::memory_order_relaxed),
              (int)g_padActive.load(std::memory_order_relaxed));
@@ -3256,8 +3349,11 @@ static void padThreadFn()
             int pr = poll(pfds, 2, 1000);
             if (!g_padRunning)
                 break;
-            if (pr > 0 && (pfds[1].revents & POLLIN))
+            if (pr > 0 && (pfds[1].revents & POLLIN)) {
+                char b;
+                while (read(g_padPipe[0], &b, 1) > 0) {} /* drain the wake (see evdev loop) */
                 break; /* exit wake */
+            }
             if (pr <= 0 || !(pfds[0].revents & POLLIN)) {
                 if (pr < 0 && errno != EINTR)
                     alive = false;
