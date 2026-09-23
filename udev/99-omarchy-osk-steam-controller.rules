@@ -1,0 +1,15 @@
+# omarchy-osk: Steam Controller 2026 (Puck) access for the hypr-osk reader.
+# The Puck exposes no kernel gamepad device (only lizard-mode mouse/keyboard
+# plus raw hidraw), and its hidraw nodes carry no ID_INPUT tag, so logind
+# ignores them and they stay root-only (crw------- root root). Without this
+# rule the compositor plugin can never open report 0x42 and gamepad control
+# never enables. TAG+="uaccess" grants the active seat user RW; the lizard
+# evdev nodes get the same tag so the phantom EVIOCGRABs succeed.
+# Deployed by install.sh to /etc/udev/rules.d/ (needs root once); re-apply
+# live with: udevadm control --reload-rules && udevadm trigger
+# --subsystem-match=hidraw --subsystem-match=input --action=change
+# VID 28de, wired 1302 / puck 1304, USB (0003) or Bluetooth (0005).
+# KERNELS matches the "0003:28DE:1304.000A"-style HID parent device name.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", KERNELS=="*28DE:130[24].*", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Valve Software Steam Controller Puck *", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Steam Controller *", TAG+="uaccess"

@@ -6,6 +6,9 @@
 #   ekollof.osk-applet (bar widget)              -> ~/.config/omarchy/plugins/
 #   hypr/osk.lua       (plugin load, gesture, keybind)
 #   hypr/osk-toggle.sh                           -> ~/.config/hypr/scripts/
+#   udev/99-omarchy-osk-steam-controller.rules   -> /etc/udev/rules.d/
+#     (gamepad hidraw access; needs root once, install.sh uses
+#     passwordless sudo when available and otherwise prints the commands)
 #
 # Idempotent: safe to re-run after every edit. The shell hot-reloads plugin
 # code, but a stale component cache can serve old QML — run `omarchy restart
@@ -40,6 +43,7 @@ need /usr/bin/dirname
 need /usr/bin/id
 need /usr/bin/grep
 need /usr/bin/sed
+need /usr/bin/cmp
 
 ensure_user_dir() {
   local d=$1
@@ -164,6 +168,29 @@ else
     /usr/bin/meson compile -C "$DIR/vendor/hyprgrass/build"
     publish_file "$DIR/vendor/hyprgrass/build/src/libhyprgrass.so" \
       "$HOME/.local/share/hyprland/plugins/hyprgrass.so" 644
+  fi
+fi
+
+# 2b. hidraw/input access for the Steam Controller Puck (gamepad reader).
+# Its hidraw nodes carry no ID_INPUT tag, so logind ignores them and they
+# stay root-only: without this rule the plugin can never open report 0x42
+# and gamepad control never enables. Needs root once; without it only
+# standard evdev pads work. Re-applied live via trigger, no replug needed.
+UDEV_SRC="$DIR/udev/99-omarchy-osk-steam-controller.rules"
+UDEV_DEST="/etc/udev/rules.d/99-omarchy-osk-steam-controller.rules"
+if [[ -f $UDEV_SRC ]]; then
+  if [[ -f $UDEV_DEST ]] && /usr/bin/cmp -s "$UDEV_SRC" "$UDEV_DEST"; then
+    : # rule already installed
+  elif [[ -x /usr/bin/sudo ]] && /usr/bin/sudo -n true 2>/dev/null; then
+    /usr/bin/sudo /usr/bin/install -m 644 "$UDEV_SRC" "$UDEV_DEST"
+    /usr/bin/sudo /usr/bin/udevadm control --reload-rules
+    /usr/bin/sudo /usr/bin/udevadm trigger --subsystem-match=hidraw --subsystem-match=input --action=change
+  else
+    echo "warning: cannot install $UDEV_DEST without root; gamepad hidraw stays root-only." >&2
+    echo "run once:" >&2
+    echo "  sudo install -m 644 \"$UDEV_SRC\" \"$UDEV_DEST\"" >&2
+    echo "  sudo udevadm control --reload-rules" >&2
+    echo "  sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=input --action=change" >&2
   fi
 fi
 
@@ -302,6 +329,10 @@ finally:
         except Exception:
             pass
 PY
+fi
+if [[ -f $HYPRLAND ]] && ! /usr/bin/grep -q 'require("hypr.osk")' "$HYPRLAND"; then
+  echo "warning: $HYPRLAND has no require(\"hypr.osk\") and no hypr.gestures anchor;" >&2
+  echo "plugins will NOT auto-load next session. Add require(\"hypr.osk\") manually." >&2
 fi
 
 # 6. Register with the shell and reload Hyprland
