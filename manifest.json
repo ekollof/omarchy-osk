@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "ekollof.osk",
   "name": "On-screen keyboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "ekollof",
-  "description": "On-screen keyboard + touchscreen pointer emulation for tablets: xkb-layout-driven OSK overlay, bar applet settings, hold-to-repeat and socket access control (compositor plugin via ./install.sh)",
+  "description": "On-screen keyboard + touchscreen pointer emulation for tablets: xkb-layout-driven OSK overlay, bar applet settings, hold-to-repeat, gamepad control (sticks, triggers, grid typing), and socket access control (compositor plugin via ./install.sh)",
   "kinds": [
     "overlay",
     "bar-widget"
