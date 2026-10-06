@@ -127,8 +127,7 @@ Item {
     // mapped layer surface (258 vs 101 observed)
     const ny = (s.height - root.panelH) / s.height
     const nh = root.panelH / s.height
-    console.log("[ekollof.osk] syncPanel panelH=" + root.panelH + " sh=" + s.height +
-                " ny=" + ny.toFixed(4) + " sock=" + connected())
+    // @@syncPanel@@
     send("PANEL 0 " + ny.toFixed(4) + " 1 " + nh.toFixed(4))
   }
 
@@ -547,7 +546,7 @@ Item {
       // normalized against; dock the keyboard there
       const name = line.split(/\s+/)[1] || ""
       if (name && name !== root.touchMonitor) {
-        console.log("[ekollof.osk] touch monitor: " + name)
+        // @@touch-monitor@@
         root.touchMonitor = name
         Qt.callLater(root.syncPanel)
       }
@@ -564,7 +563,7 @@ Item {
         onRead: function(line) { root.handleReply(line) }
       }
       onConnectedChanged: {
-        console.log("[ekollof.osk] socket " + (connected ? "connected" : "disconnected"))
+        // @@socket@@
         root.sockReady = connected
         if (!connected) {
           root.announced = false
@@ -721,8 +720,6 @@ Item {
   }
 
   function activate(k) {
-    console.log("[ekollof.osk] key t=" + k.t + " k=" + (k.l || "") + " c=" + (k.c || 0) +
-                " m=" + (k.m || "") + " sock=" + connected())
     switch (k.t) {
     case "char":
       send("TEXT " + resolveChar(k))
@@ -970,8 +967,8 @@ Item {
 
   onOpenedChanged: syncPanel()
   onPanelHChanged: syncPanel()
-  Component.onCompleted: {
-    console.log("[ekollof.osk] loaded rev23 layout=" + root.layout + " cfg=" + root.cfgPath())
+  Component.onCompleted: { // rev26
+    // @@loaded@@
     const helper = root.jsonHelper()
     if (!helper) {
       root.applyConfig("")

@@ -208,12 +208,26 @@ using namespace Hyprutils::Math;
 #define MAX_LINE 1024
 #define TEXT_CAP 96 /* TEXT payload capacity in the ring (incl. NUL) */
 static HANDLE PHANDLE = nullptr;
-static int    debug   = 1;
+/* Compiled in only when meson get_option('debug') is true (buildtype debug
+ * or debugoptimized). A release build has no key-log call. Log::logger in
+ * this .so does not print; key lines go to the compositor's stderr. */
+#ifdef HYPR_OSK_DEBUG
 #define DBG(...)                                                                                                                                                               \
     do {                                                                                                                                                                       \
-        if (debug)                                                                                                                                                             \
-            Log::logger->log(Log::DEBUG, std::string("[hypr-osk] ") + std::string(__VA_ARGS__));                                                                              \
+        Log::logger->log(Log::DEBUG, std::string("[hypr-osk] ") + std::string(__VA_ARGS__));                                                                                   \
     } while (0)
+static void debugKeyLine(const char *line)
+{
+    if (strncmp(line, "KEY ", 4) != 0 && strncmp(line, "TEXT ", 5) != 0 && strncmp(line, "MOD ", 4) != 0 &&
+        strcmp(line, "MODS off") != 0)
+        return;
+    fprintf(stderr, "[hypr-osk] input %s\n", line);
+}
+#define DBG_KEY(line) debugKeyLine(line)
+#else
+#define DBG(...) do {} while (0)
+#define DBG_KEY(line) do {} while (0)
+#endif
 
 /* ---------------- socket <-> main thread queue ----------------
  * Fixed-size POD ring buffer: no heap allocations in transit, nothing to
@@ -1879,7 +1893,7 @@ static bool handle_line(int cfd, char *line)
     size_t len = strlen(line);
     while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
         line[--len] = 0;
-    DBG("cmd: " + std::string(line));
+    DBG_KEY(line);
 
     std::string reply = "err unknown command";
     SOskCommand cmd;

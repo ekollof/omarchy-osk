@@ -23,8 +23,15 @@ hyprland_deps = [
   dependency('libdrm'),
 ]
 
+plugin_args = ['-DWLR_USE_UNSTABLE']
+# get_option('debug') is true for buildtype debug and debugoptimized, false
+# for the default release build. This is the only switch for key logging.
+if get_option('debug')
+  plugin_args += ['-DHYPR_OSK_DEBUG']
+endif
+
 shared_module('hypr-osk',
   'src/main.cpp',
-  cpp_args: ['-DWLR_USE_UNSTABLE'],
+  cpp_args: plugin_args,
   dependencies: [hyprland_deps],
   install: true)

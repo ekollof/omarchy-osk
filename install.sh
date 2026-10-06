@@ -44,6 +44,7 @@ need /usr/bin/id
 need /usr/bin/grep
 need /usr/bin/sed
 need /usr/bin/cmp
+need /usr/bin/python3
 
 ensure_user_dir() {
   local d=$1
@@ -194,10 +195,20 @@ if [[ -f $UDEV_SRC ]]; then
   fi
 fi
 
-# 4. Deploy the shell plugins
+# 4. Deploy the shell plugins. console.log is not part of a release
+# install: Quickshell has no compile step, so the deploy filter deletes
+# those calls unless this meson build was configured with debug info
+# (-DHYPR_OSK_DEBUG). A missing build dir is treated as release.
+QML_LOG_MODE=release
+if [[ -f $DIR/hypr-osk/build/compile_commands.json ]] &&
+  /usr/bin/grep -q -- '-DHYPR_OSK_DEBUG' "$DIR/hypr-osk/build/compile_commands.json"; then
+  QML_LOG_MODE=debug
+fi
 ensure_user_dir "$HOME/.config/omarchy/plugins"
 for p in ekollof.osk ekollof.osk-applet; do
   publish_tree "$DIR/shell/$p" "$HOME/.config/omarchy/plugins/$p"
+  /usr/bin/python3 "$DIR/hypr-osk/qml_debug_logs.py" --mode "$QML_LOG_MODE" \
+    "$HOME/.config/omarchy/plugins/$p"
 done
 
 # 5. Deploy the Hyprland integration

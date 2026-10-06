@@ -278,7 +278,7 @@ Panel {
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
             font.bold: true
-            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev13")
+            // @@applet-loaded@@
           }
 
           Text {
@@ -745,7 +745,7 @@ Panel {
     }
     onExited: function() {
       if (!stateProc.gotState) {
-        console.log("[ekollof.osk-applet] stateProc failed, oskEnabled=false")
+        console.warn("[ekollof.osk-applet] stateProc failed, oskEnabled=false")
         root.oskEnabled = false
       }
       stateProc.gotState = false

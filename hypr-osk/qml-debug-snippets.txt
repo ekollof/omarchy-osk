@@ -1,0 +1,11 @@
+@@syncPanel@@
+    console.log("[ekollof.osk] syncPanel panelH=" + root.panelH + " sh=" + s.height +
+                " ny=" + ny.toFixed(4) + " sock=" + connected())
+@@touch-monitor@@
+        console.log("[ekollof.osk] touch monitor: " + name)
+@@socket@@
+        console.log("[ekollof.osk] socket " + (connected ? "connected" : "disconnected"))
+@@loaded@@
+    console.log("[ekollof.osk] loaded rev26 layout=" + root.layout + " cfg=" + root.cfgPath())
+@@applet-loaded@@
+            Component.onCompleted: console.log("[ekollof.osk-applet] loaded rev14")
