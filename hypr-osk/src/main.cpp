@@ -757,6 +757,13 @@ static void execLayout(const std::string &spec)
 {
     if (!g_oskKeyboard)
         return;
+    /* Reconnects repeat LAYOUT. Keep the state (including held keys) and
+     * resend the grid without making every client, notably Xwayland,
+     * compile an identical keymap again. */
+    if (spec == g_layoutSpec) {
+        pushGrid();
+        return;
+    }
     /* "name" or "name(variant)"; validated by the socket thread before
      * queueing, so a bad name never reaches the compositor's fallback path */
     std::string layout = spec, variant;
@@ -776,7 +783,12 @@ static void execLayout(const std::string &spec)
     rules.model   = "";
     rules.options = "";
     rules.rules   = "";
+    /* Only our LAYOUT command may replace this virtual device's keymap.
+     * Hyprland also calls setKeymap on registration and config reload. */
+    g_oskKeyboard->m_keymapOverridden = false;
+    g_oskKeyboard->m_xkbFilePath.clear();
     g_oskKeyboard->setKeymap(rules);
+    g_oskKeyboard->m_keymapOverridden = true;
     g_layoutSpec = spec;
     rebuildTextMap();
     rebuildGrid();
@@ -3901,6 +3913,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     rules.options = "";
     rules.rules   = "";
     g_oskKeyboard->setKeymap(rules);
+    g_oskKeyboard->m_keymapOverridden = true;
     try {
         g_pInputManager->newKeyboard(g_oskKeyboard);
     } catch (const std::exception &e) {
