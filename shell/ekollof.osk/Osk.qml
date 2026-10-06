@@ -498,9 +498,13 @@ Item {
     if (s && s.connected) {
       s.write(line + "\n")
       s.flush() // write() queues; flush puts it on the wire now
-    } else {
-      console.warn("[ekollof.osk] socket down, dropping: " + line)
+      return
     }
+    // Quickshell persists console.warn. A dropped TEXT/KEY/MOD line is a
+    // keystroke, so a disconnect must not record it.
+    if (/^(TEXT|KEY|MODS?)( |$)/.test(line))
+      return
+    console.warn("[ekollof.osk] socket down, dropping: " + line)
   }
 
   // Handshake: layout first, then the plugin replies with the grid (and
