@@ -3,6 +3,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
+import qs.Commons as Commons
 import "KeyboardLayout.js" as KeyboardLayout
 
 // On-screen keyboard (wvkbd terminal layout) as an omarchy shell overlay.
@@ -882,7 +883,7 @@ Item {
     Rectangle {
       id: kbdColumn
       anchors.fill: parent
-      color: Color.bar.background
+      color: Commons.Color.bar.background
 
       Column {
         id: rowsCol
@@ -929,14 +930,14 @@ Item {
                 width: modelData.w * keyRow.rowUnit
                 height: root.keyH
                 radius: Style.space(5)
-                color: key.active ? Color.bar.active : (modelData.scheme ? Qt.alpha(Color.bar.text, 0.14) : Qt.alpha(Color.bar.text, 0.06))
+                color: key.active ? Commons.Color.bar.active : (modelData.scheme ? Qt.alpha(Commons.Color.bar.text, 0.14) : Qt.alpha(Commons.Color.bar.text, 0.06))
                 border.width: modelData.scheme ? 1 : 0
-                border.color: Qt.alpha(Color.bar.text, 0.25)
+                border.color: Qt.alpha(Commons.Color.bar.text, 0.25)
 
                 Text {
                   anchors.centerIn: parent
                   text: (key.upper && parent.modelData.s) ? parent.modelData.s : parent.modelData.l
-                  color: key.active ? Color.bar.background : Color.bar.text
+                  color: key.active ? Commons.Color.bar.background : Commons.Color.bar.text
                   font.family: Style.fontFamily
                   font.pixelSize: parent.modelData.l.length > 2 ? Style.space(15) : Style.space(20)
                 }

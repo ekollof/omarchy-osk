@@ -3,6 +3,7 @@ import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Bar applet for the ekollof.osk on-screen keyboard plugin: enable/disable
@@ -262,7 +263,7 @@ Panel {
         Text {
           textFormat: Text.PlainText
           text: root.kbGlyph
-          color: root.bar ? root.bar.foreground : Color.foreground
+          color: root.bar ? root.bar.foreground : Commons.Color.foreground
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.display
           anchors.verticalCenter: parent.verticalCenter
@@ -274,7 +275,7 @@ Panel {
 
           Text {
             text: "On-screen keyboard"
-            color: root.bar ? root.bar.foreground : Color.foreground
+            color: root.bar ? root.bar.foreground : Commons.Color.foreground
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.title
             font.bold: true
@@ -283,7 +284,7 @@ Panel {
 
           Text {
             text: root.oskEnabled ? root.layout : "disabled"
-            color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Color.foreground, 1.4)
+            color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Commons.Color.foreground, 1.4)
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
             font.letterSpacing: 1.2
@@ -297,7 +298,7 @@ Panel {
         label: "Enabled"
         description: "Bar toggle, swipe-up gesture and SUPER+SHIFT+K summon the keyboard"
         checked: root.oskEnabled
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onClicked: root.setOskEnabled(!root.oskEnabled)
       }
@@ -309,7 +310,7 @@ Panel {
                      ? "On: touch input drives the virtual pointer (tap, drag, scroll, pinch)"
                      : "Off: native touchscreen support — apps receive raw touch, gestures are off"
         checked: root.touchSwallow
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onClicked: {
           root.touchSwallow = !root.touchSwallow
@@ -320,7 +321,7 @@ Panel {
       Button {
         width: parent.width
         text: "Toggle keyboard"
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         enabled: root.oskEnabled
         onClicked: root.toggleOsk()
@@ -328,14 +329,14 @@ Panel {
 
       PanelSeparator {
         width: parent.width
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
       }
 
       // ---------- gamepad ----------
       PanelSectionHeader {
         width: parent.width
         text: "Gamepad"
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
       }
 
@@ -346,7 +347,7 @@ Panel {
                      : root.padActive ? "On: controller connected — stick/pad move the pointer, GUIDE summons the OSK"
                      : "On: waiting for a controller (works as soon as one is detected)"
         checked: root.gamepad
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onClicked: root.toggleGamepad()
       }
@@ -355,7 +356,7 @@ Panel {
         width: parent.width
         wrapMode: Text.WordWrap
         text: "Steam Controller (Puck) and standard Bluetooth/USB gamepads (DualSense, Xbox, 8BitDo, …). Valve hidraw is preferred when both are present. Steam client will fight hidraw — quit it while using the Puck."
-        color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Color.foreground, 1.4)
+        color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Commons.Color.foreground, 1.4)
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption
       }
@@ -365,7 +366,7 @@ Panel {
         label: "Pointer"
         value: (root.gamepadMap && root.gamepadMap.pointer) ? root.gamepadMap.pointer : "rightStick,rightPad"
         options: root.padAnalogOptions
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onChanged: function(v) { root.setMapAnalog("pointer", v) }
       }
@@ -375,7 +376,7 @@ Panel {
         label: "Scroll (nav when keyboard is open)"
         value: (root.gamepadMap && root.gamepadMap.scroll) ? root.gamepadMap.scroll : "leftStick"
         options: root.padAnalogOptions
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onChanged: function(v) { root.setMapAnalog("scroll", v) }
       }
@@ -385,7 +386,7 @@ Panel {
         label: "Button mapping"
         description: root.padBindsOpen ? "On: A/B/X/Y, Guide, Start, triggers" : "Off: collapsed — pointer and scroll stay above"
         checked: root.padBindsOpen
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onClicked: root.padBindsOpen = !root.padBindsOpen
       }
@@ -420,7 +421,7 @@ Panel {
               return (t && t[modelData.key]) ? t[modelData.key] : "none"
             }
             options: root.padActOptions
-            foreground: root.bar ? root.bar.foreground : Color.foreground
+            foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
             fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
             onChanged: function(v) { root.setMapBtn(modelData.table, modelData.key, v, !!modelData.both) }
           }
@@ -430,7 +431,7 @@ Panel {
           width: parent.width
           wrapMode: Text.WordWrap
           text: "Full map (dpad, bumpers, pad clicks, …) is in ~/.config/omarchy/osk.json under gamepadMap."
-          color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Color.foreground, 1.4)
+          color: root.bar ? Qt.darker(root.bar.foreground, 1.4) : Qt.darker(Commons.Color.foreground, 1.4)
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -438,14 +439,14 @@ Panel {
 
       PanelSeparator {
         width: parent.width
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
       }
 
       // ---------- layout ----------
       PanelSectionHeader {
         width: parent.width
         text: "Layout"
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
       }
 
@@ -454,7 +455,7 @@ Panel {
         label: "Keyboard layout"
         value: root.layout
         options: root.layouts
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onChanged: function(v) {
           root.layout = v
@@ -464,14 +465,14 @@ Panel {
 
       PanelSeparator {
         width: parent.width
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
       }
 
       // ---------- key repeat ----------
       PanelSectionHeader {
         width: parent.width
         text: "Key repeat (hold any key)"
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
       }
 
@@ -480,7 +481,7 @@ Panel {
         label: "Enable repeat"
         description: "Holding a key repeats it (first after the delay, then at the interval)"
         checked: root.repeatEnabled
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onClicked: {
           root.repeatEnabled = !root.repeatEnabled
@@ -494,7 +495,7 @@ Panel {
 
         Text {
           text: "Delay · " + root.repeatDelay + " ms"
-          color: root.bar ? root.bar.foreground : Color.foreground
+          color: root.bar ? root.bar.foreground : Commons.Color.foreground
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -518,7 +519,7 @@ Panel {
 
         Text {
           text: "Interval · " + root.repeatInterval + " ms"
-          color: root.bar ? root.bar.foreground : Color.foreground
+          color: root.bar ? root.bar.foreground : Commons.Color.foreground
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -546,7 +547,7 @@ Panel {
       PanelSectionHeader {
         width: parent.width
         text: "Pointer (touch → mouse)"
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
       }
 
@@ -556,7 +557,7 @@ Panel {
 
         Text {
           text: "Drag slop · " + root.dragSlop + " px"
-          color: root.bar ? root.bar.foreground : Color.foreground
+          color: root.bar ? root.bar.foreground : Commons.Color.foreground
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -580,7 +581,7 @@ Panel {
 
         Text {
           text: root.longPress === 0 ? "Long-press right click · off" : "Long-press right click · " + root.longPress + " ms"
-          color: root.bar ? root.bar.foreground : Color.foreground
+          color: root.bar ? root.bar.foreground : Commons.Color.foreground
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -604,7 +605,7 @@ Panel {
 
         Text {
           text: "Scroll speed · " + root.scrollGain + "%"
-          color: root.bar ? root.bar.foreground : Color.foreground
+          color: root.bar ? root.bar.foreground : Commons.Color.foreground
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -629,7 +630,7 @@ Panel {
                      ? "On: force pixel axis for every app (terminals already get this automatically)"
                      : "Off: auto — terminals get pixels, Chromium-style clients get the ×12-safe axis"
         checked: root.scrollAxisPx
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         onClicked: {
           root.scrollAxisPx = !root.scrollAxisPx
@@ -639,14 +640,14 @@ Panel {
 
       PanelSeparator {
         width: parent.width
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
       }
 
       // ---------- fling ----------
       PanelSectionHeader {
         width: parent.width
         text: "Scroll fling (momentum after lifting the fingers)"
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
       }
 
@@ -656,7 +657,7 @@ Panel {
 
         Text {
           text: "Glide · " + root.flingDecay + " ms"
-          color: root.bar ? root.bar.foreground : Color.foreground
+          color: root.bar ? root.bar.foreground : Commons.Color.foreground
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -680,7 +681,7 @@ Panel {
 
         Text {
           text: "Speed cap · " + root.flingCap + " px/s"
-          color: root.bar ? root.bar.foreground : Color.foreground
+          color: root.bar ? root.bar.foreground : Commons.Color.foreground
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.caption
         }
