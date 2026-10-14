@@ -15,7 +15,7 @@ repository = "https://github.com/ekollof/omarchy-osk"
 name = "hypr-osk"
 authors = ["ekollof"]
 commit_pins = [
-    ["efb50993780079460b0cbed1363e2166a2de1d9f", "d64eeb9b32871ede4eb4f83c582c45929300a56e"],
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "556a2f421a540c4bb5dfcfc5ea2515e22942c55a"],
 ]
 
 [hypr-osk]

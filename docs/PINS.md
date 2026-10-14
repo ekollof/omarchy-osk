@@ -19,7 +19,12 @@ pkg-config `hyprland` headers. Rebuild after a Hyprland upgrade.
 The optional hyprpm route (`hyprpm.toml` `commit_pins`) maps that Hyprland
 commit to a last-known-good hypr-osk plugin commit:
 
-`efb50993780079460b0cbed1363e2166a2de1d9f` → `d64eeb9b32871ede4eb4f83c582c45929300a56e`
+`efb50993780079460b0cbed1363e2166a2de1d9f` → `556a2f421a540c4bb5dfcfc5ea2515e22942c55a`
+
+The pinned source includes the packaged-quickshell executable check, pinned
+omarchy-shell instance, and mapped OSK layer requirement for injection. When
+updating this pin, review the selected source as well as the manifest: hyprpm
+builds the pinned commit rather than the current checkout.
 
 `./install.sh` is the primary path and builds whatever is in this tree.
 
