@@ -11,5 +11,5 @@
 # VID 28de, wired 1302 / puck 1304, USB (0003) or Bluetooth (0005).
 # KERNELS matches the "0003:28DE:1304.000A"-style HID parent device name.
 SUBSYSTEM=="hidraw", KERNEL=="hidraw*", KERNELS=="*28DE:130[24].*", TAG+="uaccess"
-SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Valve Software Steam Controller Puck *", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", KERNELS=="*28DE:130[24].*", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Steam Controller *", TAG+="uaccess"

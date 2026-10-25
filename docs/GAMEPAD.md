@@ -77,6 +77,15 @@ does not: it pushes `toggle` on the socket. Grid nav arrives as unsolicited
 QML owns highlight, repeat and commit via its normal `activate()` path.
 Bumpers, paddles and the "dots" button are unmapped (free for later).
 
+The controller's built-in keyboard/mouse events are grabbed while the
+reader owns it. Some Puck firmware exposes combined nodes named exactly
+`Valve Software Steam Controller Puck`, rather than separate Mouse/Keyboard
+nodes. Detection uses Valve VID/PID and input capabilities; real gamepad
+and absolute-axis nodes remain available. Missing these combined nodes
+lets A type the highlighted OSK key and a second, native Enter, submitting
+text unexpectedly. The input udev rule matches the HID parent so these
+combined nodes also receive the permissions needed for the grab.
+
 ## Bar icon + toggle
 
 The reader starts with the compositor plugin and injects only while a

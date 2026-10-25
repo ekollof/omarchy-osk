@@ -2443,20 +2443,13 @@ static int padOpenStreamer()
     return -1;
 }
 
-static bool padPhantomName(const char *name)
-{
-    /* Lizard-mode mouse/keyboard nodes only — not the hid-steam gamepad
-     * node named "Steam Controller", which we may read as evdev. */
-    return strstr(name, "Puck Mouse") || strstr(name, "Puck Keyboard") ||
-           strstr(name, "Puck Consumer") || strstr(name, "Puck System") ||
-           strstr(name, "Steam Controller Mouse") || strstr(name, "Steam Controller Keyboard");
-}
+#include "pad-device.hpp"
 
 static void padGrabPhantoms(int *held, int *nheld)
 {
     /* EVIOCGRAB the kernel hid-generic phantom mouse/keyboard nodes so
      * lizard-mode events don't double with the synthetic ones. Best effort:
-     * name-probe with O_RDONLY, grab only matching nodes; released on
+     * probe with O_RDONLY, grab only matching hardware/capabilities; released on
      * thread exit. */
     *nheld = 0;
     for (int i = 0; i < 64 && *nheld < 16; i++) {
@@ -2465,8 +2458,7 @@ static void padGrabPhantoms(int *held, int *nheld)
         int fd = open(node, O_RDONLY | O_NONBLOCK);
         if (fd < 0)
             continue;
-        char name[256] = {0};
-        if (ioctl(fd, EVIOCGNAME_256, name) < 0 || !padPhantomName(name)) {
+        if (!padPhantomDevice(fd)) {
             close(fd);
             continue;
         }
@@ -3023,8 +3015,7 @@ static int padOpenEvdev()
         int fd = open(node, O_RDONLY | O_NONBLOCK);
         if (fd < 0)
             continue;
-        char name[256] = {0};
-        if (ioctl(fd, EVIOCGNAME_256, name) < 0 || padPhantomName(name)) {
+        if (padPhantomDevice(fd)) {
             close(fd);
             continue;
         }

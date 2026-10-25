@@ -35,3 +35,5 @@ shared_module('hypr-osk',
   cpp_args: plugin_args,
   dependencies: [hyprland_deps],
   install: true)
+
+test('pad-device', executable('pad-device-test', 'tests/pad-device.cpp'))
