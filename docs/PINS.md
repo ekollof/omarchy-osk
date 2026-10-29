@@ -25,7 +25,7 @@ Hyprland commit to a last-known-good hypr-osk plugin commit. Both pins build
 the same dual-API source:
 
 `efb50993780079460b0cbed1363e2166a2de1d9f` → `556a2f421a540c4bb5dfcfc5ea2515e22942c55a`
-`0aa6745f705f2c4b0a5004eb019ef76e5bbdb426` → `<pin-pending>`
+`0aa6745f705f2c4b0a5004eb019ef76e5bbdb426` → `47714a4e37c9c5ef5ab900ec761f5b70fb038061`
 
 The pinned source includes the packaged-quickshell executable check, pinned
 omarchy-shell instance, and mapped OSK layer requirement for injection. When

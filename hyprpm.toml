@@ -8,6 +8,7 @@
 # preferred when both exist; the loader guards against double-loads).
 # commit_pins: running-Hyprland-commit -> last-known-good plugin commit.
 # Hyprland v0.56.2 efb50993780079460b0cbed1363e2166a2de1d9f.
+# Hyprland v0.57.0 0aa6745f705f2c4b0a5004eb019ef76e5bbdb426.
 # Vendored hyprgrass/wf-touch pins: docs/PINS.md (install.sh is the primary
 # path and builds this tree; hyprpm is optional).
 [repository]
@@ -16,6 +17,7 @@ name = "hypr-osk"
 authors = ["ekollof"]
 commit_pins = [
     ["efb50993780079460b0cbed1363e2166a2de1d9f", "556a2f421a540c4bb5dfcfc5ea2515e22942c55a"],
+    ["0aa6745f705f2c4b0a5004eb019ef76e5bbdb426", "47714a4e37c9c5ef5ab900ec761f5b70fb038061"],
 ]
 
 [hypr-osk]
