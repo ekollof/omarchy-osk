@@ -24,6 +24,12 @@ hyprland_deps = [
 ]
 
 plugin_args = ['-DWLR_USE_UNSTABLE']
+# GCC's GNU-unique symbols make dlclose retain the module. A rejected plugin
+# can then keep returning its old API version even after replacing the file.
+# Allow Hyprland to actually unload it before the next load/rebuild.
+if cpp_compiler.has_argument('-fno-gnu-unique')
+  plugin_args += ['-fno-gnu-unique']
+endif
 # get_option('debug') is true for buildtype debug and debugoptimized, false
 # for the default release build. This is the only switch for key logging.
 if get_option('debug')
