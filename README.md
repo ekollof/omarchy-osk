@@ -53,6 +53,11 @@ Builds both compositor plugins (hypr-osk + vendored hyprgrass), deploys the
 shell plugins, the Hyprland glue and registers everything. Idempotent —
 re-run after every edit.
 
+After a Hyprland upgrade, run `./install.sh` once. It selects the matching
+hypr-osk API and vendored hyprgrass tree and rebuilds both. If newer headers
+are installed while the old compositor is still running, it deploys the
+rebuild but skips loading it and tells you to reboot or log out/in.
+
 This is **manual setup**: `omarchy plugin add` installs the shell UI only.
 The compositor plugin (touch→pointer, key injection) still requires
 `./install.sh` (or the hyprpm route below). `install.sh` deploys the same

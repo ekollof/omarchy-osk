@@ -52,6 +52,18 @@ if ! HYPRLAND_VERSION=$(/usr/bin/pkg-config --modversion hyprland 2>/dev/null); 
   exit 1
 fi
 
+# Building against newer headers while the old compositor is still running is
+# the normal post-upgrade, pre-reboot state. Deploy the rebuild, but never load
+# it into the mismatched compositor or reload its config into a version clash.
+RUNNING_HYPRLAND_VERSION=""
+LIVE_LOAD=1
+if [[ -x /usr/bin/hyprctl ]]; then
+  RUNNING_HYPRLAND_VERSION=$(/usr/bin/hyprctl version 2>/dev/null | /usr/bin/sed -n '1s/^Hyprland \([^- ]*\).*/\1/p')
+  if [[ -n $RUNNING_HYPRLAND_VERSION && $RUNNING_HYPRLAND_VERSION != "$HYPRLAND_VERSION" ]]; then
+    LIVE_LOAD=0
+  fi
+fi
+
 # Reconfigure an existing build directory so a Hyprland upgrade re-evaluates
 # the headers before building. A version change wipes it: the source selects
 # the compositor API with __has_include, so the old objects must not be reused.
@@ -384,15 +396,15 @@ if [[ -x /usr/bin/omarchy-shell ]]; then
   /usr/bin/omarchy-shell shell putBarWidget ekollof.osk-applet '{}' >/dev/null 2>&1 || true
   /usr/bin/omarchy-shell shell setPluginEnabled ekollof.osk true >/dev/null 2>&1 || true
 fi
-if [[ -x /usr/bin/hyprctl ]]; then
+if [[ -x /usr/bin/hyprctl && "$LIVE_LOAD" == 1 ]]; then
   /usr/bin/hyprctl reload >/dev/null 2>&1 || true
 fi
 
 # hyprctl reload does not remap an already-loaded .so (the old inode stays
 # mapped). Unload by full path, then load the copy we just installed —
 # only when this script built that copy (hyprpm-managed machines rebuild
-# with `hyprpm update`).
-if [[ "$OSK_LOCAL_BUILT" == 1 && -x /usr/bin/hyprctl ]]; then
+# with `hyprpm update`) and the running compositor matches the headers.
+if [[ "$OSK_LOCAL_BUILT" == 1 && "$LIVE_LOAD" == 1 && -x /usr/bin/hyprctl ]]; then
   /usr/bin/hyprctl plugin unload "$OSK_SO" >/dev/null 2>&1 || true
   /usr/bin/hyprctl plugin load "$OSK_SO" >/dev/null 2>&1 || true
 fi
@@ -406,13 +418,18 @@ if [[ -x /usr/bin/omarchy ]]; then
 fi
 
 echo "omarchy-osk installed."
-if [[ -x /usr/bin/hyprctl ]] && /usr/bin/hyprctl plugin list | /usr/bin/grep -q hypr-osk; then
-  echo "compositor plugin: loaded"
-else
-  echo "compositor plugin: NOT loaded yet (log out/in, or: /usr/bin/hyprctl plugin load $HOME/.local/share/hyprland/plugins/libhypr-osk.so)"
-fi
-if [[ -x /usr/bin/hyprctl ]] && /usr/bin/hyprctl plugin list | /usr/bin/grep -q hyprgrass; then
-  echo "hyprgrass: loaded"
-else
-  echo "hyprgrass: built and deployed; loads at next session (or: /usr/bin/hyprctl plugin load $HOME/.local/share/hyprland/plugins/hyprgrass.so)"
+if [[ "$LIVE_LOAD" == 0 ]]; then
+  echo "compositor plugins: built for Hyprland $HYPRLAND_VERSION; running $RUNNING_HYPRLAND_VERSION."
+  echo "They load at the next Hyprland session (reboot or log out/in)."
+elif [[ -x /usr/bin/hyprctl ]]; then
+  if /usr/bin/hyprctl plugin list | /usr/bin/grep -q hypr-osk; then
+    echo "compositor plugin: loaded"
+  else
+    echo "compositor plugin: NOT loaded yet (log out/in, or: /usr/bin/hyprctl plugin load $HOME/.local/share/hyprland/plugins/libhypr-osk.so)"
+  fi
+  if /usr/bin/hyprctl plugin list | /usr/bin/grep -q hyprgrass; then
+    echo "hyprgrass: loaded"
+  else
+    echo "hyprgrass: built and deployed; loads at next session (or: /usr/bin/hyprctl plugin load $HOME/.local/share/hyprland/plugins/hyprgrass.so)"
+  fi
 fi
