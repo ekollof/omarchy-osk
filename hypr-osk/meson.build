@@ -13,7 +13,7 @@ else
 endif
 add_global_arguments('-Wall', language: 'cpp')
 
-hyprland_headers = dependency('hyprland')
+hyprland_headers = dependency('hyprland', version: '>=0.56.0')
 hyprland_deps = [
   hyprland_headers,
   dependency('pixman-1'),

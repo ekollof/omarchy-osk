@@ -32,6 +32,7 @@ need() {
 }
 
 need /usr/bin/meson
+need /usr/bin/pkg-config
 need /usr/bin/install
 need /usr/bin/cp
 need /usr/bin/rm
@@ -45,6 +46,33 @@ need /usr/bin/grep
 need /usr/bin/sed
 need /usr/bin/cmp
 need /usr/bin/python3
+
+if ! HYPRLAND_VERSION=$(/usr/bin/pkg-config --modversion hyprland 2>/dev/null); then
+  echo "missing hyprland pkg-config; install Hyprland headers first" >&2
+  exit 1
+fi
+
+# Reconfigure an existing build directory so a Hyprland upgrade re-evaluates
+# the headers before building. A version change wipes it: the source selects
+# the compositor API with __has_include, so the old objects must not be reused.
+meson_build() {
+  local src=$1 build=$2
+  local stamp="$build/.hyprland-version" old_version=""
+  if [[ -f $stamp ]]; then
+    old_version=$(<"$stamp")
+  fi
+  if [[ -d $build && -n $old_version && $old_version != "$HYPRLAND_VERSION" ]]; then
+    echo "Hyprland changed ($old_version -> $HYPRLAND_VERSION): rebuilding ${build##*/}"
+    /usr/bin/rm -rf "$build"
+  fi
+  if [[ -d $build ]]; then
+    /usr/bin/meson setup --reconfigure "$build" "$src" >/dev/null
+  else
+    /usr/bin/meson setup "$build" "$src" >/dev/null
+  fi
+  /usr/bin/meson compile -C "$build"
+  printf '%s\n' "$HYPRLAND_VERSION" > "$stamp"
+}
 
 ensure_user_dir() {
   local d=$1
@@ -150,24 +178,28 @@ OSK_LOCAL_BUILT=0
 if hyprpm_has hypr-osk; then
   echo "hypr-osk is hyprpm-managed: skipping the local build (rebuild with: hyprpm update)."
 else
-  [[ -d "$DIR/hypr-osk/build" ]] || /usr/bin/meson setup "$DIR/hypr-osk/build" "$DIR/hypr-osk" >/dev/null
-  /usr/bin/meson compile -C "$DIR/hypr-osk/build"
+  meson_build "$DIR/hypr-osk" "$DIR/hypr-osk/build"
   publish_file "$DIR/hypr-osk/build/libhypr-osk.so" "$OSK_SO" 644
   OSK_LOCAL_BUILT=1
 fi
 
 # 3. Build the vendored hyprgrass (edge-swipe gesture) the same way: upstream
 # horriblename/hyprgrass + wf-touch, pinned in docs/PINS.md (no git clone).
+# Each supported Hyprland generation has its own vendored tree; pick it from
+# the installed headers so an upgrade only needs a rebuild.
 # Skip when hyprpm manages it instead. glm must already be installed.
 if hyprpm_has hyprgrass; then
   echo "hyprgrass is hyprpm-managed: skipping the vendored build (rebuild with: hyprpm update)."
 else
+  GRASS_DIR="$DIR/vendor/hyprgrass"
+  if /usr/bin/pkg-config --atleast-version=0.57.0 hyprland; then
+    GRASS_DIR="$DIR/vendor/hyprgrass-0.57"
+  fi
   if [[ -x /usr/bin/pacman ]] && ! /usr/bin/pacman -Q glm >/dev/null 2>&1; then
     echo "warning: glm missing (pacman -Q glm); skipping vendored hyprgrass. Install glm and re-run." >&2
   else
-    [[ -d "$DIR/vendor/hyprgrass/build" ]] || /usr/bin/meson setup "$DIR/vendor/hyprgrass/build" "$DIR/vendor/hyprgrass" >/dev/null
-    /usr/bin/meson compile -C "$DIR/vendor/hyprgrass/build"
-    publish_file "$DIR/vendor/hyprgrass/build/src/libhyprgrass.so" \
+    meson_build "$GRASS_DIR" "$GRASS_DIR/build"
+    publish_file "$GRASS_DIR/build/src/libhyprgrass.so" \
       "$HOME/.local/share/hyprland/plugins/hyprgrass.so" 644
   fi
 fi

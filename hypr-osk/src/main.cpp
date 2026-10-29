@@ -146,7 +146,16 @@
 #include <hyprland/src/desktop/state/LayerState.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
+
+/* hypr-osk builds against both the 0.56 and 0.57 compositor APIs. Pick the
+ * API from the installed headers so upgrading Hyprland only needs a rebuild. */
+#if __has_include(<hyprland/src/desktop/view/window/Window.hpp>)
+#  define OSK_HYPRLAND_057_API 1
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#else
+#  define OSK_HYPRLAND_057_API 0
 #include <hyprland/src/desktop/view/Window.hpp>
+#endif
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
@@ -204,6 +213,62 @@ static int oskPidfdSendSignal(int fd, int sig)
 #include <sys/ioctl.h>
 
 using namespace Hyprutils::Math;
+
+/* Hyprland 0.57 moved window class/title onto metadata() and renamed the
+ * mapped flags. Keep the rest of the plugin free of version checks. */
+static inline const std::string &oskWindowClass(const PHLWINDOW &w)
+{
+#if OSK_HYPRLAND_057_API
+    return w->metadata().appID();
+#else
+    return w->m_class;
+#endif
+}
+
+static inline const std::string &oskWindowInitialClass(const PHLWINDOW &w)
+{
+#if OSK_HYPRLAND_057_API
+    return w->metadata().initialAppID();
+#else
+    return w->m_initialClass;
+#endif
+}
+
+static inline const std::string &oskWindowTitle(const PHLWINDOW &w)
+{
+#if OSK_HYPRLAND_057_API
+    return w->metadata().title();
+#else
+    return w->m_title;
+#endif
+}
+
+static inline const std::string &oskWindowInitialTitle(const PHLWINDOW &w)
+{
+#if OSK_HYPRLAND_057_API
+    return w->metadata().initialTitle();
+#else
+    return w->m_initialTitle;
+#endif
+}
+
+static inline bool oskWindowMapped(const PHLWINDOW &w)
+{
+#if OSK_HYPRLAND_057_API
+    return w->mapped();
+#else
+    return w->m_isMapped;
+#endif
+}
+
+static inline bool oskLayerMapped(const PHLLS &ls)
+{
+#if OSK_HYPRLAND_057_API
+    return ls->mapped();
+#else
+    return ls->m_mapped;
+#endif
+}
 
 #define MAX_LINE 1024
 #define TEXT_CAP 96 /* TEXT payload capacity in the ring (incl. NUL) */
@@ -321,7 +386,11 @@ static const struct {
 
 class COskKeyboard : public IKeyboard {
   public:
+#if OSK_HYPRLAND_057_API
+    virtual bool                      isVirtual() const override { return true; }
+#else
     virtual bool                      isVirtual() override { return true; }
+#endif
     virtual SP<Aquamarine::IKeyboard> aq() override { return nullptr; }
     virtual uint32_t                  getCapabilities() override { return HID_INPUT_CAPABILITY_KEYBOARD; }
     virtual eHIDType                  getType() override { return HID_TYPE_KEYBOARD; }
@@ -1644,7 +1713,7 @@ static void forEachMappedLayer(auto &&fn)
             for (auto &vec : mon->m_layerSurfaceLayers) {
                 for (auto &ref : vec) {
                     if (auto ls = ref.lock()) {
-                        if (ls->m_mapped)
+                        if (oskLayerMapped(ls))
                             fn(ls);
                     }
                 }
@@ -1653,13 +1722,13 @@ static void forEachMappedLayer(auto &&fn)
     }
     if (auto &st = Desktop::layerState(); st) {
         for (const auto &ls : st->layers()) {
-            if (ls && ls->m_mapped)
+            if (ls && oskLayerMapped(ls))
                 fn(ls);
         }
     }
     if (auto &vs = Desktop::viewState(); vs) {
         for (const auto &ls : vs->layers()) {
-            if (ls && ls->m_mapped)
+            if (ls && oskLayerMapped(ls))
                 fn(ls);
         }
     }
@@ -2695,15 +2764,15 @@ static bool padWindowClassHas(const PHLWINDOW &w, const char *needle)
 {
     if (!w || !needle)
         return false;
-    return padIcontains(w->m_class, needle) || padIcontains(w->m_initialClass, needle);
+    return padIcontains(oskWindowClass(w), needle) || padIcontains(oskWindowInitialClass(w), needle);
 }
 
 static bool padWindowLooksLikeGame(const PHLWINDOW &w)
 {
     if (!w)
         return false;
-    if (padWindowClassHas(w, "gamescope") || padIcontains(w->m_title, "gamescope") ||
-        padIcontains(w->m_initialTitle, "gamescope"))
+    if (padWindowClassHas(w, "gamescope") || padIcontains(oskWindowTitle(w), "gamescope") ||
+        padIcontains(oskWindowInitialTitle(w), "gamescope"))
         return true;
     /* Steam/Proton windows: steam_app_<id>, often borderless-maximized not exclusive FS */
     if (padWindowClassHas(w, "steam_app"))
@@ -2769,7 +2838,7 @@ static bool padMonitorHasGame()
     if (!st)
         return false;
     for (const auto &w : st->windows()) {
-        if (!w || !w->m_isMapped)
+        if (!w || !oskWindowMapped(w))
             continue;
         if (mon && w->m_monitor.lock() != mon)
             continue;

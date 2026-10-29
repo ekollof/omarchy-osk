@@ -60,16 +60,21 @@ plugins in its own layout and supersedes a plugin-add copy — pick one path.
 
 **Build inputs** (exact SHAs: [docs/PINS.md](docs/PINS.md)):
 
-- Hyprland **0.56.x** headers matching the running compositor (`v0.56.2` /
-  `efb50993780079460b0cbed1363e2166a2de1d9f` is known-good)
+- Hyprland headers matching the running compositor: **0.56.x** (`v0.56.2` /
+  `efb50993780079460b0cbed1363e2166a2de1d9f`) or **0.57.x** (`v0.57.0` /
+  `0aa6745f705f2c4b0a5004eb019ef76e5bbdb426`). The plugin picks the compositor
+  API from the installed headers, so a Hyprland upgrade only needs a rebuild.
 - meson, ninja, gcc, pkg-config; meson deps: pixman, libinput,
   wayland-server, xkbcommon, libdrm
 - `glm` for vendored hyprgrass/wf-touch (must already be installed; the
   installer does not invoke the package manager)
-- Vendored hyprgrass `hl-0.56.1` commit
-  `36df29f57f94a77b4d5dcf91100f620a46663fa9` and wf-touch
-  `8974eb0f6a65464b63dd03b842795cb441fb6403` — already in-tree; the
-  build does not clone git
+- Vendored hyprgrass `hl-0.56.1` (commit
+  `36df29f57f94a77b4d5dcf91100f620a46663fa9`) in `vendor/hyprgrass/` and
+  `hl-0.57.0` (commit `8ca1af717d5b4ea1215a781df52bcef02d7b15e6`) in
+  `vendor/hyprgrass-0.57/`, both with wf-touch
+  `8974eb0f6a65464b63dd03b842795cb441fb6403` — already in-tree; `install.sh`
+  selects the tree from the installed Hyprland version and the build does not
+  clone git
 
 `hyprpm` is an alternative route for the compositor plugin
 (`hyprpm update && hyprpm add <repo-url> && hyprpm enable hypr-osk`); the

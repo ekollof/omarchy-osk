@@ -1,0 +1,8 @@
+#!/bin/sh
+
+## Usage
+## -----
+## Prints the tag name of the latest Hyprland release
+
+gh release list --repo hyprwm/Hyprland --json tagName,isLatest \
+    -q 'map(select(.isLatest == true)) | .[0].tagName'
