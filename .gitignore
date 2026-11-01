@@ -1,4 +1,7 @@
 build/
 # Local coding-agent notes; not part of the marketplace plugin.
 AGENTS.md
+# Steam focus-filter dev harnesses; not part of the marketplace plugin.
+steam/test-*.py
+steam/popup-fixture.c
 

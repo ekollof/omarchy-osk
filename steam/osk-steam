@@ -1,0 +1,12 @@
+#!/bin/bash
+# Wrap an existing Steam launcher without losing its scaling/options.
+set -euo pipefail
+filter="$HOME/.local/lib/omarchy-osk/\$LIB/steam-focus.so"
+case ":${LD_PRELOAD:-}:" in
+  *":$filter:"*) ;;
+  *) export LD_PRELOAD="$filter${LD_PRELOAD:+:$LD_PRELOAD}" ;;
+esac
+if (($# == 0)); then
+  set -- /usr/bin/steam
+fi
+exec "$@"

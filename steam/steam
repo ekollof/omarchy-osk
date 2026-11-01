@@ -1,0 +1,3 @@
+#!/bin/bash
+# PATH-based launches (including nested gamescope) use the same filter.
+exec "$HOME/.local/bin/osk-steam" /usr/bin/steam "$@"
