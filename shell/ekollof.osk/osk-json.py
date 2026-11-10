@@ -31,7 +31,7 @@ def _open_dir(path: str) -> int:
 
 
 def load(path: str) -> None:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
@@ -84,6 +84,7 @@ def save(path: str, body: bytes) -> None:
     finally:
         os.close(cfd)
 
+    tmpname = None
     try:
         st = os.fstat(ofd)
         if st.st_uid != os.getuid() or not stat.S_ISDIR(st.st_mode):
@@ -106,7 +107,14 @@ def save(path: str, body: bytes) -> None:
         finally:
             os.close(tfd)
         os.rename(tmpname, name, src_dir_fd=ofd, dst_dir_fd=ofd)
+        tmpname = None
+        os.fsync(ofd)
     finally:
+        if tmpname is not None:
+            try:
+                os.unlink(tmpname, dir_fd=ofd)
+            except FileNotFoundError:
+                pass
         os.close(ofd)
 
 
@@ -124,4 +132,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except OSError:
+        sys.exit(1)

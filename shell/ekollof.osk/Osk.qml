@@ -194,9 +194,11 @@ Item {
 
   function persistConfig() {
     const helper = root.jsonHelper()
-    if (!helper)
+    if (!helper) {
+      root.cfgSaveError = "Configuration helper unavailable"
       return
-    const body = JSON.stringify({
+    }
+    root.cfgPendingBody = JSON.stringify({
       layout: root.layout,
       repeat: root.repeatEnabled,
       repeatDelay: root.repeatDelay,
@@ -211,8 +213,23 @@ Item {
       gamepad: root.gamepad,
       gamepadMap: root.gamepadMap
     })
-    cfgSave.command = ["/usr/bin/python3", helper, "save", root.cfgPath(), body]
-    cfgSave.running = false
+    root.cfgSavePending = true
+    root.startConfigSave()
+  }
+
+  function startConfigSave() {
+    if (!root.cfgSavePending || root.cfgSaving || cfgSave.running)
+      return
+    const helper = root.jsonHelper()
+    if (!helper) {
+      root.cfgSavePending = false
+      root.cfgSaveError = "Configuration helper unavailable"
+      return
+    }
+    root.cfgSavePending = false
+    root.cfgSaving = true
+    root.cfgSaveError = ""
+    cfgSave.command = ["/usr/bin/python3", helper, "save", root.cfgPath(), root.cfgPendingBody]
     cfgSave.running = true
   }
 
@@ -235,7 +252,8 @@ Item {
       gamepadMap: root.gamepadMap,
       padActive: root.padActive,
       gridLoaded: !!root.grid,
-      opened: root.opened
+      opened: root.opened,
+      saveError: root.cfgSaveError
     })
   }
 
@@ -487,6 +505,12 @@ Item {
   // on every client connect, so a lost announce self-heals anyway.
   property bool sockReady: false
   property bool cfgLoaded: false
+  property bool cfgLoadTimedOut: false
+  property bool cfgSaving: false
+  property bool cfgSavePending: false
+  property bool cfgSaveTimedOut: false
+  property string cfgSaveError: ""
+  property string cfgPendingBody: ""
   property bool announced: false
 
   function connected() {
@@ -633,6 +657,18 @@ Item {
     return ""
   }
 
+  Timer {
+    id: cfgLoadTimeout
+    interval: 3000
+    running: cfgLoad.running
+    onTriggered: {
+      root.cfgLoadTimedOut = true
+      cfgLoad.running = false
+      if (!root.cfgLoaded)
+        root.applyConfig("")
+    }
+  }
+
   Process {
     id: cfgLoad
     stdout: StdioCollector {
@@ -640,6 +676,10 @@ Item {
       waitForEnd: true
     }
     onExited: function(code) {
+      if (root.cfgLoadTimedOut) {
+        root.cfgLoadTimedOut = false
+        return
+      }
       if (root.cfgLoaded)
         return
       root.applyConfig(code === 0 ? cfgLoadOut.text : "")
@@ -648,6 +688,31 @@ Item {
 
   Process {
     id: cfgSave
+    onExited: function(code) {
+      const timedOut = root.cfgSaveTimedOut
+      root.cfgSaveTimedOut = false
+      root.cfgSaving = false
+      if (code !== 0 || timedOut)
+        root.cfgSaveError = timedOut ? "Saving settings timed out" : "Could not save settings"
+      else
+        root.cfgSaveError = ""
+      if (root.cfgSavePending)
+        root.startConfigSave()
+    }
+  }
+
+  Timer {
+    id: cfgSaveTimeout
+    interval: 3000
+    running: cfgSave.running
+    onTriggered: {
+      root.cfgSaveTimedOut = true
+      cfgSave.running = false
+      root.cfgSaving = false
+      root.cfgSaveError = "Saving settings timed out"
+      if (root.cfgSavePending)
+        root.startConfigSave()
+    }
   }
 
   // press-and-hold auto-repeat (all char/code keys) — one key held at a time
