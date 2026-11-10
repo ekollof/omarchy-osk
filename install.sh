@@ -32,7 +32,6 @@ need() {
 }
 
 need /usr/bin/meson
-need /usr/bin/pkg-config
 need /usr/bin/install
 need /usr/bin/cp
 need /usr/bin/rm
@@ -47,9 +46,27 @@ need /usr/bin/sed
 need /usr/bin/cmp
 need /usr/bin/python3
 
-if ! HYPRLAND_VERSION=$(/usr/bin/pkg-config --modversion hyprland 2>/dev/null); then
-  echo "missing hyprland pkg-config; install Hyprland headers first" >&2
-  exit 1
+hyprpm_has() {
+  [[ -x /usr/bin/hyprpm ]] || return 1
+  /usr/bin/hyprpm list 2>/dev/null | /usr/bin/grep -q -- "$1"
+}
+
+HYPR_OSK_MANAGED=0
+HYPRGRASS_MANAGED=0
+if hyprpm_has hypr-osk; then
+  HYPR_OSK_MANAGED=1
+fi
+if hyprpm_has hyprgrass; then
+  HYPRGRASS_MANAGED=1
+fi
+
+HYPRLAND_VERSION=""
+if (( HYPR_OSK_MANAGED == 0 || HYPRGRASS_MANAGED == 0 )); then
+  need /usr/bin/pkg-config
+  if ! HYPRLAND_VERSION=$(/usr/bin/pkg-config --modversion hyprland 2>/dev/null); then
+    echo "missing hyprland pkg-config; install Hyprland headers first" >&2
+    exit 1
+  fi
 fi
 
 # Building against newer headers while the old compositor is still running is
@@ -57,7 +74,7 @@ fi
 # it into the mismatched compositor or reload its config into a version clash.
 RUNNING_HYPRLAND_VERSION=""
 LIVE_LOAD=1
-if [[ -x /usr/bin/hyprctl ]]; then
+if [[ -n $HYPRLAND_VERSION && -x /usr/bin/hyprctl ]]; then
   RUNNING_HYPRLAND_VERSION=$(/usr/bin/hyprctl version 2>/dev/null | /usr/bin/sed -n '1s/^Hyprland \([^- ]*\).*/\1/p')
   if [[ -n $RUNNING_HYPRLAND_VERSION && $RUNNING_HYPRLAND_VERSION != "$HYPRLAND_VERSION" ]]; then
     LIVE_LOAD=0
@@ -177,17 +194,12 @@ publish_tree() {
   fi
 }
 
-hyprpm_has() {
-  [[ -x /usr/bin/hyprpm ]] || return 1
-  /usr/bin/hyprpm list 2>/dev/null | /usr/bin/grep -q -- "$1"
-}
-
 # 1+2. Build the compositor plugin and install it where Hyprland plugins
 # live — unless hyprpm manages it (see hyprpm.toml): then its copy wins and
 # a flat copy here would fight it (rebuild with: hyprpm update).
 OSK_SO="$HOME/.local/share/hyprland/plugins/libhypr-osk.so"
 OSK_LOCAL_BUILT=0
-if hyprpm_has hypr-osk; then
+if (( HYPR_OSK_MANAGED )); then
   echo "hypr-osk is hyprpm-managed: skipping the local build (rebuild with: hyprpm update)."
 else
   meson_build "$DIR/hypr-osk" "$DIR/hypr-osk/build"
@@ -200,7 +212,7 @@ fi
 # Each supported Hyprland generation has its own vendored tree; pick it from
 # the installed headers so an upgrade only needs a rebuild.
 # Skip when hyprpm manages it instead. glm must already be installed.
-if hyprpm_has hyprgrass; then
+if (( HYPRGRASS_MANAGED )); then
   echo "hyprgrass is hyprpm-managed: skipping the vendored build (rebuild with: hyprpm update)."
 else
   GRASS_DIR="$DIR/vendor/hyprgrass"
