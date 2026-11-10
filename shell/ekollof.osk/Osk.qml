@@ -228,6 +228,9 @@ Item {
     }
     root.cfgSavePending = false
     root.cfgSaving = true
+    root.cfgSaveStarted = false
+    root.cfgSaveExited = false
+    root.cfgSaveTimedOut = false
     root.cfgSaveError = ""
     cfgSave.command = ["/usr/bin/python3", helper, "save", root.cfgPath(), root.cfgPendingBody]
     cfgSave.running = true
@@ -253,6 +256,7 @@ Item {
       padActive: root.padActive,
       gridLoaded: !!root.grid,
       opened: root.opened,
+      loadError: root.cfgLoadError,
       saveError: root.cfgSaveError
     })
   }
@@ -505,8 +509,13 @@ Item {
   // on every client connect, so a lost announce self-heals anyway.
   property bool sockReady: false
   property bool cfgLoaded: false
+  property bool cfgLoadStarted: false
+  property bool cfgLoadExited: false
   property bool cfgLoadTimedOut: false
+  property string cfgLoadError: ""
   property bool cfgSaving: false
+  property bool cfgSaveStarted: false
+  property bool cfgSaveExited: false
   property bool cfgSavePending: false
   property bool cfgSaveTimedOut: false
   property string cfgSaveError: ""
@@ -657,15 +666,41 @@ Item {
     return ""
   }
 
+  function startConfigLoad() {
+    const helper = root.jsonHelper()
+    if (!helper) {
+      root.cfgLoadError = "Configuration helper unavailable"
+      root.applyConfig("")
+      return
+    }
+    root.cfgLoadStarted = false
+    root.cfgLoadExited = false
+    root.cfgLoadTimedOut = false
+    root.cfgLoadError = ""
+    cfgLoad.command = ["/usr/bin/python3", helper, "load", root.cfgPath()]
+    cfgLoad.running = true
+  }
+
   Timer {
     id: cfgLoadTimeout
     interval: 3000
     running: cfgLoad.running
     onTriggered: {
       root.cfgLoadTimedOut = true
+      root.cfgLoadError = "Configuration load timed out"
       cfgLoad.running = false
+      cfgLoadKill.start()
       if (!root.cfgLoaded)
         root.applyConfig("")
+    }
+  }
+
+  Timer {
+    id: cfgLoadKill
+    interval: 1000
+    onTriggered: {
+      if (cfgLoad.running)
+        cfgLoad.signal(9)
     }
   }
 
@@ -675,7 +710,10 @@ Item {
       id: cfgLoadOut
       waitForEnd: true
     }
+    onStarted: root.cfgLoadStarted = true
     onExited: function(code) {
+      root.cfgLoadExited = true
+      cfgLoadKill.stop()
       if (root.cfgLoadTimedOut) {
         root.cfgLoadTimedOut = false
         return
@@ -684,11 +722,20 @@ Item {
         return
       root.applyConfig(code === 0 ? cfgLoadOut.text : "")
     }
+    onRunningChanged: function() {
+      if (cfgLoad.running || root.cfgLoadStarted || root.cfgLoadExited || root.cfgLoaded)
+        return
+      root.cfgLoadError = "Could not start config loader"
+      root.applyConfig("")
+    }
   }
 
   Process {
     id: cfgSave
+    onStarted: root.cfgSaveStarted = true
     onExited: function(code) {
+      root.cfgSaveExited = true
+      cfgSaveKill.stop()
       const timedOut = root.cfgSaveTimedOut
       root.cfgSaveTimedOut = false
       root.cfgSaving = false
@@ -696,6 +743,14 @@ Item {
         root.cfgSaveError = timedOut ? "Saving settings timed out" : "Could not save settings"
       else
         root.cfgSaveError = ""
+      if (root.cfgSavePending)
+        root.startConfigSave()
+    }
+    onRunningChanged: function() {
+      if (cfgSave.running || root.cfgSaveStarted || root.cfgSaveExited || !root.cfgSaving)
+        return
+      root.cfgSaving = false
+      root.cfgSaveError = "Could not start config writer"
       if (root.cfgSavePending)
         root.startConfigSave()
     }
@@ -707,11 +762,18 @@ Item {
     running: cfgSave.running
     onTriggered: {
       root.cfgSaveTimedOut = true
-      cfgSave.running = false
-      root.cfgSaving = false
       root.cfgSaveError = "Saving settings timed out"
-      if (root.cfgSavePending)
-        root.startConfigSave()
+      cfgSave.running = false
+      cfgSaveKill.start()
+    }
+  }
+
+  Timer {
+    id: cfgSaveKill
+    interval: 1000
+    onTriggered: {
+      if (cfgSave.running)
+        cfgSave.signal(9)
     }
   }
 
@@ -1039,12 +1101,6 @@ Item {
   onPanelHChanged: syncPanel()
   Component.onCompleted: { // rev26
     // @@loaded@@
-    const helper = root.jsonHelper()
-    if (!helper) {
-      root.applyConfig("")
-      return
-    }
-    cfgLoad.command = ["/usr/bin/python3", helper, "load", root.cfgPath()]
-    cfgLoad.running = true
+    root.startConfigLoad()
   }
 }

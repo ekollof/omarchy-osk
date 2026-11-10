@@ -38,6 +38,7 @@ Panel {
   property var layouts: []
   property var gamepadMap: ({})
   property bool padBindsOpen: false
+  property string saveError: ""
   readonly property var padAnalogOptions: ["rightStick,rightPad", "rightStick", "leftStick", "rightPad", "none"]
   readonly property var padActOptions: [
     "none", "enter", "escape", "backspace", "space", "tab",
@@ -138,6 +139,7 @@ Panel {
       root.padActive = !!cfg.padActive
     if (cfg.gamepadMap && typeof cfg.gamepadMap === "object")
       root.gamepadMap = cfg.gamepadMap
+    root.saveError = String(cfg.saveError || "")
   }
 
   function callOskQuoted(method, arg) {
@@ -291,6 +293,17 @@ Panel {
             textFormat: Text.PlainText
           }
         }
+      }
+
+      Text {
+        width: parent.width
+        visible: root.saveError !== ""
+        text: root.saveError
+        color: root.bar ? root.bar.urgent : Commons.Color.urgent
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
       }
 
       Toggle {
@@ -732,7 +745,7 @@ Panel {
   Process {
     id: stateProc
     property bool gotState: false
-    command: ["/usr/bin/omarchy-shell", "ekollof.osk", "getState"]
+    command: ["/bin/sh", "-c", "/usr/bin/timeout -k 1 3 /usr/bin/omarchy-shell ekollof.osk getState | /usr/bin/head -c 65536"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -755,7 +768,7 @@ Panel {
 
   Process {
     id: layoutsProc
-    command: ["/usr/bin/localectl", "list-x11-keymap-layouts"]
+    command: ["/bin/sh", "-c", "/usr/bin/timeout -k 1 3 /usr/bin/localectl list-x11-keymap-layouts | /usr/bin/head -c 65536"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.setLayouts(text)
