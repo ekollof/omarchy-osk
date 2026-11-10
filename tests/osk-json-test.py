@@ -55,4 +55,11 @@ with tempfile.TemporaryDirectory() as tmp:
     assert invalid.returncode != 0, invalid
     assert json.loads(target.read_text(encoding="utf-8")) == {"layout": "dk"}
 
+    config.chmod(0o555)
+    try:
+        unwritable = run("save", str(target), '{"layout":"fr"}')
+        assert unwritable.returncode != 0, unwritable
+    finally:
+        config.chmod(0o755)
+
 print("osk-json special-file and failure checks passed")
