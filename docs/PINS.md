@@ -21,12 +21,13 @@ headers. A Hyprland upgrade therefore only needs a rebuild; no source change.
 The optional hyprpm route (`hyprpm.toml` `commit_pins`) maps a running
 Hyprland commit to a last-known-good hypr-osk plugin commit:
 
-`0aa6745f705f2c4b0a5004eb019ef76e5bbdb426` → `47714a4e37c9c5ef5ab900ec761f5b70fb038061`
+`0aa6745f705f2c4b0a5004eb019ef76e5bbdb426` → `c65398fab9627d2d5649ad377f27cc55978af47f`
+`acc1aa0bfd4bd575dcb0f76c35ccf12b660a1ab9` → `c65398fab9627d2d5649ad377f27cc55978af47f`
 
-The 0.57 pin is the dual-API build with the hardware/capability pad
-classification. It does not carry later unload or install changes; the
-primary `install.sh` path builds the current tree. The retired 0.56 route is
-not supported.
+The pin is the reviewed source carrying the 0.57 API, the hardware/capability
+pad classification, the bounded native drain, and the config failure handling.
+The primary `install.sh` path builds the current tree. The retired 0.56 route
+is not supported.
 
 The pinned source includes the packaged-quickshell executable check, pinned
 omarchy-shell instance, and mapped OSK layer requirement for injection. When
