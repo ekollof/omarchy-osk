@@ -307,6 +307,7 @@ struct SOskCommand {
     char  text[TEXT_CAP] = {0};
 };
 static constexpr size_t RING_SIZE = 64;
+static constexpr size_t DRAIN_BUDGET = 64; /* commands per event-loop turn */
 static SOskCommand      g_ring[RING_SIZE];
 static std::mutex       g_ringMutex;
 static size_t           g_ringHead = 0, g_ringCount = 0;
@@ -3656,7 +3657,8 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
     refreshIntendedShell();
     {
         std::lock_guard<std::mutex> lg(g_ringMutex);
-        while (g_ringCount > 0) {
+        size_t processed = 0;
+        while (g_ringCount > 0 && processed < DRAIN_BUDGET) {
             SOskCommand c = g_ring[g_ringHead];
             g_ringHead = (g_ringHead + 1) % RING_SIZE;
             g_ringCount--;
@@ -3866,6 +3868,7 @@ static void drainQueue(SP<CEventLoopTimer> self, void *data)
                 break;
             }
             }
+            ++processed;
             g_ringMutex.lock();
         }
     }

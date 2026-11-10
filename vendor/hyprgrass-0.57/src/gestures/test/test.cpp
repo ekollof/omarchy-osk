@@ -122,6 +122,11 @@ void ProcessEvents(CMockGestureManager& gm, ExpectResult expect, const std::vect
     checkCondition(gm, expect);
 }
 
+TEST_CASE("Fresh manager does not inhibit forwarding before the first touch") {
+    auto gm = CMockGestureManager::newBothHandler();
+    CHECK_FALSE(gm.eventForwardingInhibited());
+}
+
 TEST_CASE(
     "Multifinger: block touch events to client surfaces when more than a "
     "certain number of fingers touch down." *

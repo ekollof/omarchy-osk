@@ -73,7 +73,7 @@ struct Cfg {
 
 class GestureManager : public IGestureManager {
   public:
-    uint32_t long_press_next_trigger_time;
+    uint32_t long_press_next_trigger_time = 0;
     std::vector<SP<SKeybind>> internalBinds;
 
     GestureManager();
@@ -106,8 +106,8 @@ class GestureManager : public IGestureManager {
   private:
     VecSet<CWeakPointer<CWLTouchResource>> touchedResources;
     PHLMONITOR m_lastTouchedMonitor;
-    SMonitorArea m_monitorArea;
-    wl_event_source* long_press_timer;
+    SMonitorArea m_monitorArea{0, 0, 0, 0};
+    wl_event_source* long_press_timer = nullptr;
     struct {
         bool active = false;
         Config::CCssGapData old_gaps_in;
@@ -116,7 +116,7 @@ class GestureManager : public IGestureManager {
     CTrackpadGestures* activeTrackpadGesture = nullptr;
     bool mouseBindActive                     = false;
     // used by trackpadGesture* functions
-    wf::touch::point_t emulatedSwipePoint;
+    wf::touch::point_t emulatedSwipePoint{0, 0};
 
     bool handleGestureBind(std::string bind, GestureEventType);
 

@@ -98,8 +98,8 @@ class IGestureManager {
 
   private:
     std::unique_ptr<Logger> logger;
-    bool inhibitTouchEvents;
-    bool gestureTriggered; // A drag/completed gesture is triggered
+    bool inhibitTouchEvents = false;
+    bool gestureTriggered = false; // A drag/completed gesture is triggered
     std::optional<DragGestureEvent> activeDragGesture;
     std::optional<CompletedGestureEvent> promisedCompletedGesture;
 
