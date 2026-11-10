@@ -22,5 +22,5 @@ SOFTWARE.
 
 ---
 
-The vendored hyprgrass tree (vendor/hyprgrass/) retains its upstream BSD
-license; see vendor/hyprgrass/LICENSE.
+The vendored hyprgrass tree (vendor/hyprgrass-0.57/) retains its upstream BSD
+license; see vendor/hyprgrass-0.57/LICENSE.

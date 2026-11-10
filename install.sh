@@ -67,6 +67,10 @@ if (( HYPR_OSK_MANAGED == 0 || HYPRGRASS_MANAGED == 0 )); then
     echo "missing hyprland pkg-config; install Hyprland headers first" >&2
     exit 1
   fi
+  if ! /usr/bin/pkg-config --atleast-version=0.57.0 hyprland; then
+    echo "Hyprland 0.57 or newer headers are required" >&2
+    exit 1
+  fi
 fi
 
 # Building against newer headers while the old compositor is still running is
@@ -209,16 +213,11 @@ fi
 
 # 3. Build the vendored hyprgrass (edge-swipe gesture) the same way: upstream
 # horriblename/hyprgrass + wf-touch, pinned in docs/PINS.md (no git clone).
-# Each supported Hyprland generation has its own vendored tree; pick it from
-# the installed headers so an upgrade only needs a rebuild.
 # Skip when hyprpm manages it instead. glm must already be installed.
 if (( HYPRGRASS_MANAGED )); then
   echo "hyprgrass is hyprpm-managed: skipping the vendored build (rebuild with: hyprpm update)."
 else
-  GRASS_DIR="$DIR/vendor/hyprgrass"
-  if /usr/bin/pkg-config --atleast-version=0.57.0 hyprland; then
-    GRASS_DIR="$DIR/vendor/hyprgrass-0.57"
-  fi
+  GRASS_DIR="$DIR/vendor/hyprgrass-0.57"
   if [[ -x /usr/bin/pacman ]] && ! /usr/bin/pacman -Q glm >/dev/null 2>&1; then
     echo "warning: glm missing (pacman -Q glm); skipping vendored hyprgrass. Install glm and re-run." >&2
   else
